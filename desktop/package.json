@@ -1,0 +1,47 @@
+{
+  "name": "werewolf-desktop",
+  "private": true,
+  "version": "0.3.11",
+  "description": "AI模拟狼人杀研究平台 - 桌面客户端（本地 SQLite，对局数据不出本机）",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --win portable",
+    "dist": "electron-builder --win nsis portable"
+  },
+  "devDependencies": {
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.werewolf.research.desktop",
+    "productName": "AI狼人杀研究平台",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.mjs"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist",
+        "to": "dist"
+      }
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "build/icon.png",
+      "artifactName": "${productName}-${version}-portable.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-${version}-setup.${ext}"
+    }
+  }
+}

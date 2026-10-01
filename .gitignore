@@ -1,0 +1,30 @@
+node_modules
+tools/
+dist
+.DS_Store
+# Environment variables
+.env
+.env.local
+.env.*.local
+# Database
+*.db
+*.sqlite
+*.sqlite3
+db/migrations/*.sql
+# TypeScript cache
+*.tsbuildinfo
+# Build outputs
+dist/
+build/
+# Test coverage
+coverage/
+.nyc_output/
+# Logs
+*.log
+# 桌面客户端
+desktop/node_modules/
+desktop/release/
+desktop/electron-dist/
+desktop/patch-*.cjs
+# 本地临时数据
+tmp/
