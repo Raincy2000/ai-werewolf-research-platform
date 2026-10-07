@@ -52,11 +52,17 @@ npm install
 cp .env.example .env   # 然后填写 APP_ID / APP_SECRET / DATABASE_URL / PRESET_SECRET
 ```
 
-### 启动
+### 启动客户端
+
+本项目有**两种客户端**，任选其一：
+
+**① Web 客户端（浏览器）** —— 前后端一体，适合开发调试：
 
 ```bash
-npm run dev            # 前后端一体，http://localhost:3000
+npm run dev            # 启动后浏览器访问 http://localhost:3000
 ```
+
+**② 桌面客户端（Electron）** —— 本地 SQLite、数据不出本机，见下文「🖥️ 桌面客户端」。
 
 > 注意：浏览器访问的 `/` 由 `dist/public` 生产构建供给；改前端后需 `npx vite build`，改后端需重建 `dist/boot.js`（或直接 `npm run build` 全量构建）。
 
@@ -70,15 +76,30 @@ npm run build          # 构建前端 + 后端产物
 
 ## 🖥️ 桌面客户端
 
-桌面客户端把对局数据保存在本机 SQLite，不依赖云端数据库。
+桌面客户端把对局数据保存在本机 SQLite，不依赖云端数据库。**打开方式如下：**
+
+### 开发模式启动
 
 ```bash
-npm run build           # 先构建 dist
-npm run app:start       # 开发模式启动桌面端
-npm run app:pack        # 打包便携 exe → desktop/release/
+# 1. 安装依赖（根目录 + 桌面端各装一次）
+npm install
+cd desktop && npm install && cd ..
+
+# 2. 构建产物（前端 dist/public + 后端 dist/boot.js）
+npm run build
+
+# 3. 启动桌面客户端
+npm run app:start
 ```
 
-> 首次打开会用 `OWNER_EMAIL`（默认 `owner@example.com`）自动建 owner 账户；初始密码在 `desktop-config.json` 的 `ownerPassword` 字段（首启随机生成）。
+### 打包成便携 exe
+
+```bash
+npm run app:pack        # → desktop/release/AI狼人杀研究平台-<版本号>-portable.exe（双击即可运行）
+```
+
+> **首次登录**：桌面端首启会用 `OWNER_EMAIL`（默认 `owner@example.com`）自动建 owner 账户；初始密码在 `desktop-config.json` 的 `ownerPassword` 字段（首启随机生成）。
+> **环境要求**：桌面端依赖 Electron 内嵌的 Node（`node:sqlite`），构建需 Node.js ≥ 20。
 
 ## ⚙️ 环境变量
 
