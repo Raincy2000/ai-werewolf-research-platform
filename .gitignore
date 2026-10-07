@@ -28,3 +28,5 @@ desktop/electron-dist/
 desktop/patch-*.cjs
 # 本地临时数据
 tmp/
+# 一键安装脚本下载的便携 Node（免安装，不入库）
+.portable-node/
