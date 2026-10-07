@@ -15,7 +15,7 @@
   },
   "build": {
     "appId": "com.werewolf.research.desktop",
-    "productName": "AI狼人杀研究平台",
+    "productName": "WerewolfAI",
     "directories": {
       "output": "release"
     },
