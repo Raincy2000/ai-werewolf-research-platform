@@ -78,6 +78,15 @@ npm run build          # 构建前端 + 后端产物
 
 桌面客户端把对局数据保存在本机 SQLite，不依赖云端数据库。**打开方式如下：**
 
+### 🚀 一键安装（推荐，Windows）
+
+双击项目根目录的 **`install-client.bat`**，脚本会自动完成「安装依赖 → 构建 → 打包安装程序」全流程，最后弹出 `release` 目录：
+
+- `desktop\release\AI狼人杀研究平台-<版本号>-setup.exe` —— **安装版**（安装向导里可自选安装目录）
+- `desktop\release\AI狼人杀研究平台-<版本号>-portable.exe` —— 便携版（免安装，双击即用）
+
+> 前提：本机已安装 Node.js ≥ 20（脚本会自动检测）。
+
 ### 开发模式启动
 
 ```bash
