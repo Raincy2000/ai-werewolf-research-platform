@@ -10,12 +10,13 @@
     "dist": "electron-builder --win nsis portable"
   },
   "devDependencies": {
-    "electron": "^43.2.0",
+    "electron": "43.2.0",
     "electron-builder": "^26.15.3"
   },
   "build": {
     "appId": "com.werewolf.research.desktop",
     "productName": "WerewolfAI",
+    "electronDist": "electron-dist",
     "directories": {
       "output": "release"
     },
