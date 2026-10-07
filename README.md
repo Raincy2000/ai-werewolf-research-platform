@@ -42,7 +42,7 @@
 
 ### 环境要求
 
-- Node.js ≥ 20
+- Node.js ≥ 22（桌面端打包需要；仅 Web 端开发可用 ≥ 20）
 - 一个 MySQL 实例（云端部署用）；或使用桌面客户端（内置 SQLite，免 MySQL）
 
 ### 安装与配置
@@ -91,35 +91,50 @@ npm run build          # 构建前端 + 后端产物
 
 双击项目根目录的 **`install-client.bat`**，脚本会自动完成全部流程：
 
-1. 未检测到 Node.js 时，**自动下载便携版 Node.js**（免安装，仅首次约 28MB）
-2. 安装依赖 → 构建 → 打包（NSIS 安装版 + 便携版）
-3. 最后弹出 `release` 目录
+1. **准备 Node.js v22+**：系统没有或版本过低时，自动下载便携版 Node（免安装，约 33MB）
+2. **安装依赖**（前端 + 后端 + Electron）
+3. **构建**（vite 前端 + esbuild 后端）
+4. **下载 Electron 二进制**（约 138MB，仅首次）
+5. **打包** NSIS 安装版 + portable 便携版，最后弹出 `release` 目录
 
-> 全程无需手动安装任何环境，双击即用（首次需联网下载依赖 + Electron，约几分钟）。
+> 全程免装环境、双击即用；首次需联网（下载 Node + Electron + 依赖，约几分钟）。
 > 说明：安装版 exe 体积约 100MB，不随源码仓库分发，请从 Releases 下载。
 
-### 开发模式启动
+### 开发模式启动（Windows）
 
 ```bash
 # 1. 安装依赖（根目录 + 桌面端各装一次）
 npm install
 cd desktop && npm install && cd ..
 
-# 2. 构建产物（前端 dist/public + 后端 dist/boot.js）
-npm run build
+# 2. 构建（分两步，避免 npm run build 在 cmd 下的引号问题）
+node node_modules/vite/bin/vite.js build
+node build-backend.mjs
 
 # 3. 启动桌面客户端
 npm run app:start
 ```
 
-### 打包成便携 exe
+### 手动打包（Windows）
 
 ```bash
-npm run app:pack        # → desktop/release/AI狼人杀研究平台-<版本号>-portable.exe（双击即可运行）
+cd desktop && node pack.mjs    # → desktop/release/WerewolfAI-<版本号>-setup.exe / -portable.exe
 ```
 
 > **首次登录**：桌面端首启会用 `OWNER_EMAIL`（默认 `owner@example.com`）自动建 owner 账户；初始密码在 `desktop-config.json` 的 `ownerPassword` 字段（首启随机生成）。
-> **环境要求**：桌面端依赖 Electron 内嵌的 Node（`node:sqlite`），构建需 Node.js ≥ 20。
+> **环境要求**：桌面端构建需 Node.js ≥ 22（详见下节「Windows 构建说明」）。
+
+## 🛠️ Windows 构建说明
+
+本项目在 Windows 下构建/打包有几个已知点（`install-client.bat` 与 `desktop/pack.mjs` 已自动处理）：
+
+| 问题 | 说明 | 处理 |
+|---|---|---|
+| Node 版本 | `@noble/hashes` 是纯 ESM，Node 20 无法 `require()` 加载 | 需 Node ≥ 22（脚本自动下载便携 v22） |
+| tailwind 配置 | `tailwind.config.js` 用 `module.exports` 与 `"type":"module"` 冲突 | 已改为 `export default` |
+| esbuild banner | `npm run build` 里 `--banner:js="..."` 引号被 cmd 破坏 | 改用 `build-backend.mjs`（esbuild JS API） |
+| NSIS 中文路径 | 项目在中文路径下，NSIS 编译器会乱码找不到文件 | 打包输出到英文临时目录，再复制回 `release` |
+| 杀软锁文件 | Defender 实时扫描短暂锁 DLL，7za 压缩失败 | `pack.mjs` 内置 7za 重试补丁 |
 
 ## ⚙️ 环境变量
 
