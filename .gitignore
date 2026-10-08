@@ -14,8 +14,9 @@ db/migrations/*.sql
 # TypeScript cache
 *.tsbuildinfo
 # Build outputs
+# 注意：build/ 必须锚定根目录（/build/）——不锚定会误伤 desktop/build/（客户端图标目录）
 dist/
-build/
+/build/
 # Test coverage
 coverage/
 .nyc_output/

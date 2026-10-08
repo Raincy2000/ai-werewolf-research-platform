@@ -16,7 +16,6 @@
   "build": {
     "appId": "com.werewolf.research.desktop",
     "productName": "WerewolfAI",
-    "electronDist": "electron-dist",
     "directories": {
       "output": "release"
     },

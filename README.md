@@ -135,6 +135,7 @@ cd desktop && node pack.mjs    # → desktop/release/WerewolfAI-<版本号>-setu
 | esbuild banner | `npm run build` 里 `--banner:js="..."` 引号被 cmd 破坏 | 改用 `build-backend.mjs`（esbuild JS API） |
 | NSIS 中文路径 | 项目在中文路径下，NSIS 编译器会乱码找不到文件 | 打包输出到英文临时目录，再复制回 `release` |
 | 杀软锁文件 | Defender 实时扫描短暂锁 DLL，7za 压缩失败 | `pack.mjs` 内置 7za 重试补丁 |
+| Electron 直拷加速（可选） | 本机若存在 `desktop/electron-dist/`（解压好的 Electron），打包走直拷快路径；没有则自动走官方下载 | `pack.mjs` 条件注入，CI/新克隆无需任何处理 |
 
 ## ⚙️ 环境变量
 

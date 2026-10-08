@@ -3,7 +3,7 @@
 // 2) 7za 压缩「Defender 锁文件重试」补丁
 // 3) 程序化打包（输出英文临时目录，避免 NSIS 中文路径乱码）
 // 4) 成功后把 exe 复制回 desktop/release/
-import { readFileSync, writeFileSync, copyFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, copyFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, basename } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -72,13 +72,22 @@ const { build, Platform } = await import("electron-builder");
 const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
 const outDir = resolve(tmpdir(), "ww-release-" + (Date.now() % 100000));
 
+// electronDist 条件注入：仅当本机存在已解压的 Electron 副本（desktop/electron-dist，
+// 绕过 Defender 解压锁的本机加速手段，不入库）时才使用；CI/新克隆环境没有该目录，
+// 不传 electronDist —— electron-builder 自动走官方下载通道（硬性要求：配置存在但目录缺失会直接报错）
+const localElectronDist = resolve(process.cwd(), "electron-dist");
+const hasLocalElectronDist = existsSync(resolve(localElectronDist, "electron.exe"));
+console.log(hasLocalElectronDist
+  ? "[pack] 检测到本机 electron-dist，走直拷快路径"
+  : "[pack] 无本机 electron-dist，走官方下载通道");
+
 try {
   const files = await build({
     targets: Platform.WINDOWS.createTarget(["nsis", "portable"]),
     projectDir: process.cwd(),
     config: {
       ...pkg.build,
-      electronDist: resolve(process.cwd(), pkg.build.electronDist ?? "electron-dist"),
+      ...(hasLocalElectronDist ? { electronDist: localElectronDist } : {}),
       directories: { ...pkg.build.directories, output: outDir },
     },
   });
