@@ -310,14 +310,14 @@ const personaRouter = createRouter({
       const { restorePersona } = await import("./queries/personas");
       return restorePersona(input.id, ctx.user.id);
     }),
-  // 回收站彻底删除（级联清除记忆/关系/漂移；尸检报告作为研究档案保留）
+  // 回收站彻底删除（级联清除记忆/关系/漂移；心理检查报告作为研究档案保留）
   destroy: authedProcedure
     .input(z.object({ id: z.number().int().positive() }))
     .mutation(async ({ input, ctx }) => {
       const { destroyPersona } = await import("./queries/personas");
       return destroyPersona(input.id, ctx.user.id);
     }),
-  // 该人格的全部《心理尸检报告》（详情页「尸检报告」页签）
+  // 该人格的全部《心理检查报告》（详情页「心理检查报告」页签）
   reports: authedProcedure
     .input(z.object({ id: z.number().int().positive() }))
     .query(async ({ input, ctx }) => {

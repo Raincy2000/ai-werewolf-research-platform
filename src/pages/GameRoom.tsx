@@ -440,7 +440,7 @@ export default function GameRoom() {
   const [reportOpen, setReportOpen] = useState(false)
   const [analysisMsg, setAnalysisMsg] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
-  // 人格研究库：心理尸检报告（终局由解剖师自动生成；打开弹窗时刷新）
+  // 人格研究库：心理检查报告（终局由心理检查师自动生成；打开弹窗时刷新）
   const [personaReports, setPersonaReports] = useState<PersonaReport[] | null>(null)
   const [personaReportOpen, setPersonaReportOpen] = useState(false)
   // 对局回放控制器（历史对局事件流按真实节奏重现）——
@@ -1026,7 +1026,7 @@ export default function GameRoom() {
       </Button>
     )
 
-  // 心理尸检按钮（本局有人格座位即显示；报告由解剖师在终局异步生成，打开时拉取/刷新）
+  // 心理检查按钮（本局有人格座位即显示；报告由心理检查师在终局异步生成，打开时拉取/刷新）
   const hasPersonaSeats = (snapshot?.players ?? []).some((p) => p.personaName)
   const openPersonaReports = async () => {
     if (!gameId) return
@@ -1040,7 +1040,7 @@ export default function GameRoom() {
   const personaButton = !hasPersonaSeats ? null : (
     <Button size="sm" variant="outline" onClick={() => void openPersonaReports()}>
       <Brain className="h-4 w-4 text-purple-500" aria-hidden />
-      心理尸检
+      心理检查
     </Button>
   )
 
@@ -1577,16 +1577,16 @@ export default function GameRoom() {
           </DialogContent>
         </Dialog>
 
-        {/* 心理尸检弹窗（解剖师终局产出：三转折点 + 双视角 + 参数撕裂还原；按人格座位分页签） */}
+        {/* 心理检查弹窗（心理检查师终局产出：三转折点 + 双视角 + 参数撕裂还原；按人格座位分页签） */}
         <Dialog open={personaReportOpen} onOpenChange={setPersonaReportOpen}>
           <DialogContent className="max-h-[88dvh] overflow-y-auto sm:max-w-[min(1200px,94dvw)]">
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
                 <Brain className="h-5 w-5 text-purple-500" aria-hidden />
-                心理尸检报告
+                心理检查报告
               </DialogTitle>
               <DialogDescription>
-                解剖师为每个人格座位撰写的《心理尸检报告》：同一事件同时给出博弈论与人格动力学解释（铁律4）
+                心理检查师为每个人格座位撰写的《心理检查报告》：同一事件同时给出博弈论与人格动力学解释（铁律4）
               </DialogDescription>
             </DialogHeader>
             {personaReports === null ? (
@@ -1596,8 +1596,8 @@ export default function GameRoom() {
               </p>
             ) : personaReports.length === 0 ? (
               <p className="py-8 text-center text-sm text-muted-foreground">
-                尸检报告尚未生成。终局后由解剖师自动产出（需配置分析师
-                AI）；生成后事件流会有「心理尸检报告已生成」提示，届时重新打开本窗即可。
+                心理检查报告尚未生成。终局后由心理检查师自动产出（需配置分析师
+                AI）；生成后事件流会有「心理检查报告已生成」提示，届时重新打开本窗即可。
               </p>
             ) : (
               <Tabs defaultValue={String(personaReports[0]!.seat)}>
@@ -1613,7 +1613,7 @@ export default function GameRoom() {
                 {personaReports.map((r) => (
                   <TabsContent key={r.id} value={String(r.seat)} className="mt-4">
                     <p className="mb-3 text-xs text-muted-foreground">
-                      解剖师模型 {r.model} · 生成于 {formatTime(r.createdAt)}
+                      心理检查师模型 {r.model} · 生成于 {formatTime(r.createdAt)}
                     </p>
                     <MarkdownBoard content={r.report} />
                   </TabsContent>

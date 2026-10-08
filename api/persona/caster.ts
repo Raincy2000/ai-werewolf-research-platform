@@ -128,22 +128,40 @@ export async function postChat(
     data && typeof data === "object"
       ? String((data as { error?: { message?: unknown } }).error?.message ?? raw)
       : raw;
-  let { status, data, raw } = await post();
-  // 端点不支持 SSE 流式：400 时去掉 stream 重试（后续回退链同此模式）
-  if (status === 400 && body.stream === true) {
-    delete body.stream;
-    ({ status, data, raw } = await post());
+  // 单次尝试：流式优先 + 400 回退链（去 stream / 去 temperature）
+  const attempt = async (): Promise<unknown> => {
+    let { status, data, raw } = await post();
+    // 端点不支持 SSE 流式：400 时去掉 stream 重试（后续回退链同此模式）
+    if (status === 400 && body.stream === true) {
+      delete body.stream;
+      ({ status, data, raw } = await post());
+    }
+    // 思考类模型（如 kimi-k2.5）端点只允许 temperature=1：400 且报错点名 temperature 时，
+    // 去掉该参数重试一次（与 providers.ts 主链路同款兼容，铸魂师三 AI 同样可能踩中）
+    if (status === 400 && "temperature" in body && /temperature/i.test(errText(data, raw))) {
+      delete body.temperature;
+      ({ status, data, raw } = await post());
+    }
+    if (status < 200 || status >= 300) {
+      throw new Error(httpErrorMessage(status, errText(data, raw)));
+    }
+    return data;
+  };
+  // 流式中断整调用重发：长生成 SSE 中途被网关/中间盒掐断（实锤：12 分钟级 terminated）
+  // 此前一发就死——fetchWithRetry 只能管到响应头到达之前，流中死亡需要整调用级重试；
+  // HTTP 语义错误（参数/鉴权）重试无意义，立即抛
+  let lastErr: unknown = null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await attempt();
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/^HTTP \d/.test(msg)) throw err;
+      if (i < 2) await new Promise((r) => setTimeout(r, 2_000 * (i + 1)));
+    }
   }
-  // 思考类模型（如 kimi-k2.5）端点只允许 temperature=1：400 且报错点名 temperature 时，
-  // 去掉该参数重试一次（与 providers.ts 主链路同款兼容，铸魂师三 AI 同样可能踩中）
-  if (status === 400 && "temperature" in body && /temperature/i.test(errText(data, raw))) {
-    delete body.temperature;
-    ({ status, data, raw } = await post());
-  }
-  if (status < 200 || status >= 300) {
-    throw new Error(httpErrorMessage(status, errText(data, raw)));
-  }
-  return data;
+  throw lastErr;
 }
 
 // ---------- kimi-k3 联网检索：Formula API 官方工具通道 ----------
@@ -1226,6 +1244,12 @@ export async function castPersona(
       let draft = sanitizeCastedDraft(obj, name);
       if (!webSearched) draft = markAllInferred(draft);
       const check = personaInputSchema.safeParse(draft);
+      // 空壳拦截（实锤：张雪峰一轮合成产出全空 profile 却通过 schema——各字段只有 max 无 min）。
+      // 档案正文两段为空 = 合成失败，按校验未过走重修/重试，绝不让空壳入库
+      if (check.success && (!draft.profile.summary.trim() || !draft.profile.persona.trim())) {
+        lastIssues = "合成产出为空壳（summary/persona 均空）——请基于①档案与②深读真实撰写完整档案";
+        continue;
+      }
       if (check.success) {
         // 肖像定案：③的 portraitChoice 命中候选下载集则用其 data URL；
         // 未命中/未选 → 第一张下载成功的候选；全灭 → 参考页 og:image 兜底

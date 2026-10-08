@@ -71,19 +71,20 @@ import { callAi } from "./ai/providers";
 import { defaultCallTimeoutMs, isThinkingModel } from "./ai/modelCaps";
 import { buildPrompt, modelContextTokens } from "./ai/prompts";
 import { parseDecision } from "./ai/parse";
-import { buildPersonaCircleText } from "./personaVisibility";
+import { buildPersonaCircleText, injectCircleText, type PersonaBondInfo } from "./personaVisibility";
 import type { PersonaCard, PersonaEventMeta, PersonaSeatInfo } from "../../contracts/persona";
 import {
   getPersona,
   getPersonaCardsInternal,
   getPersonaReportsForGame,
   incrementPersonaGameCount,
+  listRelationshipsAmong,
   loadMemoryContext,
   upsertPersonaReport,
 } from "../queries/personas";
 import { runPersonaPipeline } from "../persona/pipeline";
 import { runNotebookWriteback } from "../persona/notebook";
-import { runAutopsy } from "../persona/anatomist";
+import { runPsyCheck } from "../persona/anatomist";
 
 export interface GameService {
   // userId 由路由层强制传入（归属校验）；测试/内部路径可省略（省略时不做归属拦截）
@@ -104,7 +105,7 @@ export interface GameService {
   updateGuide(userId: string, scope: string, content: string): Promise<import("../../contracts/game").GuideInfo>;
   getAnalysis(gameId: string, userId: string): Promise<{ report: import("../../contracts/game").AnalysisReport | null; jobStatus: import("../../contracts/game").AnalysisJobStatus; jobStage: import("../../contracts/game").AnalysisJobStage; jobError: string | null }>;
   generateAnalysis(gameId: string, userId: string, analyst?: import("../../contracts/game").AnalystAiConfig): Promise<{ started: boolean }>;
-  /** 人格研究库：本局人格座位的《心理尸检报告》列表（对局页查看入口） */
+  /** 人格研究库：本局人格座位的《心理检查报告》列表（对局页查看入口） */
   personaReports(gameId: string, userId: string): Promise<import("../../contracts/persona").PersonaReport[]>;
 }
 
@@ -199,8 +200,79 @@ export interface GameRuntime {
   personaMemory?: Map<number, string>;
   // 涌现事件注解暂存（座位 → 本决策点的人格注解）：事件落盘前富化到 meta.persona 后清空
   personaEventMeta?: Map<number, PersonaEventMeta>;
-  // 终局收尾（尸检+记忆回写）防重标记
+  // 终局收尾（心理检查+记忆回写）防重标记
   personaEpilogueDone?: boolean;
+  // 圈层羁绊缓存（观察者 personaId → 与在场人格的关系行）：首个人格决策点惰性加载，
+  // 局内不变（关系只在终局回写时更新），避免每决策点重复查库
+  personaBondRows?: Map<number, RelationshipRowLite[]>;
+}
+
+/** 圈层羁绊的关系行最简形态（查询层 RelationshipRow 的字段子集，service 内自洽） */
+interface RelationshipRowLite {
+  personaId: number;
+  targetPersonaId: number | null;
+  targetName: string;
+  relation: string;
+  affinity: number;
+  trust: number;
+  note: string;
+}
+
+/** 取观察者座位的在场羁绊：记事簿跨局关系（双方都在本局）+ 档案互提的原作渊源。
+ *  返回 null 表示本局无人格绑定（连圈层都不需要装配）。 */
+async function getSeatBonds(rt: GameRuntime, seat: number): Promise<PersonaBondInfo[] | null> {
+  if (!rt.seatPersonas || rt.seatPersonas.length === 0) return null;
+  const me = rt.seatPersonas.find((b) => b.seat === seat);
+  if (!me) return []; // 观察者本人无人格卡：无圈层视角（不会走到这里，防御）
+  if (!rt.personaBondRows) {
+    const ids = rt.seatPersonas.map((b) => b.personaId);
+    const rows = await listRelationshipsAmong(ids).catch(() => []);
+    rt.personaBondRows = new Map();
+    for (const r of rows) {
+      const list = rt.personaBondRows.get(r.personaId) ?? [];
+      list.push(r);
+      rt.personaBondRows.set(r.personaId, list);
+    }
+  }
+  const seatOf = new Map(rt.seatPersonas.map((b) => [b.personaId, b.seat] as const));
+  const out: PersonaBondInfo[] = [];
+  for (const r of rt.personaBondRows.get(me.personaId) ?? []) {
+    const tSeat = r.targetPersonaId != null ? seatOf.get(r.targetPersonaId) : undefined;
+    if (tSeat == null) continue;
+    out.push({
+      seat: tSeat,
+      name: r.targetName,
+      relation: r.relation,
+      affinity: r.affinity,
+      trust: r.trust,
+      note: r.note,
+    });
+  }
+  // 原作渊源：观察者自己的档案（重要关系栏）提到在场人格的人格名/原型名
+  //（如五条悟档案记载夏油杰）——曾有羁绊的角色同场时，这是最直接的认知依据
+  const relText = rt.personaCards?.get(seat)?.profile.relationships?.trim() ?? "";
+  if (relText) {
+    for (const b of rt.seatPersonas) {
+      if (b.seat === seat || out.some((o) => o.seat === b.seat)) continue;
+      const card = rt.personaCards?.get(b.seat);
+      const hit = [b.name, card?.originName ?? ""].filter(Boolean).find((n) => relText.includes(n));
+      if (hit) {
+        // 截取档案中记载对方的那一句（按句切分）
+        const sentence =
+          relText.split(/[。！？!?\n；;]/).find((s) => s.includes(hit))?.trim() ?? "";
+        out.push({
+          seat: b.seat,
+          name: b.name,
+          relation: "",
+          affinity: 0,
+          trust: 0,
+          note: "",
+          origin: `你的档案记载着你们的渊源${sentence ? `（「${sentence.slice(0, 60)}」）` : ""}`,
+        });
+      }
+    }
+  }
+  return out;
 }
 
 export const registry = new Map<string, GameRuntime>();
@@ -670,20 +742,29 @@ async function askAiOnce(
         modelContext: personaModelContext,
       });
       // 人格圈层可见度：仅人格座位注入（普通 AI 不受影响）——
-      // 三档（full 全见姓名+外貌气质/partial 勾选迷雾/none 全员迷雾），不破身份壁垒
+      // 三档（full 全见/partial 勾选迷雾/none 全员迷雾），不破身份壁垒；
+      // 含人格名互称指引与羁绊注入（记事簿跨局关系 + 档案互提原作渊源）
       const circleText = buildPersonaCircleText(
         pending.seat,
-        (rt.seatPersonas ?? []).map((b) => ({
-          seat: b.seat,
-          name: b.name,
-          // 外貌与气质取自完整人格卡（断点恢复时卡已删的座位自动退化为仅姓名）
-          appearance: rt.personaCards?.get(b.seat)?.profile.appearance ?? null,
-        })),
+        (rt.seatPersonas ?? []).map((b) => {
+          const card = rt.personaCards?.get(b.seat);
+          return {
+            seat: b.seat,
+            name: b.name,
+            // 外貌气质与基本印象取自完整人格卡（断点恢复时卡已删的座位自动退化为仅姓名）
+            appearance: card?.profile.appearance ?? null,
+            summary: card?.profile.summary?.trim() ?? null,
+            originSource: card?.originSource ?? null,
+          };
+        }),
         rt.options.personaVisibility,
         rt.options.personaFogSeats,
+        (await getSeatBonds(rt, pending.seat)) ?? undefined,
       );
       if (circleText) {
-        base.user = `${base.user}\n\n${circleText}`;
+        // 注入位铁律：必须落在【输出契约】之前——人格管线会截断契约后的部分
+        //（对局 20260930001 实锤：尾部追加被静默切断，人格玩家全程互不认识）
+        base.user = injectCircleText(base.user, circleText);
       }
       const personaRes = await runPersonaPipeline({
         cfg,
@@ -1814,13 +1895,13 @@ async function finishIfDone(gameId: string, rt: GameRuntime): Promise<boolean> {
   // 自动分析触发：统一由开头 markDecidedIfNeeded 完成（分出胜负即启动，此处不重复启动）
   // 终局保底：最后再评估一次胜率（在飞则记 winRateFinalPending，在飞完成的 finally 里补）
   maybeWinRateTick(gameId, rt);
-  // 人格研究库终局收尾：记事簿回写（记忆/关系/漂移）+ 心理尸检报告（铁律3/4，自主调度关键节点）
+  // 人格研究库终局收尾：记事簿回写（记忆/关系/漂移）+ 心理检查报告（铁律3/4，自主调度关键节点）
   triggerPersonaEpilogue(gameId, rt);
   return true;
 }
 
-/** 人格终局收尾编排：对每个人格座位「记事簿回写 → 尸检报告 → 参战计数」，人格之间并行、
- * 单人格局部保序（漂移先于尸检，报告反映漂移后参数）——全部人格串行曾是纯浪费
+/** 人格终局收尾编排：对每个人格座位「记事簿回写 → 心理检查报告 → 参战计数」，人格之间并行、
+ * 单人格局部保序（漂移先于心理检查，报告反映漂移后参数）——全部人格串行曾是纯浪费
  * （5 人格 × 2 次长调用串行 5-40 分钟尾巴；各人格链路相互独立，并行不损内容质量）。
  * 关键节点写事件流汇报（铁律5：自行决定，汇报结果）；复用分析师配置（未配置则跳过） */
 function triggerPersonaEpilogue(gameId: string, rt: GameRuntime): void {
@@ -1840,7 +1921,7 @@ function triggerPersonaEpilogue(gameId: string, rt: GameRuntime): void {
           actor: null,
           actorLabel: null,
           title: "人格收尾失败",
-          content: `人格终局收尾（记事簿/尸检）异常：${errMessage(err).slice(0, 300)}`,
+          content: `人格终局收尾（记事簿/心理检查）异常：${errMessage(err).slice(0, 300)}`,
           thought: null,
           meta: null,
         },
@@ -1853,7 +1934,7 @@ function triggerPersonaEpilogue(gameId: string, rt: GameRuntime): void {
 
 async function runPersonaEpilogueJob(gameId: string, rt: GameRuntime): Promise<void> {
   const analyst = rt.analystAi;
-  if (!analyst || analyst.autoGenerate === false) return; // 解剖师/记事簿复用分析师配置
+  if (!analyst || analyst.autoGenerate === false) return; // 心理检查师/记事簿复用分析师配置
   const cfg: SeatAiConfig = { ...analyst, seat: 0 };
   const row = await getGame(gameId);
   if (!row) return;
@@ -1864,7 +1945,7 @@ async function runPersonaEpilogueJob(gameId: string, rt: GameRuntime): Promise<v
   const seats = [...(rt.personaCards?.entries() ?? [])];
   const others = seats.map(([seat, card]) => ({ seat, name: card.name, personaId: card.id }));
 
-  // 单个人格的收尾链（局部保序：回写→尸检→计数）；人格之间并行
+  // 单个人格的收尾链（局部保序：回写→心理检查→计数）；人格之间并行
   const epilogueForSeat = async (seat: number, card: (typeof seats)[number][1]): Promise<void> => {
     const player = snapshot.players.find((p) => p.seat === seat);
     const roleName = player?.roleName ?? "未知身份";
@@ -1916,9 +1997,9 @@ async function runPersonaEpilogueJob(gameId: string, rt: GameRuntime): Promise<v
         },
       ]);
     }
-    // ---- 解剖师：《心理尸检报告》 ----
+    // ---- 心理检查师：《心理检查报告》 ----
     try {
-      const report = await runAutopsy(cfg, { card, seat, roleName, outcome, digest, gameTitleNo: row.titleNo ?? "" });
+      const report = await runPsyCheck(cfg, { card, seat, roleName, outcome, digest, gameTitleNo: row.titleNo ?? "" });
       await upsertPersonaReport({ gameId, personaId: card.id, seat, report, model: cfg.model });
       await appendEvents([
         {
@@ -1929,8 +2010,8 @@ async function runPersonaEpilogueJob(gameId: string, rt: GameRuntime): Promise<v
           type: "system",
           actor: null,
           actorLabel: null,
-          title: "心理尸检报告已生成",
-          content: `「${card.name}」（${seat}号）的《心理尸检报告》已生成：三个转折点 + 参数撕裂还原，可在本页「心理尸检」按钮与人格详情页查看。`,
+          title: "心理检查报告已生成",
+          content: `「${card.name}」（${seat}号）的《心理检查报告》已生成：三个转折点 + 参数撕裂还原 + 人格状态与走向，可在本页「心理检查」按钮与人格详情页查看。`,
           thought: null,
           meta: null,
         },
@@ -1945,8 +2026,8 @@ async function runPersonaEpilogueJob(gameId: string, rt: GameRuntime): Promise<v
           type: "system",
           actor: null,
           actorLabel: null,
-          title: "尸检报告生成失败",
-          content: `「${card.name}」（${seat}号）尸检报告生成失败：${errMessage(err).slice(0, 200)}`,
+          title: "心理检查报告生成失败",
+          content: `「${card.name}」（${seat}号）心理检查报告生成失败：${errMessage(err).slice(0, 200)}`,
           thought: null,
           meta: null,
         },
@@ -3198,7 +3279,7 @@ async function generateAnalysis(
   return { started: true };
 }
 
-/** 人格研究库：本局人格座位的《心理尸检报告》列表（归属校验后返回） */
+/** 人格研究库：本局人格座位的《心理检查报告》列表（归属校验后返回） */
 async function personaReports(gameId: string, userId: string) {
   await requireOwnedGame(gameId, userId);
   return getPersonaReportsForGame(gameId);

@@ -254,7 +254,7 @@ export const personaDriftLog = mysqlTable(
   (t) => [index("idx_pdrift_persona").on(t.personaId)],
 );
 
-// 心理尸检报告表（解剖师产出：一局一人格一份，重复生成则覆盖）
+// 心理检查报告表（心理检查师产出：一局一人格一份，重复生成则覆盖）
 export const personaReports = mysqlTable(
   "persona_reports",
   {

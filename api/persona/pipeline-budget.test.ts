@@ -6,6 +6,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { PendingDecision } from "../game/engine/api";
 import type { PersonaCard } from "../../contracts/persona";
 import { defaultPersonaParams, emptyPersonaProfile } from "../../contracts/persona";
+import { injectCircleText } from "../game/personaVisibility";
 
 // ---------- 夹具 ----------
 function makeCard(): PersonaCard {
@@ -64,14 +65,14 @@ const VALID_EMERGENCE = '{"thought":"权衡","speech":"大家好，我先听听�
 
 // ---------- callAi 记录器：按调用顺序出脚本 ----------
 const h = {
-  calls: [] as { timeoutMs?: number; deadlineAt?: number; system: string }[],
+  calls: [] as { timeoutMs?: number; deadlineAt?: number; system: string; user: string }[],
   script: [] as ({ ok: boolean; text: string | null } | "hang")[],
   t0: 0,
 };
 
 vi.mock("../game/ai/providers", () => ({
-  callAi: async (_cfg: unknown, system: string, _user: string, opts?: { timeoutMs?: number; deadlineAt?: number }) => {
-    h.calls.push({ timeoutMs: opts?.timeoutMs, deadlineAt: opts?.deadlineAt, system });
+  callAi: async (_cfg: unknown, system: string, user: string, opts?: { timeoutMs?: number; deadlineAt?: number }) => {
+    h.calls.push({ timeoutMs: opts?.timeoutMs, deadlineAt: opts?.deadlineAt, system, user });
     const next = h.script.shift() ?? { ok: false, text: null };
     if (next === "hang") return { ok: false, text: null, latencyMs: 1, error: "请求超时" };
     return next.ok
@@ -153,5 +154,56 @@ describe("双程管线预算纪律（涌现优先）", () => {
     });
     expect(res.decision).not.toBeNull();
     expect(h.calls.length).toBe(2);
+  });
+});
+
+
+describe("圈层文本抵达管线（对局 20260930001 截断事故回归）", () => {
+  // 事故：service 曾把圈层文本追加在 base.user 尾部（【输出契约】之后），
+  // 人格单/双程都在契约处截断 → 文本从未抵达 AI → 人格玩家全程互不认识。
+  // 修复后：injectCircleText 落在契约前，双程涌现层与单程合并层都必须收到。
+  const BASE_WITH_CONTRACT = {
+    system: "系统提示",
+    user: "【对局状态】第1天\n【公开记录】1. 2号发言\n\n【输出契约】严格输出 JSON……",
+  };
+
+  it("双程：涌现层收到的 user 含圈层文本（在契约段之前）", async () => {
+    h.script.push({ ok: true, text: VALID_MIRROR }, { ok: true, text: VALID_EMERGENCE });
+    const base = {
+      ...BASE_WITH_CONTRACT,
+      user: injectCircleText(BASE_WITH_CONTRACT.user, "【人格圈层】3号=张雪峰，基本印象：考研名师"),
+    };
+    const res = await runPersonaPipeline({
+      cfg: CFG,
+      card: makeCard(),
+      memoryText: null,
+      pending: makePending(),
+      base,
+      modelContext: 1_048_576, // 双程
+      deadlineAt: h.t0 + 260_000,
+    });
+    expect(res.decision).not.toBeNull();
+    const emergeUser = h.calls.at(-1)!.user;
+    expect(emergeUser).toContain("【人格圈层】3号=张雪峰");
+    expect(emergeUser.indexOf("人格圈层")).toBeLessThan(emergeUser.indexOf("【输出契约】"));
+  });
+
+  it("单程：合并层收到的 user 同样含圈层文本", async () => {
+    h.script.push({ ok: true, text: '{"mirror":{"pressures":[{"param":"bigFive.neuroticism","value":85,"reason":"被质疑"}]},"thought":"权衡","speech":"我先听听。"}' });
+    const base = {
+      ...BASE_WITH_CONTRACT,
+      user: injectCircleText(BASE_WITH_CONTRACT.user, "【人格圈层】5号=五条悟"),
+    };
+    const res = await runPersonaPipeline({
+      cfg: CFG,
+      card: makeCard(),
+      memoryText: null,
+      pending: makePending(),
+      base,
+      modelContext: 16_384, // 单程合并
+      deadlineAt: h.t0 + 260_000,
+    });
+    expect(res.decision).not.toBeNull();
+    expect(h.calls.at(-1)!.user).toContain("【人格圈层】5号=五条悟");
   });
 });

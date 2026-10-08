@@ -130,7 +130,7 @@ export const gameRouter = createRouter({
     }))
     .mutation(({ input, ctx }) => gameService.generateAnalysis(input.gameId, ctx.user.id, input.analystAi)),
 
-  // 人格研究库：本局人格座位的《心理尸检报告》（对局页「心理尸检」入口）
+  // 人格研究库：本局人格座位的《心理检查报告》（对局页「心理检查」入口）
   personaReports: authedProcedure
     .input(z.object({ gameId: z.string() }))
     .query(({ input, ctx }) => gameService.personaReports(input.gameId, ctx.user.id)),

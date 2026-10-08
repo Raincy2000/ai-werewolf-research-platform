@@ -462,9 +462,9 @@ export interface GameApi {
   fetchPortrait(url: string): Promise<{ imageData: string | null }>
   /** 铸造草稿确认入库（persona.createCasted，source="ai-cast"） */
   createCastedPersona(input: PersonaCardInput): Promise<PersonaCard>
-  /** 该人格的全部尸检报告（persona.reports） */
+  /** 该人格的全部心理检查报告（persona.reports） */
   listPersonaReports(id: number): Promise<PersonaReport[]>
-  /** 本局人格座位的尸检报告（game.personaReports） */
+  /** 本局人格座位的心理检查报告（game.personaReports） */
   getGamePersonaReports(gameId: string): Promise<PersonaReport[]>
 }
 

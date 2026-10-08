@@ -124,7 +124,7 @@ function paramsDigest(card: PersonaCard): string {
 function profileDigest(card: PersonaCard): string {
   const pr = card.profile;
   // 人格精粹优先（三步铸魂师产出的行为指导级蒸馏）：大档案不失效的关键——
-  // 对局注入只取精粹，完整档案留给展示/尸检/记事簿
+  // 对局注入只取精粹，完整档案留给展示/心理检查/记事簿
   if (pr.essence?.trim()) {
     const extras = [
       pr.quotes.length > 0 && `口头禅：${pr.quotes.slice(0, 3).join("／")}`,
@@ -589,7 +589,7 @@ export async function runPersonaPipeline(opts: {
     thought = decision.thought ?? "";
   }
 
-  // 张力模板覆盖 thought（观察者可见的心理解剖；涌现原文进【涌现输出】段）
+  // 张力模板覆盖 thought（观察者可见的心理检查注解；涌现原文进【涌现输出】段）
   const fullThought = formatTensionTemplate(card, mirror, extras.bodyTrace, thought);
   decision.thought = fullThought;
 

@@ -1,6 +1,6 @@
 // ============================================================
 // 人格研究库 — 前后端共享契约
-// 「数字人类心理学实验场」的人格参数卡 / 记忆 / 关系 / 漂移 / 尸检报告类型唯一事实源。
+// 「数字人类心理学实验场」的人格参数卡 / 记忆 / 关系 / 漂移 / 心理检查报告类型唯一事实源。
 // 设计铁律：
 // 1. 人格量化：所有维度 0-100 连续量化，禁止二选一（多组冲突参数必须能同时拉扯）
 // 2. 推断项：铸魂师补全的字段在 params.inferred 里留路径标记，报告附录可追溯
@@ -128,7 +128,7 @@ export interface PersonaProfile {
   relationships: string; // 重要关系（人物关系网）
   quotes: string[]; // 标志性语录/口头禅（≤5，涌现层语气锚点）
   speechStyle: string; // 语言风格描述（用词/节奏/口癖）
-  // ---- 完整档案扩展区（三步铸魂师产出；展示/尸检/记事簿用） ----
+  // ---- 完整档案扩展区（三步铸魂师产出；展示/心理检查/记事簿用） ----
   appearance?: string; // 外貌与气质（肖像文字版；以人物最新状态为准：在世取当下/已故取终态）
   values?: string; // 价值观与信念
   desires?: string; // 欲望与驱动力
@@ -233,14 +233,14 @@ export interface PersonaDriftEntry {
   createdAt: string;
 }
 
-// ---------- 心理尸检报告（解剖师产出，一局一人格一份） ----------
+// ---------- 心理检查报告（心理检查师产出，一局一人格一份） ----------
 export interface PersonaReport {
   id: number;
   gameId: string;
   personaId: number;
   seat: number;
-  report: string; // 《心理尸检报告》全文（markdown）
-  model: string; // 解剖师所用模型
+  report: string; // 《心理检查报告》全文（markdown）
+  model: string; // 心理检查师所用模型
   createdAt: string;
 }
 

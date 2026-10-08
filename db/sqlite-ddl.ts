@@ -231,7 +231,7 @@ CREATE TABLE \`library_docs\` (
 );
 `;
 
-// 增量 DDL（0002：人格研究库五表——人格参数卡/自传体记忆/关系图谱/人格漂移/尸检报告）
+// 增量 DDL（0002：人格研究库五表——人格参数卡/自传体记忆/关系图谱/人格漂移/心理检查报告）
 // 老库升级用（users/library_docs 已存在但缺 personas 表时执行；与 SQLITE_DDL 尾部保持同构）
 export const SQLITE_DDL_0002 = `
 CREATE TABLE \`persona_drift_log\` (

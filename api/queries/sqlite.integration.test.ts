@@ -350,11 +350,11 @@ describe("SQLite 方言：人格研究库", () => {  const personaInput = () => 
     expect(await personasQ.getPersona(created.id, UID)).toBeNull();
   });
 
-  it("记事簿读取 + 软删连体保留 + 还原 + 彻底删除级联（尸检报告保留）", async () => {
+  it("记事簿读取 + 软删连体保留 + 还原 + 彻底删除级联（心理检查报告保留）", async () => {
     await seedUser();
     const created = await personasQ.createPersona(UID, personaInput());
     const db = getDb();
-    // 直接落库三类记事簿数据 + 一份尸检报告（写入管线 P4 才开放，这里验证表结构与回收站语义）
+    // 直接落库三类记事簿数据 + 一份心理检查报告（写入管线 P4 才开放，这里验证表结构与回收站语义）
     await db.insert(tbl.personaMemories).values({
       personaId: created.id, gameId: "g-x", type: "trauma",
       content: "第2夜被挚友 3 号投出局，信任崩塌。", emotionalWeight: 90, strength: 80,
@@ -368,7 +368,7 @@ describe("SQLite 方言：人格研究库", () => {  const personaInput = () => 
       changes: [{ path: "attachment.anxiety", from: 30, to: 45, reason: "被盟友背叛" }], note: "首局后漂移",
     });
     await db.insert(tbl.personaReports).values({
-      gameId: "g-x", personaId: created.id, seat: 2, report: "# 心理尸检报告", model: "mock",
+      gameId: "g-x", personaId: created.id, seat: 2, report: "# 心理检查报告", model: "mock",
     });
 
     const mem = await personasQ.listPersonaMemories(created.id, UID);
@@ -400,7 +400,7 @@ describe("SQLite 方言：人格研究库", () => {  const personaInput = () => 
     expect((await personasQ.listPersonaDrift(created.id, UID))?.length).toBe(1);
     expect((await personasQ.listPersonaTrash(UID)).length).toBe(0);
 
-    // 彻底删除（需先在回收站）：级联清除记忆/关系/漂移；尸检报告作为研究档案保留
+    // 彻底删除（需先在回收站）：级联清除记忆/关系/漂移；心理检查报告作为研究档案保留
     expect(await personasQ.destroyPersona(created.id, UID)).toBe(false); // 未入回收站不可直删
     expect(await personasQ.deletePersona(created.id, UID)).toBe(true);
     expect(await personasQ.destroyPersona(created.id, UID)).toBe(true);
@@ -409,6 +409,27 @@ describe("SQLite 方言：人格研究库", () => {  const personaInput = () => 
     expect((await db.select().from(tbl.personaDriftLog)).length).toBe(0);
     expect((await db.select().from(tbl.personas)).length).toBe(0);
     expect((await db.select().from(tbl.personaReports)).length).toBe(1);
+  });
+
+  it("圈层羁绊查询：listRelationshipsAmong 只返回双方都在集合内的关系", async () => {
+    await seedUser();
+    const a = await personasQ.createPersona(UID, personaInput());
+    const b = await personasQ.createPersona(UID, { ...personaInput(), name: "刘备" });
+    const c = await personasQ.createPersona(UID, { ...personaInput(), name: "孙权" });
+    const db = getDb();
+    // A→B（在场两人）、B→A、C→A（C 不在查询集合）、A→场外自由文本（无 targetPersonaId）
+    await db.insert(tbl.personaRelationships).values([
+      { personaId: a.id, targetPersonaId: b.id, targetName: "刘备", relation: "宿怨", affinity: -60, trust: 20, note: "赤壁旧账" },
+      { personaId: b.id, targetPersonaId: a.id, targetName: "曹操", relation: "警惕", affinity: -30, trust: 40, note: "" },
+      { personaId: c.id, targetPersonaId: a.id, targetName: "曹操", relation: "中立", affinity: 0, trust: 50, note: "" },
+      { personaId: a.id, targetPersonaId: null, targetName: "袁绍", relation: "旧识", affinity: 10, trust: 50, note: "" },
+    ]);
+    const rows = await personasQ.listRelationshipsAmong([a.id, b.id]);
+    expect(rows.length).toBe(2); // 仅 A→B 与 B→A（双方都在场）
+    expect(rows.every((r) => [a.id, b.id].includes(r.personaId) && [a.id, b.id].includes(r.targetPersonaId!))).toBe(true);
+    expect(rows.some((r) => r.relation === "宿怨" && r.note === "赤壁旧账")).toBe(true);
+    expect(await personasQ.listRelationshipsAmong([a.id])).toEqual([]); // 少于 2 张卡直接空
+    expect(await personasQ.listRelationshipsAmong([])).toEqual([]);
   });
 
   it("回收站惰性过期清理：超过 30 天保留期的软删人格被彻底删除", async () => {

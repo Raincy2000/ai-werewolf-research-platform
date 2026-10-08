@@ -316,9 +316,9 @@ export default function Personas() {
   // 详情
   const [detail, setDetail] = useState<PersonaDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
-  // 详情页尸检报告（打开详情时一并拉取）
+  // 详情页心理检查报告（打开详情时一并拉取）
   const [detailReports, setDetailReports] = useState<PersonaReport[]>([])
-  // 尸检报告阅读窗
+  // 心理检查报告阅读窗
   const [reportView, setReportView] = useState<PersonaReport | null>(null)
   // 删除确认
   const [deleteTarget, setDeleteTarget] = useState<PersonaCardSummary | null>(null)
@@ -558,7 +558,7 @@ export default function Personas() {
       const d = await api.getPersonaDetail(id)
       if (d) {
         setDetail(d)
-        // 尸检报告随详情一并拉取（解剖师终局产出，可能为空）
+        // 心理检查报告随详情一并拉取（心理检查师终局产出，可能为空）
         setDetailReports(await api.listPersonaReports(id).catch(() => []))
       }
     } catch {
@@ -1089,7 +1089,7 @@ export default function Personas() {
                 </div>
               </section>
 
-              {/* 完整档案扩展区（三步铸魂师自动填充；展示/尸检/记事簿用） */}
+              {/* 完整档案扩展区（三步铸魂师自动填充；展示/心理检查/记事簿用） */}
               <section className="space-y-3">
                 <h3 className="text-sm font-medium text-foreground">
                   完整档案扩展区
@@ -1137,7 +1137,7 @@ export default function Personas() {
                     placeholder="TA 的核心冲突如何表现为具体言行；什么情境会点燃 TA；TA 怎样说话、如何隐藏（AI 铸造会自动生成，可在此基础上精修）"
                   />
                   <p className="text-[10px] text-muted-foreground">
-                    心镜与涌现层只注入精粹与语气锚点，完整档案用于展示/尸检/记事簿——保证信息量大但对局中不失效
+                    心镜与涌现层只注入精粹与语气锚点，完整档案用于展示/心理检查/记事簿——保证信息量大但对局中不失效
                   </p>
                 </div>
               </section>
@@ -1341,7 +1341,7 @@ export default function Personas() {
                   <TabsTrigger value="memories">记忆（{detail.memories.length}）</TabsTrigger>
                   <TabsTrigger value="relations">关系（{detail.relationships.length}）</TabsTrigger>
                   <TabsTrigger value="drift">漂移（{detail.drift.length}）</TabsTrigger>
-                  <TabsTrigger value="reports">尸检报告（{detailReports.length}）</TabsTrigger>
+                  <TabsTrigger value="reports">心理检查报告（{detailReports.length}）</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="profile" className="mt-4 space-y-3 text-sm">
@@ -1536,7 +1536,7 @@ export default function Personas() {
                 <TabsContent value="reports" className="mt-4">
                   {detailReports.length === 0 ? (
                     <p className="py-8 text-center text-sm text-muted-foreground">
-                      暂无尸检报告。该人格完赛一局后，解剖师会自动生成《心理尸检报告》（三个转折点 +
+                      暂无心理检查报告。该人格完赛一局后，心理检查师会自动生成《心理检查报告》（三个转折点 +
                       参数撕裂还原）。
                     </p>
                   ) : (
@@ -1550,7 +1550,7 @@ export default function Personas() {
                             {r.seat}号
                           </Badge>
                           <span className="text-sm font-medium text-foreground">
-                            《心理尸检报告》
+                            《心理检查报告》
                           </span>
                           <span className="text-xs text-muted-foreground">
                             对局 {r.gameId.slice(0, 8)} · {r.model} · {formatTime(r.createdAt)}
@@ -1570,11 +1570,11 @@ export default function Personas() {
         </DialogContent>
       </Dialog>
 
-      {/* 尸检报告阅读窗 */}
+      {/* 心理检查报告阅读窗 */}
       <Dialog open={reportView !== null} onOpenChange={(open) => !open && setReportView(null)}>
         <DialogContent className="max-h-[85dvh] max-w-3xl overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>《心理尸检报告》</DialogTitle>
+            <DialogTitle>《心理检查报告》</DialogTitle>
             <DialogDescription>
               {reportView
                 ? `对局 ${reportView.gameId.slice(0, 8)} · ${reportView.seat}号 · ${reportView.model} · ${formatTime(reportView.createdAt)}`
@@ -1600,7 +1600,7 @@ export default function Personas() {
             <AlertDialogTitle>删除人格卡「{deleteTarget?.name}」？</AlertDialogTitle>
             <AlertDialogDescription>
               将移入回收站：30 天内可一键还原（其记忆、关系与漂移历程连体保留、原样恢复），到期自动彻底清除；
-              已生成对局中的事件与尸检报告保留在研究档案中。
+              已生成对局中的事件与心理检查报告保留在研究档案中。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1680,7 +1680,7 @@ export default function Personas() {
           <AlertDialogHeader>
             <AlertDialogTitle>彻底删除「{destroyTarget?.name}」？</AlertDialogTitle>
             <AlertDialogDescription>
-              人格卡及其全部记忆、关系与漂移历程将被永久清除，不可恢复（尸检报告保留在研究档案中）。
+              人格卡及其全部记忆、关系与漂移历程将被永久清除，不可恢复（心理检查报告保留在研究档案中）。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

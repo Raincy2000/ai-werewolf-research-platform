@@ -1,7 +1,7 @@
 {
   "name": "werewolf-desktop",
   "private": true,
-  "version": "0.3.11",
+  "version": "0.3.14",
   "description": "AI模拟狼人杀研究平台 - 桌面客户端（本地 SQLite，对局数据不出本机）",
   "main": "main.mjs",
   "scripts": {

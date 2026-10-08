@@ -182,7 +182,7 @@ export async function updatePersona(
   return getPersona(id, userId);
 }
 
-/** 删除人格卡并级联清理其记忆/关系/漂移（尸检报告保留——它属于对局研究档案） */
+/** 删除人格卡并级联清理其记忆/关系/漂移（心理检查报告保留——它属于对局研究档案） */
 // ---------- 回收站（软删除 → 30 天保留期 → 惰性彻底删除） ----------
 
 /** 删除 = 移入回收站（软删）：人格本体标记 deleted_at，记忆/关系/漂移/报告全部保留——
@@ -220,7 +220,7 @@ function toTrashEntry(row: PersonaRow): PersonaTrashEntry {
 }
 
 /** 彻底删除（回收站内二次确认）：人格本体 + 记忆/关系/漂移级联清除；
- * 尸检报告保留（研究档案语义：对局产物不随人格消失） */
+ * 心理检查报告保留（研究档案语义：对局产物不随人格消失） */
 async function destroyById(id: number, userId: string): Promise<void> {
   const db = getDb();
   await db.delete(personaMemories).where(eq(personaMemories.personaId, id));
@@ -313,6 +313,23 @@ export async function listPersonaRelationships(
     .where(eq(personaRelationships.personaId, personaId))
     .orderBy(desc(personaRelationships.updatedAt));
   return rows.map(toRelationship);
+}
+
+/** 查一组人格卡两两之间的在场关系（对局圈层羁绊注入用：观察者与被观察者都在集合内）。
+ *  服务层内部调用（已按对局绑定过滤，无需 userId 维度）。 */
+export async function listRelationshipsAmong(personaIds: number[]): Promise<RelationshipRow[]> {
+  if (personaIds.length < 2) return [];
+  const db = getDb();
+  return db
+    .select()
+    .from(personaRelationships)
+    .where(
+      and(
+        inArray(personaRelationships.personaId, personaIds),
+        inArray(personaRelationships.targetPersonaId, personaIds),
+      ),
+    )
+    .orderBy(desc(personaRelationships.updatedAt));
 }
 
 export async function listPersonaDrift(
@@ -541,7 +558,7 @@ export async function incrementPersonaGameCount(personaId: number): Promise<void
     .where(eq(personas.id, personaId));
 }
 
-// ---------- 心理尸检报告 ----------
+// ---------- 心理检查报告 ----------
 export async function upsertPersonaReport(input: {
   gameId: string;
   personaId: number;
