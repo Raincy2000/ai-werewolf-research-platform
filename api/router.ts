@@ -15,6 +15,7 @@ import {
   listPersonaDrift,
   listPersonaMemories,
   listPersonaRelationships,
+  listPersonaRelationshipHistory,
   listPersonas,
   updatePersona,
 } from "./queries/personas";
@@ -98,12 +99,19 @@ const personaRouter = createRouter({
     .query(async ({ input, ctx }) => {
       const card = await getPersona(input.id, ctx.user.id);
       if (!card) return null;
-      const [memories, relationships, drift] = await Promise.all([
+      const [memories, relationships, drift, relationshipHistory] = await Promise.all([
         listPersonaMemories(input.id, ctx.user.id),
         listPersonaRelationships(input.id, ctx.user.id),
         listPersonaDrift(input.id, ctx.user.id),
+        listPersonaRelationshipHistory(input.id, ctx.user.id),
       ]);
-      return { card, memories: memories ?? [], relationships: relationships ?? [], drift: drift ?? [] };
+      return {
+        card,
+        memories: memories ?? [],
+        relationships: relationships ?? [],
+        drift: drift ?? [],
+        relationshipHistory: relationshipHistory ?? [],
+      };
     }),
   create: authedProcedure
     .input(personaInputSchema)

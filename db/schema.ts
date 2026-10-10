@@ -22,6 +22,8 @@ export const personas = picked.personas as typeof mysqlSchema.personas;
 export const personaMemories = picked.personaMemories as typeof mysqlSchema.personaMemories;
 export const personaRelationships =
   picked.personaRelationships as typeof mysqlSchema.personaRelationships;
+export const personaRelationshipHistory =
+  picked.personaRelationshipHistory as typeof mysqlSchema.personaRelationshipHistory;
 export const personaDriftLog = picked.personaDriftLog as typeof mysqlSchema.personaDriftLog;
 export const personaReports = picked.personaReports as typeof mysqlSchema.personaReports;
 

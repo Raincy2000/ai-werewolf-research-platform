@@ -244,6 +244,29 @@ export const personaRelationships = sqliteTable(
   (t) => [index("idx_prel_persona").on(t.personaId)],
 );
 
+// 关系历史（同 MySQL 侧 personaRelationshipHistory；逐局变迁追加，汇总行不动）
+export const personaRelationshipHistory = sqliteTable(
+  "persona_relationship_history",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    personaId: integer("persona_id").notNull(),
+    targetPersonaId: integer("target_persona_id"),
+    targetName: text("target_name").notNull(),
+    gameId: text("game_id"),
+    titleNo: text("title_no").notNull().default(""),
+    relation: text("relation").notNull().default(""),
+    affinityDelta: integer("affinity_delta").notNull().default(0),
+    trustDelta: integer("trust_delta").notNull().default(0),
+    affinity: integer("affinity").notNull().default(0),
+    trust: integer("trust").notNull().default(50),
+    note: text("note").notNull().default(""),
+    createdAt: integer("created_at", { mode: "timestamp_ms" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  (t) => [index("idx_prelh_persona").on(t.personaId), index("idx_prelh_target").on(t.targetPersonaId)],
+);
+
 export const personaDriftLog = sqliteTable(
   "persona_drift_log",
   {

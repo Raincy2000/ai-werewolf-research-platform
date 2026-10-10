@@ -70,7 +70,7 @@ import { SPEECH_REQUIRED_KINDS } from "./engine/api";
 import { callAi } from "./ai/providers";
 import { defaultCallTimeoutMs, isThinkingModel } from "./ai/modelCaps";
 import { buildPrompt, modelContextTokens } from "./ai/prompts";
-import { parseDecision, parseJsonRobust } from "./ai/parse";
+import { parseDecision } from "./ai/parse";
 import { buildPersonaCircleText, injectCircleText, type PersonaBondInfo } from "./personaVisibility";
 import type { PersonaCard, PersonaEventMeta, PersonaSeatInfo } from "../../contracts/persona";
 import {
@@ -85,6 +85,8 @@ import {
 import { runPersonaPipeline } from "../persona/pipeline";
 import { runNotebookWriteback } from "../persona/notebook";
 import { runPsyCheck } from "../persona/anatomist";
+import { withTimeout, DB_TIMEOUT_MS } from "./runtime/timing";
+import { initJudgeRecorder, maybeFoulCheck } from "./judge/foulReferee";
 
 export interface GameService {
   // userId 由路由层强制传入（归属校验）；测试/内部路径可省略（省略时不做归属拦截）
@@ -293,29 +295,9 @@ export const registry = new Map<string, GameRuntime>();
 const recoveringGames = new Map<string, Promise<GameRuntime | null>>();
 
 // ---------- 超时/看门狗常量 ----------
-const DB_TIMEOUT_MS = 15_000; // tick 循环内单次 DB 调用最长等待，超时抛错走 handleTickError
+// 计时工具已迁入书记员层（runtime/timing.ts）：withTimeout / DB_TIMEOUT_MS
 const STALE_TICK_MS = 15_000; // running 状态下超过该时长没有任何 tick 推进 → 判定 tick 链断裂
 const MAX_NO_PROGRESS_TICKS = 30; // 连续无进展 tick 上限，超过判定为引擎停滞
-
-// Promise.race 超时保护：promise 在 ms 内未 settle 则以 label 报错 reject。
-// 注意：不取消底层 promise，只是不再等待（race 已订阅它，不会产生 unhandledRejection）
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(label)), ms);
-    // Node 环境下不阻断进程退出；测试/其他环境无 unref 则忽略
-    (timer as { unref?: () => void }).unref?.();
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (err: unknown) => {
-        clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      },
-    );
-  });
-}
 
 // ---------- 分析任务状态（内存跟踪；含阶段检查点与自愈心跳） ----------
 // 导出仅供测试/诊断使用（构造停滞任务、观察阶段流转），运行时不应外部修改
@@ -1862,212 +1844,9 @@ function maybeWinRateTick(gameId: string, rt: GameRuntime): void {
     });
 }
 
-// ---------- 犯规裁判（分析师担任）：实时审查公开发言的内容级犯规 ----------
-// 由来（对局 20261009001 实锤）：夜神月（平民）被放逐后在遗言里「把牌正过来放回桌面」
-// 翻牌自证——平民无翻牌权，此属违规亮牌。规则红线已写进玩家 prompt（明知故犯允许，但必被罚）。
-// 判罚：犯规成立即本局结束、犯规方对立阵营获胜（settleExternal，与拍刀驳回同一外部结算路径）。
-// 豁免：赛后讨论（信息壁垒已解除）与狼人频道（非公开发言）不审查。
-
-type FoulType = "unauthorizedReveal" | "aiLeak" | "metaGaming";
-interface FoulVerdict {
-  foul: boolean;
-  type?: FoulType;
-  evidence?: string;
-  verdict?: string;
-}
-
-const FOUL_TYPE_LABEL: Record<FoulType, string> = {
-  unauthorizedReveal: "违规亮牌自证",
-  aiLeak: "AI身份泄露",
-  metaGaming: "元游戏言论",
-};
-const FOUL_CHECK_TIMEOUT_MS = 45_000;
-
-/** 裁判配置：优先分析师配置，缺省回落 1 号座位配置（与胜率分析同一回落链） */
-function foulRefereeCfg(rt: GameRuntime): SeatAiConfig | null {
-  const base = rt.analystAi ?? rt.seatAIs[0];
-  if (!base) return null;
-  return {
-    seat: 0,
-    provider: base.provider,
-    baseUrl: base.baseUrl,
-    model: base.model,
-    apiKey: base.apiKey,
-  };
-}
-
-/** 构建裁判 prompt：发言者真实身份是裁判专用信息（判「亮牌是否属实」的依据），绝不外泄 */
-export function buildFoulCheckPrompt(opts: {
-  seat: number;
-  roleName: string;
-  eventTitle: string;
-  day: number;
-  speech: string;
-}): { system: string; user: string } {
-  const system = [
-    "你是狼人杀对局的裁判，负责审查玩家公开发言是否触犯规则红线。你只输出 JSON，禁止任何其他文字。",
-    "保守原则：只有明确违反才判犯规；模棱两可、口头身份声称、正常的规则讨论一律不判。",
-  ].join("\n");
-  const user = [
-    `【发言者】${opts.seat}号玩家（真实身份：${opts.roleName}——裁判专用，绝不外泄）`,
-    `【发言场景】第${opts.day}天 · ${opts.eventTitle}`,
-    `【发言内容】${opts.speech.slice(0, 900)}`,
-    "",
-    "【犯规判定标准】满足以下任一即判犯规：",
-    "1. 违规亮牌自证（unauthorizedReveal）：没有翻牌权的玩家，在公开发言中翻开、亮出、展示自己的真实身份底牌以自证（如「我把牌翻开给大家看，是民牌」「（把底牌亮出来）」）。",
-    "   有翻牌权、不算犯规的情形：白痴被放逐时翻牌免死；骑士翻牌决斗；猎人/狼王出局开枪亮身份；白狼王自爆带人；狼人自爆。",
-    "   关键区分：口头声称「我是平民/我是预言家」是正常发言，不是亮牌——只有「翻牌/亮牌/展示底牌」这一动作描写才算违规。",
-    "2. AI身份泄露（aiLeak）：自称或暗示自己是 AI、人工智能、语言模型、程序、机器人。",
-    "3. 元游戏言论（metaGaming）：提及提示词、系统指令、状态报告、模拟实验、开发者等游戏世界外的存在。",
-    "",
-    "【输出契约】严格输出 JSON：",
-    '{"foul":false} 或 {"foul":true,"type":"unauthorizedReveal|aiLeak|metaGaming","evidence":"犯规原句（≤50字）","verdict":"判罚理由一句"}',
-  ].join("\n");
-  return { system, user };
-}
-
-/** 解析裁判裁决；解析失败/非法输出返回 null（裁判不可用=不判罚，绝不误判） */
-export function parseFoulVerdict(text: string): FoulVerdict | null {
-  const cleaned = text.replace(/```(?:json)?/gi, "");
-  const start = cleaned.indexOf("{");
-  if (start < 0) return null;
-  const end = cleaned.lastIndexOf("}");
-  const obj = parseJsonRobust(cleaned.slice(start, end > start ? end + 1 : undefined));
-  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
-  const o = obj as Record<string, unknown>;
-  if (o.foul !== true) return { foul: false };
-  const type = String(o.type ?? "");
-  if (!Object.hasOwn(FOUL_TYPE_LABEL, type)) return { foul: false }; // 类型缺失/非法：保守不判
-  return {
-    foul: true,
-    type: type as FoulType,
-    evidence: String(o.evidence ?? "").trim().slice(0, 80),
-    verdict: String(o.verdict ?? "").trim().slice(0, 120),
-  };
-}
-
-/** 公开发言事件落盘后触发犯规审查（非阻塞）：在飞则排队，判罚落定前逐条审查 */
-function maybeFoulCheck(gameId: string, rt: GameRuntime, events: EngineEvent[]): void {
-  if (rt.status !== "running" || rt.foulSettled) return;
-  // 只审公开发言（type=speech）；赛后讨论（postgame.* 阶段）豁免；狼人频道是 action 类事件，天然不在此列
-  const suspects = events.filter(
-    (ev) =>
-      ev.type === "speech" &&
-      ev.actor != null &&
-      !ev.phase.startsWith("postgame") &&
-      typeof ev.content === "string" &&
-      ev.content.trim().length > 0,
-  );
-  if (suspects.length === 0) return;
-  (rt.foulQueue ??= []).push(...suspects);
-  if (rt.foulInFlight) return;
-  rt.foulInFlight = true;
-  void runFoulQueue(gameId, rt)
-    .catch(() => {
-      /* 裁判故障静默：绝不阻塞对局 */
-    })
-    .finally(() => {
-      rt.foulInFlight = false;
-    });
-}
-
-async function runFoulQueue(gameId: string, rt: GameRuntime): Promise<void> {
-  const cfg = foulRefereeCfg(rt);
-  if (!cfg) {
-    rt.foulQueue = [];
-    return;
-  }
-  while ((rt.foulQueue?.length ?? 0) > 0) {
-    if (rt.status !== "running" || rt.foulSettled) {
-      rt.foulQueue = [];
-      return;
-    }
-    const ev = rt.foulQueue!.shift()!;
-    const roleName =
-      ROLE_META[rt.engine.getSnapshot().players.find((p) => p.seat === ev.actor)?.role as RoleId]
-        ?.name ?? "未知身份";
-    const prompt = buildFoulCheckPrompt({
-      seat: ev.actor!,
-      roleName,
-      eventTitle: ev.title,
-      day: ev.day,
-      speech: ev.content,
-    });
-    const res = await callAi(cfg, prompt.system, prompt.user, {
-      timeoutMs: FOUL_CHECK_TIMEOUT_MS,
-      maxRetries: 0,
-    }).catch(() => null);
-    const verdict = res?.ok && res.text ? parseFoulVerdict(res.text) : null;
-    if (verdict?.foul) {
-      await settleFoul(gameId, rt, ev, verdict);
-      rt.foulQueue = [];
-      return;
-    }
-  }
-}
-
-/** 犯规判罚落定：本局立即结束，犯规方对立阵营获胜。
- * 与 tick 串行化：等静默窗口（无 tick 在飞）再结算——settleExternal 封存主流程协程，
- * 与进行中的 decide/advance 互斥；等待期间对局暂停/终局则放弃判罚（保守）。 */
-async function settleFoul(
-  gameId: string,
-  rt: GameRuntime,
-  ev: EngineEvent,
-  verdict: FoulVerdict,
-): Promise<void> {
-  const waitStart = Date.now();
-  while (rt.ticking && rt.status === "running" && Date.now() - waitStart < 180_000) {
-    await new Promise((r) => setTimeout(r, 50)); // 50ms 轮询：tick 间隙窗口毫秒级出现，快速接管
-  }
-  if (rt.status !== "running" || rt.ticking || rt.foulSettled) return;
-  rt.foulSettled = true;
-  rt.ticking = true; // 占住 tick 闸：判罚落定期间不许新 tick 插入
-  try {
-    const snap = rt.engine.getSnapshot();
-    const offender = snap.players.find((p) => p.seat === ev.actor);
-    if (!offender) return;
-    const winner: "wolf" | "good" = offender.camp === "wolf" ? "good" : "wolf";
-    const winnerLabel = winner === "good" ? "神民" : "狼人";
-    const roleName = ROLE_META[offender.role as RoleId]?.name ?? offender.role;
-    const typeLabel = FOUL_TYPE_LABEL[verdict.type ?? "metaGaming"];
-    const evidence = verdict.evidence ? `「${verdict.evidence}」` : "";
-    const note = `（犯规判罚：${ev.actor}号${typeLabel}）`;
-    const pub = `【裁判】${ev.actor}号玩家犯规——${typeLabel}${evidence ? `：${evidence}` : ""}。依据规则红线，本局立即结束，${winnerLabel}阵营获胜。`;
-    const engineEvents = rt.engine.settleExternal(winner, note, pub);
-    const foulEvent: EngineEvent = {
-      day: snap.day,
-      phase: snap.phase,
-      type: "system",
-      actor: null,
-      title: "犯规判罚",
-      content: `${ev.actor}号玩家（${roleName}）${typeLabel}${evidence}——${verdict.verdict ?? "触犯规则红线"}。本局立即结束，${winnerLabel}阵营获胜。`,
-      thought: null,
-      meta: { foul: true, foulType: verdict.type, foulSeat: ev.actor },
-    };
-    // 决策日志记 auditSettle（与拍刀驳回同类：重放时调 settleExternal 精确重建）
-    await withTimeout(
-      appendDecision({
-        gameId,
-        idx: rt.decisionIdx,
-        kind: "auditSettle",
-        seat: ev.actor!,
-        decision: { thought: "", auditSettle: winner, auditNote: note, auditPub: pub },
-      }),
-      DB_TIMEOUT_MS,
-      "决策日志写入超时",
-    );
-    rt.decisionIdx += 1;
-    rt.pending = null; // 被封存的待决不再有效
-    await persistWithPhaseBreak(gameId, rt, [foulEvent, ...engineEvents]);
-    rt.acts = rt.engine.getSnapshot().pendingActs;
-    await markDecidedIfNeeded(gameId, rt);
-    if (await finishIfDone(gameId, rt)) return;
-    // 引擎未 finished（赛后讨论开启）：续上正常 tick 链，赛后环节照常推进
-    if (rt.status === "running") scheduleTick(gameId, rt, rt.options.stepDelayMs);
-  } finally {
-    rt.ticking = false;
-  }
-}
+// ---------- 犯规裁判已迁入法官模块（judge/foulReferee.ts） ----------
+// 版图拆分第一批（2026-10-10）：法官=流程秩序唯一写者；书记员（runtime/）隐而不现；
+// 判罚落定经 JudgeRecorder 窄接口回调本文件的 persist/markDecided/finishIfDone/scheduleTick。
 
 /** 配置了分析师且选择「自动生成」的对局，分出胜负后自动复盘并蒸馏进指南
  *（「手动生成」的对局在观察室由用户点击生成；失败只落系统事件，绝不上抛阻塞对局） */
@@ -2160,7 +1939,7 @@ async function runPsyCheckForSeat(
     digest: string;
     winnerText: string;
     titleNo: string;
-    others: { seat: number; name: string; personaId: number }[];
+    others: { seat: number; name: string; personaId: number; known: boolean }[];
     writebackDoneSeats: Set<number>;
   },
   seat: number,
@@ -2275,10 +2054,15 @@ async function runPsyCheckJob(
   const snapshot = snapshotFromRuntime(gameId, row, rt);
   const digest = buildLogDigest(snapshot, events);
   const winnerText = snapshot.winner === "wolf" ? "狼人阵营胜利" : snapshot.winner === "good" ? "神民阵营胜利" : "未分胜负";
+  // 人格可知性名册（迷雾规则：full 全可见；partial 中 personaFogSeats 被上迷雾；none 全迷雾）——
+  // 记事簿回写的锚点双轨依据：可知的归人格名，迷雾/无人格的归「标题号·代号」
+  const visibility = rt.options.personaVisibility ?? "full";
+  const fogSeats = new Set(rt.options.personaFogSeats ?? []);
   const others = (rt.seatPersonas ?? []).map((b) => ({
     seat: b.seat,
     name: rt.personaCards?.get(b.seat)?.name ?? b.name,
     personaId: b.personaId,
+    known: visibility === "full" || (visibility === "partial" && !fogSeats.has(b.seat)),
   }));
   // 回写完成判定：事件流里该座位的「记事簿回写」成功事件（内容以「名字」（N号）开头）
   const writebackDoneSeats = new Set(
@@ -3701,3 +3485,12 @@ export const gameService: GameService = {
   generateAnalysis,
   personaReports,
 };
+
+// ---------- 模块装配：为法官模块注入书记员实现（模块加载即完成，运行时零开销） ----------
+initJudgeRecorder({
+  persistEvents: (gameId, rt, events) => persistWithPhaseBreak(gameId, rt, events),
+  markDecided: markDecidedIfNeeded,
+  finishIfDone,
+  scheduleTick,
+});
+

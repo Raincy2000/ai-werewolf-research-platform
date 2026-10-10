@@ -37,6 +37,7 @@ import type {
   PersonaDriftEntry,
   PersonaMemory,
   PersonaRelationship,
+  PersonaRelationshipHistory,
   PersonaReport,
   PersonaResearchResult,
   PersonaTrashEntry,
@@ -115,6 +116,7 @@ export interface PersonaDetail {
   memories: PersonaMemory[]
   relationships: PersonaRelationship[]
   drift: PersonaDriftEntry[]
+  relationshipHistory: PersonaRelationshipHistory[] // 人格锚点关系的逐局沿革（折叠栏）
 }
 
 // ---------------------------------------------------------------------------

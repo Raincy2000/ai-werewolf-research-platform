@@ -206,6 +206,24 @@ CREATE TABLE \`personas\` (
 );
 
 CREATE INDEX \`idx_personas_user\` ON \`personas\` (\`user_id\`);
+
+CREATE TABLE \`persona_relationship_history\` (
+	\`id\` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	\`persona_id\` integer NOT NULL,
+	\`target_persona_id\` integer,
+	\`target_name\` text NOT NULL,
+	\`game_id\` text,
+	\`title_no\` text DEFAULT '' NOT NULL,
+	\`relation\` text DEFAULT '' NOT NULL,
+	\`affinity_delta\` integer DEFAULT 0 NOT NULL,
+	\`trust_delta\` integer DEFAULT 0 NOT NULL,
+	\`affinity\` integer DEFAULT 0 NOT NULL,
+	\`trust\` integer DEFAULT 50 NOT NULL,
+	\`note\` text DEFAULT '' NOT NULL,
+	\`created_at\` integer NOT NULL
+);
+CREATE INDEX \`idx_prelh_persona\` ON \`persona_relationship_history\` (\`persona_id\`);
+CREATE INDEX \`idx_prelh_target\` ON \`persona_relationship_history\` (\`target_persona_id\`);
 `;
 
 // 增量 DDL（0001：图书馆文档表 + 赛前学习笔记表）——老库升级用（users 已存在但缺新表时执行）
@@ -337,3 +355,26 @@ export const SQLITE_DDL_0005 = `
 ALTER TABLE \`personas\` ADD COLUMN \`deleted_at\` integer;
 `;
 
+
+
+// 增量 DDL（0006：关系历史表 persona_relationship_history——人格锚点关系的逐局变迁，
+// 汇总行 upsert 不动；老库升级用：缺该表时执行）
+export const SQLITE_DDL_0006 = `
+CREATE TABLE \`persona_relationship_history\` (
+	\`id\` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	\`persona_id\` integer NOT NULL,
+	\`target_persona_id\` integer,
+	\`target_name\` text NOT NULL,
+	\`game_id\` text,
+	\`title_no\` text DEFAULT '' NOT NULL,
+	\`relation\` text DEFAULT '' NOT NULL,
+	\`affinity_delta\` integer DEFAULT 0 NOT NULL,
+	\`trust_delta\` integer DEFAULT 0 NOT NULL,
+	\`affinity\` integer DEFAULT 0 NOT NULL,
+	\`trust\` integer DEFAULT 50 NOT NULL,
+	\`note\` text DEFAULT '' NOT NULL,
+	\`created_at\` integer NOT NULL
+);
+CREATE INDEX \`idx_prelh_persona\` ON \`persona_relationship_history\` (\`persona_id\`);
+CREATE INDEX \`idx_prelh_target\` ON \`persona_relationship_history\` (\`target_persona_id\`);
+`;

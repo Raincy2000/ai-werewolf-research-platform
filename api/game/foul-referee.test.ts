@@ -137,7 +137,8 @@ function makeFoulEngine(speechContent: string, offenderSeat = 9, offenderCamp = 
   };
 }
 
-const { gameService, buildFoulCheckPrompt, parseFoulVerdict } = await import("./service");
+const { gameService } = await import("./service");
+const { buildFoulCheckPrompt, parseFoulVerdict } = await import("./judge/foulReferee");
 const { buildPrompt } = await import("./ai/prompts");
 
 async function startGame(speech: string, camp = "villager"): Promise<string> {

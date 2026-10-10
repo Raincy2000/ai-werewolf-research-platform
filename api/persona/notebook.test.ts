@@ -8,7 +8,7 @@ import {
   getParamValue,
   setParamValue,
 } from "../../contracts/persona";
-import { parseWriteback, normalizeRelationAnchor, buildWritebackPrompt } from "./notebook";
+import { parseWriteback, normalizeRelationAnchor, normalizeMemoryContent, buildWritebackPrompt } from "./notebook";
 import { sanitizeCastedDraft } from "./caster";
 
 describe("parseWriteback（记忆回写清洗与钳位）", () => {  it("合法输出解析；权重/增量/漂移幅度全部钳位", () => {
@@ -91,9 +91,11 @@ describe("setParamValue / getParamValue（漂移读写）", () => {
 });
 
 describe("normalizeRelationAnchor（关系锚点双轨制）", () => {
+  // 名册含座位与可知性（known）：五条悟=3号、夏油杰=4号、夜神月=9号（均人格可知）
   const others = [
-    { name: "五条悟", personaId: 11 },
-    { name: "夏油杰", personaId: 12 },
+    { seat: 3, name: "五条悟", personaId: 11 },
+    { seat: 4, name: "夏油杰", personaId: 12 },
+    { seat: 9, name: "夜神月", personaId: 13 },
   ];
   const titleNo = "20261010001";
 
@@ -168,9 +170,99 @@ describe("buildWritebackPrompt（关系锚点双轨写进契约）", () => {
       digest: "摘要",
       memories: [],
       relationships: [],
-      otherPersonas: ["五条悟"],
+      seatRoster: [{ seat: 3, name: "五条悟", personaId: 11, known: true }],
     });
     expect(user).toContain("20261010001·10号玩家"); // 无人格锚点示例
     expect(user).toContain("精确等于 TA 的人格名"); // 人格锚点规则
+  });
+});
+
+describe("迷雾双轨：座位代号的归属由人格可知性决定", () => {
+  const roster = [
+    { seat: 3, name: "五条悟", personaId: 11 },
+    { seat: 9, name: "夜神月", personaId: 13 },
+  ];
+  const titleNo = "20261010001";
+
+  it("人格可知座位的裸代号 → 归一到人格名（根治执念绑座位号事故）", () => {
+    // 艾伦对 9 号（夜神月）的敌意：锚点必须是「夜神月」，不是「9号玩家」
+    expect(normalizeRelationAnchor("9号玩家", roster, titleNo)).toEqual({
+      targetName: "夜神月",
+      targetPersonaId: 13,
+    });
+  });
+
+  it("人格可知座位被误贴标题号前缀 → 仍归一到人格名", () => {
+    expect(normalizeRelationAnchor("20261010001·9号玩家", roster, titleNo)).toEqual({
+      targetName: "夜神月",
+      targetPersonaId: 13,
+    });
+  });
+
+  it("迷雾中的座位（不在可知名册）→ 保持标题号·代号锚点", () => {
+    // 同一局里被上迷雾的人格玩家：观察者不知道 TA 是谁，锚点必须带对局编号
+    expect(normalizeRelationAnchor("5号玩家", roster, titleNo)).toEqual({
+      targetName: "20261010001·5号玩家",
+      targetPersonaId: null,
+    });
+    // 历史对局里已带标题号的迷雾代号：原样保留（不追贴、不归并）
+    expect(normalizeRelationAnchor("20260930001·5号玩家", roster, titleNo)).toEqual({
+      targetName: "20260930001·5号玩家",
+      targetPersonaId: null,
+    });
+  });
+});
+
+describe("normalizeMemoryContent（记忆内容的座位引用归一）", () => {
+  const roster = [
+    { seat: 3, name: "五条悟" },
+    { seat: 9, name: "夜神月" },
+    { seat: 11, name: "艾伦" },
+  ];
+
+  it("可知人格的「N号玩家」「N号」引用改写为人格名", () => {
+    expect(normalizeMemoryContent("9号玩家当众把我票出去，我记住他了", roster)).toBe(
+      "夜神月当众把我票出去，我记住他了",
+    );
+    expect(normalizeMemoryContent("我信了9号一整局", roster)).toBe("我信了夜神月一整局");
+  });
+
+  it("多位座位降序替换，两位数座位不被一位数误伤", () => {
+    expect(normalizeMemoryContent("11号和1号联手，3号看穿了他们", roster)).toBe(
+      "艾伦和1号联手，五条悟看穿了他们",
+    );
+  });
+
+  it("无人格/迷雾座位的引用原样保留", () => {
+    expect(normalizeMemoryContent("7号玩家发言很可疑", roster)).toBe("7号玩家发言很可疑");
+  });
+});
+
+describe("铁律0「第一人称本体」（人格即本人，绝不自称其名）", () => {
+  const roster = [
+    { seat: 3, name: "五条悟" },
+    { seat: 9, name: "夜神月" },
+  ];
+
+  it("观察者自己的座位引用保持原样（excludeSeat）", () => {
+    // 我是 3 号（五条悟）：我的座位号不换成我的名字——「我作为3号猎人」是局内事实
+    expect(normalizeMemoryContent("我作为3号猎人被放逐，9号玩家笑的最开心", roster, 3)).toBe(
+      "我作为3号猎人被放逐，夜神月笑的最开心",
+    );
+  });
+
+  it("原文已是「9号夜神月」形态：替换后叠词收拢为一次", () => {
+    expect(normalizeMemoryContent("最后带走了9号夜神月", roster)).toBe("最后带走了夜神月");
+  });
+});
+
+describe("粘连收敛（原文已含人格名片段）", () => {
+  it("「9号夜神月」→「夜神月」；「1号艾伦」→「艾伦·耶格尔」（全名+短名粘连）", () => {
+    const roster = [
+      { seat: 9, name: "夜神月" },
+      { seat: 1, name: "艾伦·耶格尔" },
+    ];
+    expect(normalizeMemoryContent("最后带走9号夜神月", roster)).toBe("最后带走夜神月");
+    expect(normalizeMemoryContent("1号艾伦自爆跳预言家", roster)).toBe("艾伦·耶格尔自爆跳预言家");
   });
 });

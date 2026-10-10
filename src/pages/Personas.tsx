@@ -9,6 +9,8 @@ import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   Brain,
+  ChevronDown,
+  ChevronRight,
   CircleAlert,
   Fingerprint,
   Loader2,
@@ -359,6 +361,8 @@ export default function Personas() {
   const [destroyTarget, setDestroyTarget] = useState<PersonaTrashEntry | null>(null)
   // 铸造中卡片组（后台铸造任务透出：批量并发时逐卡显示姓名+进度+暂停/继续/终止；向导误关也不丢进度）
   const [activeCasts, setActiveCasts] = useState<CastProgressState[]>([])
+  // 关系沿革折叠栏展开状态（关系行 id 集合；人格锚点的关系可展开看逐局变迁）
+  const [expandedRels, setExpandedRels] = useState<Set<number>>(new Set())
   // 终止生成确认（取消并删除整个铸造流程；记录待终止的 castId）
   const [cancelConfirm, setCancelConfirm] = useState<string | null>(null)
 
@@ -1513,7 +1517,10 @@ export default function Personas() {
                     </p>
                   ) : (
                     <ul className="space-y-2">
-                      {detail.memories.map((m) => (
+                      {/* 按记忆产生的时间先后排序（合乎人格变化的真实性），不按强度/刷新时间 */}
+                      {[...detail.memories]
+                        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+                        .map((m) => (
                         <li key={m.id} className="rounded-md border border-border p-3 text-sm">
                           <div className="mb-1 flex items-center gap-2">
                             <Badge variant={m.type === 'trauma' ? 'destructive' : 'outline'}>
@@ -1525,7 +1532,7 @@ export default function Personas() {
                           </div>
                           <p className="whitespace-pre-wrap leading-6">{m.content}</p>
                         </li>
-                      ))}
+                        ))}
                     </ul>
                   )}
                 </TabsContent>
@@ -1537,18 +1544,78 @@ export default function Personas() {
                     </p>
                   ) : (
                     <ul className="space-y-2">
-                      {detail.relationships.map((r) => (
-                        <li key={r.id} className="rounded-md border border-border p-3 text-sm">
-                          <div className="mb-1 flex items-center gap-2">
-                            <span className="font-medium">{r.targetName}</span>
-                            <Badge variant="outline">{r.relation || '未命名关系'}</Badge>
-                            <span className="text-xs text-muted-foreground">
-                              亲疏 {r.affinity} · 信任 {r.trust}
-                            </span>
-                          </div>
-                          {r.note ? <p className="text-xs text-muted-foreground">{r.note}</p> : null}
-                        </li>
-                      ))}
+                      {detail.relationships.map((r) => {
+                        // 人格锚点的关系才有沿革（无人格锚点每局一个锚点，本身就是逐局的）
+                        const history = r.targetPersonaId != null
+                          ? detail.relationshipHistory.filter((h) => h.targetName === r.targetName)
+                          : []
+                        const expandable = r.targetPersonaId != null
+                        const expanded = expandable && expandedRels.has(r.id)
+                        return (
+                          <li key={r.id} className="rounded-xl border border-border p-3 text-sm">
+                            <div
+                              className={cn(
+                                'flex items-center gap-2',
+                                expandable ? 'cursor-pointer select-none' : '',
+                                r.note || expanded ? 'mb-1' : '',
+                              )}
+                              onClick={() => {
+                                if (!expandable) return
+                                setExpandedRels((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(r.id)) next.delete(r.id)
+                                  else next.add(r.id)
+                                  return next
+                                })
+                              }}
+                            >
+                              {expandable ? (
+                                expanded ? (
+                                  <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
+                                ) : (
+                                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
+                                )
+                              ) : null}
+                              <span className="font-medium">{r.targetName}</span>
+                              <Badge variant="outline">{r.relation || '未命名关系'}</Badge>
+                              <span className="text-xs text-muted-foreground">
+                                亲疏 {r.affinity} · 信任 {r.trust}
+                              </span>
+                              {expandable ? (
+                                <span className="ml-auto text-[11px] text-muted-foreground">
+                                  {history.length > 0 ? `沿革 ${history.length} 局` : '沿革从下一局开始记录'}
+                                </span>
+                              ) : null}
+                            </div>
+                            {r.note ? <p className="text-xs text-muted-foreground">{r.note}</p> : null}
+                            {expanded ? (
+                              <ul className="mt-2 space-y-1.5 border-t border-border/60 pt-2">
+                                {history.length === 0 ? (
+                                  <li className="py-1 text-xs text-muted-foreground">
+                                    暂无沿革记录——关系历史从功能上线后的下一局开始逐局留痕。
+                                  </li>
+                                ) : (
+                                  history.map((h) => (
+                                    <li key={h.id} className="rounded-md bg-secondary/40 px-2.5 py-1.5 text-xs">
+                                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                        <span className="font-mono text-muted-foreground">{h.titleNo || h.gameId?.slice(0, 8)}</span>
+                                        <Badge variant="outline" className="px-1 text-[10px] font-normal">
+                                          {h.relation || '未命名'}
+                                        </Badge>
+                                        <span className="text-muted-foreground">
+                                          亲疏 {h.affinityDelta >= 0 ? '+' : ''}{h.affinityDelta} → {h.affinity}
+                                          {' · '}信任 {h.trustDelta >= 0 ? '+' : ''}{h.trustDelta} → {h.trust}
+                                        </span>
+                                      </div>
+                                      {h.note ? <p className="mt-0.5 leading-5 text-muted-foreground">{h.note}</p> : null}
+                                    </li>
+                                  ))
+                                )}
+                              </ul>
+                            ) : null}
+                          </li>
+                        )
+                      })}
                     </ul>
                   )}
                 </TabsContent>

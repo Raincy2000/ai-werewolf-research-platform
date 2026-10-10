@@ -216,6 +216,23 @@ export interface PersonaRelationship {
   updatedAt: string;
 }
 
+// ---------- 关系历史（人格锚点关系的逐局变迁；汇总行看现状，历史行看沿革） ----------
+export interface PersonaRelationshipHistory {
+  id: number;
+  personaId: number;
+  targetPersonaId: number | null;
+  targetName: string;
+  gameId: string | null;
+  titleNo: string; // 对局标题号（展示用统一编号）
+  relation: string; // 当局关系标签
+  affinityDelta: number; // 当局亲疏增量
+  trustDelta: number; // 当局信任增量
+  affinity: number; // 当局结算后累计亲疏
+  trust: number; // 当局结算后累计信任
+  note: string; // 当局关键事件一句
+  createdAt: string;
+}
+
 // ---------- 人格漂移记录（报告附录；长期参数跨对局可调，逐次留痕） ----------
 export interface PersonaDriftChange {
   path: string; // 参数路径（如 "bigFive.neuroticism"）

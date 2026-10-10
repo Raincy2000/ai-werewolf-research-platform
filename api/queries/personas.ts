@@ -7,6 +7,7 @@ import {
   personas,
   personaMemories,
   personaRelationships,
+  personaRelationshipHistory,
   personaDriftLog,
   personaReports,
 } from "../../db/schema";
@@ -21,6 +22,7 @@ import {
   type PersonaParams,
   type PersonaProfile,
   type PersonaRelationship,
+  type PersonaRelationshipHistory,
   type PersonaReport,
   type PersonaSource,
   type PersonaTrashEntry,
@@ -477,7 +479,7 @@ export async function upsertPersonaRelationship(input: {
   trustDelta: number;
   note: string;
   gameId: string;
-}): Promise<void> {
+}): Promise<{ affinity: number; trust: number }> {
   const db = getDb();
   const rows: RelationshipRow[] = await db
     .select()
@@ -492,31 +494,102 @@ export async function upsertPersonaRelationship(input: {
   const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, Math.round(v)));
   if (rows.length) {
     const cur = rows[0];
+    const next = {
+      affinity: clamp(cur.affinity + input.affinityDelta, -100, 100),
+      trust: clamp(cur.trust + input.trustDelta, 0, 100),
+    };
     await db
       .update(personaRelationships)
       .set({
         targetPersonaId: input.targetPersonaId ?? cur.targetPersonaId,
         relation: input.relation || cur.relation,
-        affinity: clamp(cur.affinity + input.affinityDelta, -100, 100),
-        trust: clamp(cur.trust + input.trustDelta, 0, 100),
+        affinity: next.affinity,
+        trust: next.trust,
         note: input.note || cur.note,
         gameId: input.gameId,
         updatedAt: new Date(),
       })
       .where(eq(personaRelationships.id, cur.id));
-    return;
+    return next;
   }
+  const init = {
+    affinity: clamp(input.affinityDelta, -100, 100),
+    trust: clamp(50 + input.trustDelta, 0, 100), // 新关系信任基线 50 起调
+  };
   await db.insert(personaRelationships).values({
     personaId: input.personaId,
     targetPersonaId: input.targetPersonaId,
     targetName: input.targetName,
     relation: input.relation,
-    affinity: clamp(input.affinityDelta, -100, 100),
-    trust: clamp(50 + input.trustDelta, 0, 100), // 新关系信任基线 50 起调
+    affinity: init.affinity,
+    trust: init.trust,
     note: input.note,
     gameId: input.gameId,
     updatedAt: new Date(),
   });
+  return init;
+}
+
+// ---------- 关系历史（人格锚点关系的逐局变迁；追加写，不改不删） ----------
+
+/** 追加一条关系历史（记事簿回写时与汇总 upsert 同步调用） */
+export async function insertPersonaRelationshipHistory(input: {
+  personaId: number;
+  targetPersonaId: number | null;
+  targetName: string;
+  gameId: string;
+  titleNo: string;
+  relation: string;
+  affinityDelta: number;
+  trustDelta: number;
+  affinity: number; // 当局结算后累计值（汇总行 upsert 后的读数）
+  trust: number;
+  note: string;
+}): Promise<void> {
+  const db = getDb();
+  await db.insert(personaRelationshipHistory).values({
+    personaId: input.personaId,
+    targetPersonaId: input.targetPersonaId,
+    targetName: input.targetName,
+    gameId: input.gameId,
+    titleNo: input.titleNo,
+    relation: input.relation,
+    affinityDelta: input.affinityDelta,
+    trustDelta: input.trustDelta,
+    affinity: input.affinity,
+    trust: input.trust,
+    note: input.note,
+  });
+}
+
+/** 人格的关系历史（详情页折叠栏用；按产生时间正序——沿革的本质是时间线） */
+export async function listPersonaRelationshipHistory(
+  personaId: number,
+  userId: string,
+): Promise<PersonaRelationshipHistory[] | null> {
+  const owner = await getPersona(personaId, userId);
+  if (!owner) return null;
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(personaRelationshipHistory)
+    .where(eq(personaRelationshipHistory.personaId, personaId))
+    .orderBy(personaRelationshipHistory.createdAt);
+  return rows.map((r: typeof personaRelationshipHistory.$inferSelect) => ({
+    id: r.id,
+    personaId: r.personaId,
+    targetPersonaId: r.targetPersonaId,
+    targetName: r.targetName,
+    gameId: r.gameId,
+    titleNo: r.titleNo,
+    relation: r.relation,
+    affinityDelta: r.affinityDelta,
+    trustDelta: r.trustDelta,
+    affinity: r.affinity,
+    trust: r.trust,
+    note: r.note,
+    createdAt: (r.createdAt instanceof Date ? r.createdAt : new Date(r.createdAt)).toISOString(),
+  }));
 }
 
 /** 人格漂移应用：改写卡的长期参数（逐路径钳位、漂移字段摘除推断标记）+ 漂移日志留痕 */

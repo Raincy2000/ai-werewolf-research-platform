@@ -240,6 +240,28 @@ export const personaRelationships = mysqlTable(
   (t) => [index("idx_prel_persona").on(t.personaId)],
 );
 
+// 关系历史（人格锚点关系的逐局变迁：每次回写追加一行，亲疏/信任增量 + 当时快照；
+// 汇总行仍走 persona_relationships upsert——列表看现状，折叠栏看沿革，科研价值在沿革）
+export const personaRelationshipHistory = mysqlTable(
+  "persona_relationship_history",
+  {
+    id: serial("id").primaryKey(),
+    personaId: int("persona_id").notNull(),
+    targetPersonaId: int("target_persona_id"), // 人格锚点目标（非人格锚点的逐局锚点已是天然历史，不入此表）
+    targetName: varchar("target_name", { length: 128 }).notNull(),
+    gameId: varchar("game_id", { length: 36 }),
+    titleNo: varchar("title_no", { length: 16 }).notNull().default(""), // 对局标题号（展示用统一编号）
+    relation: varchar("relation", { length: 64 }).notNull().default(""), // 当局关系标签
+    affinityDelta: int("affinity_delta").notNull().default(0), // 当局亲疏增量
+    trustDelta: int("trust_delta").notNull().default(0), // 当局信任增量
+    affinity: int("affinity").notNull().default(0), // 当局结算后累计亲疏
+    trust: int("trust").notNull().default(50), // 当局结算后累计信任
+    note: varchar("note", { length: 255 }).notNull().default(""), // 当局关键事件
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("idx_prelh_persona").on(t.personaId), index("idx_prelh_target").on(t.targetPersonaId)],
+);
+
 // 人格漂移日志（附录留痕：长期参数跨对局逐次调整，from→to + 事由）
 export const personaDriftLog = mysqlTable(
   "persona_drift_log",

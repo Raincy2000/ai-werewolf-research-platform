@@ -49,6 +49,7 @@ beforeEach(async () => {
     tbl.apiPresets,
     tbl.personaReports,
     tbl.personaDriftLog,
+    tbl.personaRelationshipHistory,
     tbl.personaRelationships,
     tbl.personaMemories,
     tbl.personas,
@@ -513,5 +514,53 @@ describe("SQLite 方言：对局标题号（games.title_no）", () => {
       { id: "g2", title_no: "20260804002" },
       { id: "g3", title_no: "20260804001" },
     ]);
+  });
+});
+
+describe("persona_relationship_history（关系沿革：追加写+正序读）", () => {
+  it("upsert 汇总 + 历史追加 + 按时间正序读取", async () => {
+    await users.insertUser({ id: "relh-user-1", email: "relh@example.com", username: "沿革测试", avatar: "", passwordHash: await hashPassword("password123"), settings: null });
+    const u = await users.findUserByEmail("relh@example.com");
+    const created = await personasQ.createPersona(
+      u!.id,
+      { name: "艾伦·耶格尔", params: defaultPersonaParams(), profile: emptyPersonaProfile() },
+      "manual",
+    );
+    const pid = created.id;
+
+    // 两局两次回写：汇总行 upsert 归并，历史行各留一条
+    const s1 = await personasQ.upsertPersonaRelationship({
+      personaId: pid, targetPersonaId: 13, targetName: "夜神月",
+      relation: "宿敌", affinityDelta: -30, trustDelta: -20, note: "第一局被算计", gameId: "g1",
+    });
+    await personasQ.insertPersonaRelationshipHistory({
+      personaId: pid, targetPersonaId: 13, targetName: "夜神月", gameId: "g1", titleNo: "20261009001",
+      relation: "宿敌", affinityDelta: -30, trustDelta: -20,
+      affinity: s1.affinity, trust: s1.trust, note: "第一局被算计",
+    });
+    const s2 = await personasQ.upsertPersonaRelationship({
+      personaId: pid, targetPersonaId: 13, targetName: "夜神月",
+      relation: "亦敌亦友", affinityDelta: 10, trustDelta: 15, note: "第二局并肩作战", gameId: "g2",
+    });
+    await personasQ.insertPersonaRelationshipHistory({
+      personaId: pid, targetPersonaId: 13, targetName: "夜神月", gameId: "g2", titleNo: "20261010001",
+      relation: "亦敌亦友", affinityDelta: 10, trustDelta: 15,
+      affinity: s2.affinity, trust: s2.trust, note: "第二局并肩作战",
+    });
+
+    // 汇总行：累计值（亲和 -30+10=-20；信任 50-20+15=45）
+    const rels = await personasQ.listPersonaRelationships(pid, u!.id);
+    expect(rels!.length).toBe(1);
+    expect(rels![0]!.affinity).toBe(-20);
+    expect(rels![0]!.trust).toBe(45);
+
+    // 历史行：两条、正序、快照与汇总结算值一致
+    const hist = await personasQ.listPersonaRelationshipHistory(pid, u!.id);
+    expect(hist!.length).toBe(2);
+    expect(hist![0]!.titleNo).toBe("20261009001");
+    expect(hist![0]!.affinity).toBe(-30);
+    expect(hist![1]!.titleNo).toBe("20261010001");
+    expect(hist![1]!.affinity).toBe(-20); // 快照=结算后累计
+    expect(hist![1]!.trust).toBe(45);
   });
 });
