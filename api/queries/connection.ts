@@ -11,7 +11,7 @@ import path from "node:path";
 import { env } from "../lib/env";
 import * as mysqlSchema from "@db/schema.mysql";
 import * as sqliteSchema from "@db/schema.sqlite";
-import { SQLITE_DDL, SQLITE_DDL_0001, SQLITE_DDL_0002, SQLITE_DDL_0003, SQLITE_DDL_0004, SQLITE_DDL_0005, SQLITE_DDL_0006 } from "@db/sqlite-ddl";
+import { SQLITE_DDL, SQLITE_DDL_0001, SQLITE_DDL_0002, SQLITE_DDL_0003, SQLITE_DDL_0004, SQLITE_DDL_0005, SQLITE_DDL_0006, SQLITE_DDL_0007 } from "@db/sqlite-ddl";
 
 let instance: unknown;
 
@@ -73,6 +73,12 @@ function createSqliteDb(dbPath: string) {
       .get();
     if (!hasRelHistory) {
       raw.exec(SQLITE_DDL_0006);
+    }
+    const hasRelBackfill = raw
+      .prepare("SELECT 1 FROM pragma_table_info('persona_relationship_history') WHERE name='backfill'")
+      .get();
+    if (!hasRelBackfill) {
+      raw.exec(SQLITE_DDL_0007);
     }
   }
   const executor = async (

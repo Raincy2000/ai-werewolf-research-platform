@@ -545,7 +545,7 @@ describe("persona_relationship_history（关系沿革：追加写+正序读）",
     await personasQ.insertPersonaRelationshipHistory({
       personaId: pid, targetPersonaId: 13, targetName: "夜神月", gameId: "g2", titleNo: "20261010001",
       relation: "亦敌亦友", affinityDelta: 10, trustDelta: 15,
-      affinity: s2.affinity, trust: s2.trust, note: "第二局并肩作战",
+      affinity: s2.affinity, trust: s2.trust, note: "第二局并肩作战", backfill: true,
     });
 
     // 汇总行：累计值（亲和 -30+10=-20；信任 50-20+15=45）
@@ -562,5 +562,7 @@ describe("persona_relationship_history（关系沿革：追加写+正序读）",
     expect(hist![1]!.titleNo).toBe("20261010001");
     expect(hist![1]!.affinity).toBe(-20); // 快照=结算后累计
     expect(hist![1]!.trust).toBe(45);
+    expect(hist![0]!.backfill).toBe(false); // 赛后实时回写
+    expect(hist![1]!.backfill).toBe(true); // 追溯回填标记
   });
 });

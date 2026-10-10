@@ -220,6 +220,7 @@ CREATE TABLE \`persona_relationship_history\` (
 	\`affinity\` integer DEFAULT 0 NOT NULL,
 	\`trust\` integer DEFAULT 50 NOT NULL,
 	\`note\` text DEFAULT '' NOT NULL,
+	\`backfill\` integer DEFAULT 0 NOT NULL,
 	\`created_at\` integer NOT NULL
 );
 CREATE INDEX \`idx_prelh_persona\` ON \`persona_relationship_history\` (\`persona_id\`);
@@ -233,6 +234,7 @@ CREATE TABLE \`game_studies\` (
 	\`game_id\` text NOT NULL,
 	\`seat\` integer NOT NULL,
 	\`notes\` text NOT NULL,
+	\`backfill\` integer DEFAULT 0 NOT NULL,
 	\`created_at\` integer NOT NULL
 );
 
@@ -373,8 +375,15 @@ CREATE TABLE \`persona_relationship_history\` (
 	\`affinity\` integer DEFAULT 0 NOT NULL,
 	\`trust\` integer DEFAULT 50 NOT NULL,
 	\`note\` text DEFAULT '' NOT NULL,
+	\`backfill\` integer DEFAULT 0 NOT NULL,
 	\`created_at\` integer NOT NULL
 );
 CREATE INDEX \`idx_prelh_persona\` ON \`persona_relationship_history\` (\`persona_id\`);
 CREATE INDEX \`idx_prelh_target\` ON \`persona_relationship_history\` (\`target_persona_id\`);
+`;
+
+
+// 增量 DDL（0007：关系历史表加追溯回填标记列 persona_relationship_history.backfill）
+export const SQLITE_DDL_0007 = `
+ALTER TABLE \`persona_relationship_history\` ADD COLUMN \`backfill\` integer DEFAULT 0 NOT NULL;
 `;

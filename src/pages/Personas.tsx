@@ -1599,6 +1599,11 @@ export default function Personas() {
                                     <li key={h.id} className="rounded-md bg-secondary/40 px-2.5 py-1.5 text-xs">
                                       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                                         <span className="font-mono text-muted-foreground">{h.titleNo || h.gameId?.slice(0, 8)}</span>
+                                        {h.backfill ? (
+                                          <Badge variant="secondary" className="px-1 text-[10px] font-normal" title="追溯回填：由历史对局日志事后蒸馏补史">
+                                            溯
+                                          </Badge>
+                                        ) : null}
                                         <Badge variant="outline" className="px-1 text-[10px] font-normal">
                                           {h.relation || '未命名'}
                                         </Badge>

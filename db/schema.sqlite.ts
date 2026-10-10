@@ -260,6 +260,7 @@ export const personaRelationshipHistory = sqliteTable(
     affinity: integer("affinity").notNull().default(0),
     trust: integer("trust").notNull().default(50),
     note: text("note").notNull().default(""),
+    backfill: integer("backfill").notNull().default(0), // 1=追溯回填（历史对局事后蒸馏，区别于赛后实时回写）
     createdAt: integer("created_at", { mode: "timestamp_ms" })
       .notNull()
       .$defaultFn(() => new Date()),

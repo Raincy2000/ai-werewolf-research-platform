@@ -545,6 +545,7 @@ export async function insertPersonaRelationshipHistory(input: {
   affinity: number; // 当局结算后累计值（汇总行 upsert 后的读数）
   trust: number;
   note: string;
+  backfill?: boolean; // 追溯回填标记（默认 false=赛后实时回写）
 }): Promise<void> {
   const db = getDb();
   await db.insert(personaRelationshipHistory).values({
@@ -559,6 +560,7 @@ export async function insertPersonaRelationshipHistory(input: {
     affinity: input.affinity,
     trust: input.trust,
     note: input.note,
+    backfill: input.backfill === true ? 1 : 0,
   });
 }
 
@@ -588,6 +590,7 @@ export async function listPersonaRelationshipHistory(
     affinity: r.affinity,
     trust: r.trust,
     note: r.note,
+    backfill: Number(r.backfill) === 1,
     createdAt: (r.createdAt instanceof Date ? r.createdAt : new Date(r.createdAt)).toISOString(),
   }));
 }

@@ -230,6 +230,7 @@ export interface PersonaRelationshipHistory {
   affinity: number; // 当局结算后累计亲疏
   trust: number; // 当局结算后累计信任
   note: string; // 当局关键事件一句
+  backfill: boolean; // true=追溯回填（历史对局事后蒸馏，区别于赛后实时回写）
   createdAt: string;
 }
 

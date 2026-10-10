@@ -257,6 +257,7 @@ export const personaRelationshipHistory = mysqlTable(
     affinity: int("affinity").notNull().default(0), // 当局结算后累计亲疏
     trust: int("trust").notNull().default(50), // 当局结算后累计信任
     note: varchar("note", { length: 255 }).notNull().default(""), // 当局关键事件
+    backfill: int("backfill").notNull().default(0), // 1=追溯回填（历史对局事后蒸馏）
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [index("idx_prelh_persona").on(t.personaId), index("idx_prelh_target").on(t.targetPersonaId)],
