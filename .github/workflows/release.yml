@@ -35,6 +35,15 @@ jobs:
         env:
           ELECTRON_BUILDER_COMPRESSION_LEVEL: '5'
 
+      # GitHub Release 资产名对非 ASCII 不友好（中文会被剥成 "AI."），统一改 ASCII 规范名
+      - name: Rename artifacts to ASCII
+        run: |
+          $v = (Get-Content desktop/package.json | ConvertFrom-Json).version
+          Get-ChildItem desktop/release/*.exe | ForEach-Object {
+            $kind = if ($_.Name -like '*portable*') { 'portable' } else { 'setup' }
+            Rename-Item $_.FullName "werewolf-research-$v-$kind.exe"
+          }
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
