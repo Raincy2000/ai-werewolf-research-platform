@@ -65,6 +65,24 @@ export const gameRouter = createRouter({
     .input(z.object({ gameId: z.string() }))
     .mutation(({ input, ctx }) => gameService.startPostGame(input.gameId, ctx.user.id)),
 
+  // 开始心理检查（手动开启的终局收尾：分出胜负即可；可续跑——已完成座位不重跑）；
+  // 分析师配置由前端携带（与手动生成分析报告同款），缺省后端回落对局座位配置
+  startPsyCheck: authedProcedure
+    .input(
+      z.object({
+        gameId: z.string(),
+        analystAi: z
+          .object({
+            provider: z.enum(["kimi", "openai", "deepseek", "custom", "anthropic"]),
+            baseUrl: z.string(),
+            model: z.string(),
+            apiKey: z.string(),
+          })
+          .nullish(),
+      }),
+    )
+    .mutation(({ input, ctx }) => gameService.startPsyCheck(input.gameId, input.analystAi, ctx.user.id)),
+
   // 赛前学习心得（图书馆对局）：按座位返回各 AI 的学习记录（观察者上帝视角可见）
   studyNotes: authedProcedure
     .input(z.object({ gameId: z.string() }))

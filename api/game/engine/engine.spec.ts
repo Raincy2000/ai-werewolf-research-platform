@@ -2044,3 +2044,146 @@ describe("专项：开局告知与快照存量", () => {
     expect(villager.checks).toEqual([]);
   });
 });
+
+
+describe("专项：外部结算（settleExternal，引擎外房规裁决落定终局）", () => {
+  const BOARD = BOARDS.find((b) => b.id === "standard9")!;
+  // 跑到首个待决点（第1夜狼队思考批次），此刻主流程协程挂在待决上
+  function engineAtFirstPending(opts?: Partial<AdvancedOptions>) {
+    const options: AdvancedOptions = {
+      stepDelayMs: 0,
+      sheriffEnabled: false,
+      allowSelfDestruct: true,
+      speechRoundsLimit: 1,
+      ...opts,
+    };
+    const engine = createEngine({ boardId: BOARD.id, seatRoles: [...BOARD.roles], options });
+    const first = engine.advance();
+    if (!first.pending) throw new Error("未见待决点");
+    return engine;
+  }
+
+  it("封存待决 + 落定胜者 + 结果事件含存活表；未开赛后讨论则立即 finished", () => {
+    const engine = engineAtFirstPending();
+    const events = engine.settleExternal("good");
+    const snap = engine.getSnapshot();
+    expect(snap.winner).toBe("good");
+    expect(snap.phase).toBe("game.over");
+    expect(engine.isFinished()).toBe(true); // 未开赛后讨论：结算即终局
+    const result = events.find((e) => e.type === "result");
+    expect(result?.content).toContain("好人阵营胜利");
+    expect(result?.content).toContain("存活"); // 与自然终局同格式（存活表）
+    expect(engine.advance().pending).toBeNull(); // 终局后无待决
+  });
+
+  it("开赛后讨论：结算后 advance 照常进入赛后环节，全员弃权后 finished", () => {
+    const engine = engineAtFirstPending({ postGameDiscuss: true, postGameSpeechLimit: 2 });
+    engine.settleExternal("wolf");
+    expect(engine.isFinished()).toBe(false); // 赛后未跑完不收敛
+    // advance 驱动独立赛后协程：阶段提醒 + 开始公告 + 首个 postgameSpeak 待决
+    let r = engine.advance();
+    expect(r.events.some((e) => e.title === "赛后讨论开始")).toBe(true);
+    expect(r.pending?.kind).toBe("postgameSpeak");
+    // 全员弃权（skip 不消耗机会）→ 一整轮无人发言 → 环节结束 → finished
+    const allEvents = [...r.events];
+    let guard = 0;
+    while (!engine.isFinished() && guard++ < 100) {
+      if (r.pending) {
+        expect(r.pending.kind).toBe("postgameSpeak");
+        allEvents.push(...engine.decide({ thought: "", skip: true })); // decide 排出的事件也要收集
+      }
+      r = engine.advance();
+      allEvents.push(...r.events);
+    }
+    expect(engine.isFinished()).toBe(true);
+    expect(allEvents.some((e) => e.title === "赛后讨论结束")).toBe(true);
+    expect(engine.getSnapshot().winner).toBe("wolf"); // 胜者不受影响
+  });
+
+  it("裁决缘由入公开记录：pubLine 先于胜负公告写入 publicLog（赛后复盘的认知依据）", () => {
+    // 对局 20261009001 实锤：驳回缘由从未进玩家公开记录 → 赛后全员对逆转零提及
+    const engine = engineAtFirstPending({ postGameDiscuss: true, postGameSpeechLimit: 1 });
+    engine.settleExternal(
+      "good",
+      "（白日交刀宣布胜利未通过审核）",
+      "【审核】2号代表狼队宣布提前胜利——狼人胜率未达 100%，宣布无效！",
+    );
+    let r = engine.advance();
+    let guard = 0;
+    while (r.pending && guard++ < 50) {
+      if (r.pending.kind === "postgameSpeak") break;
+      engine.decide({ thought: "", skip: true });
+      r = engine.advance();
+    }
+    expect(r.pending?.kind).toBe("postgameSpeak");
+    const log = r.pending!.view.publicLog;
+    const auditIdx = log.findIndex((l) => l.includes("【审核】"));
+    const overIdx = log.findIndex((l) => l.includes("【游戏结束】"));
+    expect(auditIdx).toBeGreaterThan(-1); // 玩家可见
+    expect(overIdx).toBeGreaterThan(auditIdx); // 裁决缘由先于胜负公告
+    expect(log[auditIdx]!).toContain("宣布无效");
+  });
+
+  it("结算后 decide 旧待决被拒（封存语义：在飞待决不再可消费）", () => {
+    const engine = engineAtFirstPending();
+    engine.settleExternal("good");
+    expect(() => engine.decide({ thought: "", skip: true })).toThrow("当前没有待决的决策");
+  });
+});
+
+describe("专项：放逐出局时点（放逐结果≠出局，技能结算后才真正出局）", () => {
+  // 房规语义（用户裁定）：投票结果落地≠出局——被放逐者在遗言、放逐技能询问期间仍在场
+  //（技能发动才有存在前提），仅当技能选择结算完毕出现死亡公告后才出局（座位才变灰）。
+  it("遗言/技能询问时点仍在场；技能结算（死亡公告）后才出局；放逐结果事件不是 death 类", () => {
+    // 剧本：夜1狼刀 9 号；白天全体放逐 1 号（狼人，技能询问沉默）
+    const ROLES: RoleId[] = ["werewolf", "werewolf", "werewolf", "seer", "witch", "hunter", "villager", "villager", "villager"];
+    const aliveAt: { label: string; alive: boolean }[] = [];
+    let exiledSeen = false;
+    const { events } = drive("standard9", ROLES, (p, e) => {
+      const alive1 = () => e.getSnapshot().players[0]!.alive;
+      // 狼刀固定刀 8 号（平民）：狼刀批次全员一致投 8（options 含全场座位，防误刀自己人）
+      if (p.kind === "wolfKill") {
+        const pick = (s: PendingDecision) => s.options.includes(8) ? 8 : s.options[s.options.length - 1]!;
+        if (!p.batch) return { thought: "t", targets: [pick(p)] }; // 单待决（独狼带刀）：直接 targets
+        return {
+          thought: "t",
+          batchInputs: p.batch.map((s) => ({ thought: "t", targets: [pick(s)] })),
+        };
+      }
+      if (p.kind === "dayVote") {
+        // 放逐 1 号：不投自己（1 号本人投首个合法项），其余全投 1 号
+        return {
+          thought: "t",
+          batchInputs: (p.batch ?? []).map((s) => ({
+            thought: "t",
+            targets: [s.seat !== 1 && s.options.includes(1) ? 1 : s.options[0]!],
+          })),
+        };
+      }
+      if (p.kind === "lastWords" && p.seat === 1) {
+        aliveAt.push({ label: "遗言待决", alive: alive1() });
+        return { thought: "", speech: "我是好人" };
+      }
+      if (p.kind === "exileSkill" && p.seat === 1) {
+        aliveAt.push({ label: "技能询问待决", alive: alive1() });
+        exiledSeen = true;
+        return { thought: "", skip: true }; // 沉默 → 结算出局
+      }
+      // 技能询问结算后的首个待决（权衡窗口或入夜）——此刻 1 号必须已出局
+      if (exiledSeen && aliveAt.every((a) => a.label !== "技能结算后")) {
+        aliveAt.push({ label: "技能结算后", alive: alive1() });
+      }
+      return QUICK(p);
+    });
+
+    expect(aliveAt.find((a) => a.label === "遗言待决")?.alive).toBe(true);
+    expect(aliveAt.find((a) => a.label === "技能询问待决")?.alive).toBe(true);
+    expect(aliveAt.find((a) => a.label === "技能结算后")?.alive).toBe(false);
+    // 事件流：放逐结果在前、死亡公告在后；且「放逐结果」不是 death 类（回放按 death 灰显不误伤）
+    const idxResult = events.findIndex((e) => e.title === "放逐结果" && e.content.includes("1号"));
+    const idxDeath = events.findIndex((e) => e.type === "death" && e.actor === 1);
+    expect(idxResult).toBeGreaterThan(-1);
+    expect(idxDeath).toBeGreaterThan(idxResult);
+    expect(events[idxResult]!.type).toBe("vote");
+  });
+});

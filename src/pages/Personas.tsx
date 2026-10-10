@@ -6,6 +6,7 @@
  */
 
 import { useEffect, useState } from 'react'
+import type { ReactNode } from 'react'
 import {
   Brain,
   CircleAlert,
@@ -85,6 +86,7 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { CastWizard } from '@/components/persona/CastWizard'
+import { CastStageBar } from '@/components/persona/CastStageBar'
 import { MarkdownBoard } from '@/components/MarkdownBoard'
 
 // ---------------------------------------------------------------------------
@@ -254,7 +256,9 @@ function formToInput(form: PersonaFormState): PersonaCardInput {
 function ParamBar({ label, value, tone }: { label: string; value: number; tone?: 'wolf' }) {
   return (
     <div className="flex items-center gap-2">
-      <span className="w-16 shrink-0 text-xs text-muted-foreground">{label}</span>
+      <span className="w-20 shrink-0 break-words text-xs leading-4 text-muted-foreground" title={label}>
+        {label}
+      </span>
       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-secondary">
         <div
           className={cn('h-full rounded-full', tone === 'wolf' ? 'bg-wolf/70' : 'bg-god/70')}
@@ -263,6 +267,31 @@ function ParamBar({ label, value, tone }: { label: string; value: number; tone?:
       </div>
       <span className="w-7 shrink-0 text-right font-mono text-xs text-foreground">{value}</span>
     </div>
+  )
+}
+
+/** 参数分类模块框：人格参数页的统一容器（标题 + 一句话介绍 + 参数行） */
+function ParamModule({
+  title,
+  desc,
+  children,
+  className,
+}: {
+  title: string
+  desc?: string
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <section className={cn('rounded-xl border border-border bg-secondary/20 p-4', className)}>
+      <p className="text-[13px] font-semibold text-foreground">{title}</p>
+      {desc ? (
+        <p className="mb-3 mt-1 break-words text-[11px] leading-4 text-muted-foreground">{desc}</p>
+      ) : (
+        <div className="mb-2" />
+      )}
+      <div className="space-y-2">{children}</div>
+    </section>
   )
 }
 
@@ -691,7 +720,7 @@ export default function Personas() {
             <ul className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
               {/* 铸造中卡片组（始终在最前/最新位置）：批量并发时逐卡显示；姓名+进度+暂停/继续+终止 */}
               {activeCasts.map((activeCast) => (
-                <li key={activeCast.castId} className="flex gap-3 rounded-lg border border-god/50 bg-god/5 p-3">
+                <li key={activeCast.castId} className="flex gap-3 rounded-xl border border-god/50 bg-god/5 p-3 transition-shadow duration-300 hover:shadow-md">
                   <span className="flex h-24 w-[72px] shrink-0 items-center justify-center rounded-md border border-god/40 bg-secondary">
                     {activeCast.done ? (
                       <Sparkles className="h-7 w-7 text-god" aria-hidden />
@@ -717,6 +746,10 @@ export default function Personas() {
                     <p className="mb-1 truncate text-[11px] text-god">
                       {activeCast.error ?? activeCast.label}
                     </p>
+                    {/* 三节点生成进度条（紧凑模式）：跟随后端阶段 label 推进 */}
+                    <div className="mb-1.5 pr-1">
+                      <CastStageBar compact done={activeCast.done && !activeCast.error} label={activeCast.label} />
+                    </div>
                     {activeCast.detail ? (
                       <p className="mb-1 truncate text-[10px] text-muted-foreground">{activeCast.detail}</p>
                     ) : null}
@@ -778,7 +811,7 @@ export default function Personas() {
                 </li>
               ))}
               {cards.map((c) => (
-                <li key={c.id} className="flex gap-3 rounded-lg border border-border bg-card p-3">
+                <li key={c.id} className="flex gap-3 rounded-xl border border-border bg-card p-3 transition-shadow duration-300 hover:shadow-md">
                   {/* 肖像（身份证式配图；无图用首字占位） */}
                   {c.imageData ? (
                     <img
@@ -855,7 +888,7 @@ export default function Personas() {
 
       {/* ================= 编辑器弹窗（新建/编辑共用） ================= */}
       <Dialog open={editor !== null} onOpenChange={(open) => !open && setEditor(null)}>
-        <DialogContent className="max-h-[90dvh] max-w-4xl overflow-y-auto">
+        <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-[min(1200px,94dvw)]">
           <DialogHeader>
             <DialogTitle>
               {editor?.id === null
@@ -1293,7 +1326,7 @@ export default function Personas() {
 
       {/* ================= 详情弹窗 ================= */}
       <Dialog open={detail !== null} onOpenChange={(open) => !open && setDetail(null)}>
-        <DialogContent className="max-h-[90dvh] max-w-4xl overflow-y-auto">
+        <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-[min(1200px,94dvw)]">
           {detail ? (
             <>
               <DialogHeader>
@@ -1397,64 +1430,78 @@ export default function Personas() {
                   ) : null}
                 </TabsContent>
 
-                <TabsContent value="params" className="mt-4 grid grid-cols-1 gap-6 sm:grid-cols-2">
-                  <div className="space-y-1.5">
-                    <p className="text-xs font-medium text-muted-foreground">大五人格</p>
-                    {BIG_FIVE_LABELS.map(({ key, label }) => (
-                      <ParamBar key={key} label={label} value={detail.card.params.bigFive[key]} />
-                    ))}
-                    <p className="pt-2 text-xs font-medium text-muted-foreground">
-                      依恋类型（{attachmentLabel(detail.card.params.attachment)}）
-                    </p>
-                    <ParamBar label="依恋焦虑" value={detail.card.params.attachment.anxiety} />
-                    <ParamBar label="依恋回避" value={detail.card.params.attachment.avoidance} />
-                  </div>
-                  <div className="space-y-1.5">
-                    <p className="text-xs font-medium text-muted-foreground">黑暗四人格</p>
-                    {DARK_LABELS.map(({ key, label }) => (
-                      <ParamBar
-                        key={key}
-                        label={label}
-                        value={detail.card.params.darkTetrad[key]}
-                        tone="wolf"
-                      />
-                    ))}
-                  </div>
-                  <div className="space-y-1.5">
-                    <p className="text-xs font-medium text-muted-foreground">情绪调节策略</p>
-                    {EMO_LABELS.map(({ key, label }) => (
-                      <ParamBar
-                        key={key}
-                        label={label}
-                        value={detail.card.params.emotionRegulation[key]}
-                      />
-                    ))}
-                    <p className="pt-2 text-xs font-medium text-muted-foreground">SDT 动机</p>
-                    {SDT_LABELS.map(({ key, label }) => (
-                      <ParamBar key={key} label={label} value={detail.card.params.sdt[key]} />
-                    ))}
-                  </div>
-                  <div className="space-y-2">
-                    <p className="text-xs font-medium text-muted-foreground">核心认知偏差</p>
-                    {detail.card.params.cognitiveBiases.map((b) => (
-                      <ParamBar key={b.id} label={b.label} value={b.strength} />
-                    ))}
-                    <p className="pt-2 text-xs font-medium text-muted-foreground">防御机制</p>
-                    {detail.card.params.defenseMechanisms.map((d) => (
-                      <div key={d.id} className="flex items-center gap-2">
-                        <Badge variant="outline" className="w-14 justify-center text-[10px] font-normal">
-                          {MATURITY_LABEL[d.maturity]}
-                        </Badge>
-                        <div className="flex-1">
-                          <ParamBar label={d.label} value={d.tendency} />
-                        </div>
-                      </div>
-                    ))}
+                <TabsContent value="params" className="mt-4">
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <ParamModule title="大五人格" desc="人格的五个基础维度（0-100，50 为中性）">
+                      {BIG_FIVE_LABELS.map(({ key, label }) => (
+                        <ParamBar key={key} label={label} value={detail.card.params.bigFive[key]} />
+                      ))}
+                    </ParamModule>
+                    <ParamModule
+                      title="依恋类型"
+                      desc={`亲密关系中的安全感模式 · 当前倾向：${attachmentLabel(detail.card.params.attachment)}`}
+                    >
+                      <ParamBar label="依恋焦虑" value={detail.card.params.attachment.anxiety} />
+                      <ParamBar label="依恋回避" value={detail.card.params.attachment.avoidance} />
+                    </ParamModule>
+                    <ParamModule title="黑暗四人格" desc="暗影特质的倾向强度（越高越锋利）">
+                      {DARK_LABELS.map(({ key, label }) => (
+                        <ParamBar
+                          key={key}
+                          label={label}
+                          value={detail.card.params.darkTetrad[key]}
+                          tone="wolf"
+                        />
+                      ))}
+                    </ParamModule>
+                    <ParamModule title="情绪调节策略" desc="情绪涌上来时惯用的处理方式">
+                      {EMO_LABELS.map(({ key, label }) => (
+                        <ParamBar
+                          key={key}
+                          label={label}
+                          value={detail.card.params.emotionRegulation[key]}
+                        />
+                      ))}
+                    </ParamModule>
+                    <ParamModule title="SDT 动机" desc="自我决定论的三大基本心理需要">
+                      {SDT_LABELS.map(({ key, label }) => (
+                        <ParamBar key={key} label={label} value={detail.card.params.sdt[key]} />
+                      ))}
+                    </ParamModule>
+                    <ParamModule title="核心认知偏差" desc="思维捷径带来的系统性偏误倾向">
+                      {detail.card.params.cognitiveBiases.length > 0 ? (
+                        detail.card.params.cognitiveBiases.map((b) => (
+                          <ParamBar key={b.id} label={b.label} value={b.strength} />
+                        ))
+                      ) : (
+                        <p className="text-xs text-muted-foreground">无显著认知偏差</p>
+                      )}
+                    </ParamModule>
+                    <ParamModule title="防御机制" desc="面对压力与威胁时的心理防线（徽章为成熟度）">
+                      {detail.card.params.defenseMechanisms.length > 0 ? (
+                        detail.card.params.defenseMechanisms.map((d) => (
+                          <div key={d.id} className="flex items-center gap-2">
+                            <Badge variant="outline" className="w-14 shrink-0 justify-center text-[10px] font-normal">
+                              {MATURITY_LABEL[d.maturity]}
+                            </Badge>
+                            <div className="flex-1">
+                              <ParamBar label={d.label} value={d.tendency} />
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="text-xs text-muted-foreground">无显著防御机制</p>
+                      )}
+                    </ParamModule>
                     {detail.card.params.inferred.length > 0 ? (
-                      <p className="pt-2 text-xs text-amber-600">
-                        推断项（{detail.card.params.inferred.length}）：
-                        {detail.card.params.inferred.join('、')}
-                      </p>
+                      <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-4 sm:col-span-2">
+                        <p className="mb-1 text-[13px] font-semibold text-amber-600">
+                          推断项（{detail.card.params.inferred.length}）
+                        </p>
+                        <p className="break-words text-xs leading-5 text-amber-600/90">
+                          铸魂师资料不足时按心理学原型补全的参数：{detail.card.params.inferred.join('、')}
+                        </p>
+                      </div>
                     ) : null}
                   </div>
                 </TabsContent>
@@ -1473,7 +1520,7 @@ export default function Personas() {
                               {m.type === 'trauma' ? '创伤' : m.type === 'relationship' ? '关系' : '一般'}
                             </Badge>
                             <span className="text-xs text-muted-foreground">
-                              强度 {m.strength} · 权重 {m.emotionalWeight} · {formatTime(m.updatedAt)}
+                              强度 {m.strength} · 权重 {m.emotionalWeight} · {formatTime(m.createdAt)}
                             </span>
                           </div>
                           <p className="whitespace-pre-wrap leading-6">{m.content}</p>
@@ -1572,7 +1619,7 @@ export default function Personas() {
 
       {/* 心理检查报告阅读窗 */}
       <Dialog open={reportView !== null} onOpenChange={(open) => !open && setReportView(null)}>
-        <DialogContent className="max-h-[85dvh] max-w-3xl overflow-y-auto">
+        <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-[min(1000px,94dvw)]">
           <DialogHeader>
             <DialogTitle>《心理检查报告》</DialogTitle>
             <DialogDescription>
@@ -1614,7 +1661,7 @@ export default function Personas() {
 
       {/* 回收站弹窗 */}
       <Dialog open={trashOpen} onOpenChange={setTrashOpen}>
-        <DialogContent className="max-h-[85dvh] max-w-2xl overflow-y-auto">
+        <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Trash className="h-5 w-5" aria-hidden />

@@ -10,6 +10,7 @@ const h = {
   games: new Map<string, Record<string, unknown>>(),
   events: [] as Record<string, unknown>[],
   decisions: [] as Record<string, unknown>[],
+  aiResponse: null as string | null, // 非空时 callAi 返回该文本（注入非法输出场景）
   engine: null as ReturnType<typeof makeFakeBatchEngine> | null,
 };
 
@@ -42,9 +43,12 @@ vi.mock("../../queries/decisions", () => ({
       .sort((a, b) => (a.idx as number) - (b.idx as number)),
 }));
 
-// AI 永远失败（队列空 → ok:false），错误原因固定可断言
+// AI 响应模式可控：aiResponse=null → 永远失败（队列空 → ok:false）；非空 → 返回该文本（可注入非法输出）
 vi.mock("./providers", () => ({
-  callAi: async () => ({ ok: false, text: null, latencyMs: 1, error: "请求超时（150s）" }),
+  callAi: async () =>
+    h.aiResponse != null
+      ? { ok: true, text: h.aiResponse, latencyMs: 1, error: null }
+      : { ok: false, text: null, latencyMs: 1, error: "请求超时（150s）" },
 }));
 
 vi.mock("../engine/index", () => ({
@@ -80,10 +84,10 @@ function makeSub(seat: number): PendingDecision {
   };
 }
 
-function makeFakeBatchEngine() {
+function makeFakeBatchEngine(subs?: PendingDecision[]) {
   const state = { finished: false, decided: [] as DecisionInput[] };
   const batchPending = {
-    batch: [makeSub(2), makeSub(5)],
+    batch: subs ?? [makeSub(2), makeSub(5)],
   } as unknown as PendingDecision;
   return {
     state,
@@ -135,6 +139,7 @@ beforeEach(() => {
   h.games.clear();
   h.events.length = 0;
   h.decisions.length = 0;
+  h.aiResponse = null;
   h.engine = makeFakeBatchEngine();
 });
 
@@ -178,6 +183,73 @@ describe("批量决策托管原因透出", () => {
       expect(m).toContain("2号");
       expect(m).toContain("5号");
       expect(m).toContain("请求超时（150s）");
+    }
+  });
+});
+
+describe("批量「输出非法」托管的原因透出与原始输出留痕（对局 20261009001 回归）", () => {
+  it("AI 返回非法目标 → 兜底标记 + 事件 meta 透出原因与原始输出截断", async () => {
+    // 狼队独立思考批次：AI 返回空思考（wolfThink 子项以 thought 为有效动作）→
+    // sanitize 判非法兜底托管（与对局 20260930002/20261009001 的「输出非法」托管同路径）
+    const runSub = (seat: number): PendingDecision => ({
+      seat,
+      role: "werewolf",
+      kind: "wolfThink",
+      options: [],
+      allowSkip: false,
+      hint: "狼队独立思考",
+      view: {
+        seat,
+        role: "villager",
+        roleName: "狼人",
+        camp: "wolf",
+        day: 1,
+        phase: "day.sheriff.run",
+        aliveSeats: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        deadSeats: [],
+        revealedRoles: {},
+        sheriffSeat: null,
+        selfAlive: true,
+        rules: { witchSelfSave: "never" },
+        publicLog: [],
+        private: {},
+      } as unknown as PendingDecision["view"],
+    });
+    h.engine = makeFakeBatchEngine([runSub(3), runSub(7)]);
+    h.aiResponse = '{"thought":""}'; // 空思考——wolfThink 子项以 thought 为有效动作，空即非法
+
+    const seats = Array.from({ length: 9 }, (_, i) => ({
+      seat: i + 1,
+      provider: "kimi" as const,
+      baseUrl: "http://mock.local/v1",
+      model: "mock-model",
+      apiKey: "sk-mock",
+    }));
+    const { gameId } = await gameService.createGame({
+      boardId: "standard9",
+      seats,
+      options: { stepDelayMs: 5, sheriffEnabled: false, allowSelfDestruct: true, speechRoundsLimit: 2 },
+    });
+    await gameService.control(gameId, "start");
+    const t0 = Date.now();
+    while (Date.now() - t0 < 3_000) {
+      if (h.games.get(gameId)?.status === "finished") break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(h.games.get(gameId)?.status).toBe("finished");
+    // 两个子决策都被兜底（合法等价=托管标记）
+    const decided = h.engine!.state.decided.at(-1)!;
+    for (const sub of decided.batchInputs!) {
+      expect(sub.thought).toBe("[AI输出非法，系统托管]");
+    }
+    // 事件 meta 透出：原因 + 原始输出截断（含非法的 99）
+    const evs = h.events.filter((e) => e.title === "技能权衡" && e.type === "action");
+    expect(evs.length).toBe(2);
+    for (const e of evs) {
+      const m = typeof e.meta === "string" ? e.meta : JSON.stringify(e.meta ?? {});
+      expect(m).toContain("AI输出非法已兜底");
+      expect(m).toContain("原始输出");
+      expect(m).toContain("thought");
     }
   });
 });

@@ -23,7 +23,7 @@ const CAMP_BADGE_CLASS: Record<Camp, string> = {
 /** 座位状态种类与配色（ring=状态圈颜色，text=状态文字颜色）
  * 权衡=技能发动前的思考（狼队独立思考、警长定序、白日主动技能权衡）；
  * 上票=暗票类选择（上警报名同为暗票机制，归入上票） */
-type SeatStateKind = 'selected' | 'speech' | 'skillFire' | 'vote' | 'weigh' | 'study'
+type SeatStateKind = 'selected' | 'speech' | 'skillFire' | 'vote' | 'weigh' | 'study' | 'psyCheck'
 
 const STATE_META: Record<SeatStateKind, { label: string; ring: string; text: string }> = {
   selected: { label: '查看', ring: '#78716c', text: '#78716c' },
@@ -33,6 +33,9 @@ const STATE_META: Record<SeatStateKind, { label: string; ring: string; text: str
   weigh: { label: '权衡', ring: '#b3433a', text: '#b3433a' },
   // 赛前学习中（祖母绿）：图书馆对局的学习阶段，正在通读资料的座位
   study: { label: '学习', ring: '#059669', text: '#059669' },
+  // 心理检查中（慕斯粉，与顶栏「心理检查」按钮 Brain 图标同色 #e0568a）：
+  // 手动开启的终局收尾在飞座位；该座位检查完成后状态环消失
+  psyCheck: { label: '心理检查', ring: '#e0568a', text: '#e0568a' },
 }
 
 /** 引擎待决类型 → 座位状态（狼人落刀 wolfKill 归入技能发动；夜间技能使用同归技能发动） */
@@ -40,6 +43,8 @@ function pendingKindToState(kind: string | null): SeatStateKind | null {
   switch (kind) {
     case 'study': // 赛前学习中（非引擎待决，由快照 studyingSeats 合成）
       return 'study'
+    case 'psyCheck': // 心理检查中（非引擎待决，由 poll 透出的 psyCheck 进度合成）
+      return 'psyCheck'
     case 'wolfThink':
     case 'sheriffOrder':
     case 'sheriffWithdraw': // 退水抉择：权衡中状态环
@@ -133,17 +138,9 @@ export const SeatGrid = memo(function SeatGrid({
         states.sort((a, b) => a.since - b.since)
 
         return (
-          <button
-            key={p.seat}
-            type="button"
-            onClick={() => handleSelect(p.seat)}
-            aria-pressed={selectedSeat === p.seat}
-            title={p.alive ? `${p.seat}号 ${p.roleName}` : `${p.seat}号 ${p.roleName} · ${p.deathInfo ?? '已死亡'}`}
-            className={cn(
-              'relative flex items-stretch rounded-lg border bg-card text-center transition-colors',
-              p.alive ? 'border-border' : 'border-border/60 opacity-60 grayscale',
-            )}
-          >
+          // 包装层：状态环与状态文本挂这里（不吃卡片的灰化滤镜）——
+          // 出局座位的卡片变灰，但赛后讨论/心理检查等环节的状态环与状态文字必须保持彩色可辨
+          <div key={p.seat} className="relative">
             {/* 多状态圈：内圈=最早出现的状态，逐圈向外扩散 */}
             {states.map((s, i) => (
               <span
@@ -156,73 +153,89 @@ export const SeatGrid = memo(function SeatGrid({
                 }}
               />
             ))}
+            <button
+              type="button"
+              onClick={() => handleSelect(p.seat)}
+              aria-pressed={selectedSeat === p.seat}
+              title={p.alive ? `${p.seat}号 ${p.roleName}` : `${p.seat}号 ${p.roleName} · ${p.deathInfo ?? '已死亡'}`}
+              className={cn(
+                'flex h-full w-full items-stretch rounded-lg border bg-card text-center transition-colors',
+                p.alive ? 'border-border' : 'border-border/60 opacity-60 grayscale',
+              )}
+            >
 
-            {/* 主内容列 */}
-            <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5 px-2 py-3">
-              <span className="flex items-center gap-1">
-                <span className="font-mono text-lg font-semibold leading-6 text-foreground">
-                  {p.seat}
+              {/* 主内容列 */}
+              <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5 px-2 py-3">
+                <span className="flex items-center gap-1">
+                  <span className="font-mono text-lg font-semibold leading-6 text-foreground">
+                    {p.seat}
+                  </span>
+                  {p.sheriff ? (
+                    <SheriffBadge className="h-4 w-4 text-god" aria-label="警长" />
+                  ) : p.sheriffCandidate ? (
+                    // 上警竞选中（≥2 人才标记）：亮蓝警徽，与警长金色高区分度（警长落地/警徽流失/退水后消失）
+                    <SheriffBadge className="h-4 w-4 text-sky-500" aria-label="上警竞选中" />
+                  ) : null}
                 </span>
-                {p.sheriff ? (
-                  <SheriffBadge className="h-4 w-4 text-god" aria-label="警长" />
-                ) : p.sheriffCandidate ? (
-                  // 上警竞选中（≥2 人才标记）：亮蓝警徽，与警长金色高区分度（警长落地/警徽流失/退水后消失）
-                  <SheriffBadge className="h-4 w-4 text-sky-500" aria-label="上警竞选中" />
+
+                <Badge variant="outline" className={cn('text-xs font-normal', CAMP_BADGE_CLASS[p.camp])}>
+                  {p.roleName}
+                </Badge>
+
+                {/* 人格研究库：该座位绑定的人格名（其一切言行由该人格驱动） */}
+                {p.personaName ? (
+                  <span
+                    className="max-w-full truncate rounded-full border border-purple-500/50 bg-purple-500/10 px-1.5 py-0.5 text-[10px] text-purple-600 dark:text-purple-300"
+                    title={`人格：${p.personaName}`}
+                  >
+                    {p.personaName}
+                  </span>
                 ) : null}
-              </span>
 
-              <Badge variant="outline" className={cn('text-xs font-normal', CAMP_BADGE_CLASS[p.camp])}>
-                {p.roleName}
-              </Badge>
-
-              {/* 人格研究库：该座位绑定的人格名（其一切言行由该人格驱动） */}
-              {p.personaName ? (
-                <span
-                  className="max-w-full truncate rounded-full border border-purple-500/50 bg-purple-500/10 px-1.5 py-0.5 text-[10px] text-purple-600 dark:text-purple-300"
-                  title={`人格：${p.personaName}`}
-                >
-                  {p.personaName}
-                </span>
-              ) : null}
-
-              {/* 状态描述：分段着色（如「思考/发言中」——「/」与「中」跟随其前面状态文字的颜色） */}
-              {states.length > 0 ? (
-                <span className="text-[11px] font-medium leading-4">
-                  {states.map((s, i) => {
-                    const meta = STATE_META[s.kind]
-                    const last = i === states.length - 1
-                    return (
-                      <span key={s.kind} style={{ color: meta.text }}>
-                        {meta.label}
-                        {last ? '中' : '/'}
-                      </span>
-                    )
-                  })}
-                </span>
-              ) : (
-                <span className="text-[11px] text-muted-foreground">
+                {/* 状态占位行：保持卡片高度稳定（彩色状态文本由外层覆盖呈现，不吃灰化滤镜） */}
+                <span className="text-[11px] font-medium leading-4 text-transparent select-none">
                   {p.alive ? '存活' : '出局'}
                 </span>
-              )}
-            </div>
-
-            {/* 出局原因：右侧灰底白字竖向滚动条 */}
-            {!p.alive ? (
-              // 灰色条右缘圆角 = 卡片圆角(8px) - 边框(1px)，完美贴合卡片的两个右侧圆角
-              <div className="relative w-7 shrink-0 overflow-hidden rounded-r-[7px] bg-stone-500/80">
-                <div className="seat-marquee absolute inset-x-0 top-0 flex flex-col items-center">
-                  {[0, 1].map((k) => (
-                    <span
-                      key={k}
-                      className="py-2 text-[10px] font-medium tracking-wider text-white [writing-mode:vertical-rl]"
-                    >
-                      {`${p.deathInfo ?? '死亡'} · ${p.deathInfo ?? '死亡'}`}
-                    </span>
-                  ))}
-                </div>
               </div>
-            ) : null}
-          </button>
+
+              {/* 出局原因：右侧灰底白字竖向滚动条 */}
+              {!p.alive ? (
+                // 灰色条右缘圆角 = 卡片圆角(8px) - 边框(1px)，完美贴合卡片的两个右侧圆角
+                <div className="relative w-7 shrink-0 overflow-hidden rounded-r-[7px] bg-stone-500/80">
+                  <div className="seat-marquee absolute inset-x-0 top-0 flex flex-col items-center">
+                    {[0, 1].map((k) => (
+                      <span
+                        key={k}
+                        className="py-2 text-[10px] font-medium tracking-wider text-white [writing-mode:vertical-rl]"
+                      >
+                        {`${p.deathInfo ?? '死亡'} · ${p.deathInfo ?? '死亡'}`}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+            </button>
+
+            {/* 状态文本覆盖层（外层、不吃灰化）：无状态时显示灰字 存活/出局 */}
+            {states.length > 0 ? (
+              <span className="pointer-events-none absolute inset-x-1 bottom-2 rounded bg-background/85 text-center text-[11px] font-medium leading-4">
+                {states.map((s, i) => {
+                  const meta = STATE_META[s.kind]
+                  const last = i === states.length - 1
+                  return (
+                    <span key={s.kind} style={{ color: meta.text }}>
+                      {meta.label}
+                      {last ? '中' : '/'}
+                    </span>
+                  )
+                })}
+              </span>
+            ) : (
+              <span className="pointer-events-none absolute inset-x-1 bottom-2 text-center text-[11px] leading-4 text-muted-foreground">
+                {p.alive ? '存活' : '出局'}
+              </span>
+            )}
+          </div>
         )
       })}
     </div>

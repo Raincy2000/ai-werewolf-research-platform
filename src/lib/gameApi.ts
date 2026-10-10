@@ -377,6 +377,9 @@ export interface GameApi {
   controlGame(gameId: string, action: 'start' | 'pause' | 'terminate' | 'stopPostGame'): Promise<{ ok: boolean }>
   /** 已结束对局补开赛后讨论（game.startPostGame）；started=false 时 reason 给出原因（幂等） */
   startPostGame(gameId: string): Promise<{ started: boolean; reason?: string }>
+  /** 开始心理检查（game.startPsyCheck）：分出胜负即可；可续跑（已完成座位不重跑）；
+   *  分析师配置由前端携带（缺省后端回落对局座位配置） */
+  startPsyCheck(gameId: string, analystAi?: AnalystAiConfig | null): Promise<{ started: boolean; reason?: string }>
   /** 导出完整研究数据（game.export） */
   exportGame(gameId: string): Promise<GameExportData>
   /** 经验指南总览（game.guide）：共通内容 + 各版型特定内容；GuideInfo.version=0 表示该 scope 暂无 */
@@ -509,6 +512,7 @@ export function useGameApi(): GameApi {
         ),
       controlGame: (gameId, action) => client.game.control.mutate({ gameId, action }),
       startPostGame: (gameId) => client.game.startPostGame.mutate({ gameId }),
+      startPsyCheck: (gameId, analystAi) => client.game.startPsyCheck.mutate({ gameId, analystAi }),
       exportGame: async (gameId) => {
         const data = await client.game.export.query({ gameId })
         return { snapshot: data.snapshot, events: data.events as GameEvent[] }

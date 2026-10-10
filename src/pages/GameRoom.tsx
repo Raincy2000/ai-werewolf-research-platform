@@ -431,7 +431,7 @@ export default function GameRoom() {
   // 未登录守卫：轮询接口要求登录，UNAUTHORIZED 时停轮询并展示登录提示（而非无限「正在连接」）
   const [unauthorized, setUnauthorized] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
-  const [busy, setBusy] = useState<'control' | 'export' | 'postgame' | null>(null)
+  const [busy, setBusy] = useState<'control' | 'export' | 'postgame' | 'psyCheck' | null>(null)
   const [selectedSeat, setSelectedSeat] = useState<number | null>(null)
   // 分析报告：任务状态 / 当前阶段 / 报告全文 / 查看弹窗 / 手动触发中的提示
   const [jobStatus, setJobStatus] = useState<AnalysisJobStatus>('idle')
@@ -440,8 +440,12 @@ export default function GameRoom() {
   const [reportOpen, setReportOpen] = useState(false)
   const [analysisMsg, setAnalysisMsg] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
-  // 人格研究库：心理检查报告（终局由心理检查师自动生成；打开弹窗时刷新）
+  // 人格研究库：心理检查报告（手动开启：分出胜负后顶栏「开始心理检查」启动；打开弹窗时刷新）
   const [personaReports, setPersonaReports] = useState<PersonaReport[] | null>(null)
+  // 心理检查进度（poll 透出）：逐座位 pending/running/done——驱动按钮文案与座位紫圈
+  const [psyCheckSeats, setPsyCheckSeats] = useState<
+    { seat: number; status: 'pending' | 'running' | 'done' }[] | null
+  >(null)
   const [personaReportOpen, setPersonaReportOpen] = useState(false)
   // 对局回放控制器（历史对局事件流按真实节奏重现）——
   // 注意：所有 replay 相关 hook 必须在下方条件早退（unauthorized/notFound/!snapshot）之前，
@@ -587,6 +591,8 @@ export default function GameRoom() {
       // 补开赛后讨论资格（已结束+分胜负+无赛后内容）：后端透出即显示「开启赛后讨论」按钮
       if (result.postGameEligible) setPostGameEligible(true)
       if (result.study) setStudy(result.study)
+      // 心理检查进度（有人格座位且分出胜负的对局透出）：逐座位 pending/running/done
+      if (result.psyCheck) setPsyCheckSeats(result.psyCheck.seats)
       // 胜率推测：仅本局开启时后端返回该字段——收到即视为开启（面板据此显示）
       if (result.winRate) {
         setHasWinRate(true)
@@ -1026,8 +1032,15 @@ export default function GameRoom() {
       </Button>
     )
 
-  // 心理检查按钮（本局有人格座位即显示；报告由心理检查师在终局异步生成，打开时拉取/刷新）
+  // 心理检查按钮（手动开启环节）：
+  // - 对局开始前/进行中不出现；分出胜负（含赛后讨论进行中/待开始）后出现「开始心理检查」
+  // - 点击启动（可续跑：已完成的座位不重跑）；启动后/已有报告时变「心理检查状况」（同面板查看）
   const hasPersonaSeats = (snapshot?.players ?? []).some((p) => p.personaName)
+  const psySeats = psyCheckSeats ?? []
+  const psyAnyRunning = psySeats.some((s) => s.status === 'running')
+  const psyAllDone = psySeats.length > 0 && psySeats.every((s) => s.status === 'done')
+  // 已开始过（在跑或已有产出）→ 状况查看态；未开始 → 开始态
+  const psyStarted = psyAnyRunning || psySeats.some((s) => s.status === 'done')
   const openPersonaReports = async () => {
     if (!gameId) return
     setPersonaReportOpen(true)
@@ -1037,10 +1050,45 @@ export default function GameRoom() {
       setPersonaReports([])
     }
   }
-  const personaButton = !hasPersonaSeats ? null : (
+  const handleStartPsyCheck = async () => {
+    if (!gameId || busy) return
+    setBusy('psyCheck')
+    setActionError(null)
+    try {
+      // 分析师配置由前端同步设置携带；缺省时后端回落对局座位配置（与分析报告同款兜底）
+      const cfg = resolveAnalystAiConfig()
+      const r = await api.startPsyCheck(gameId, cfg ?? undefined)
+      if (!r.started) setActionError(r.reason ?? '无法开始心理检查')
+      else if (snapshot) {
+        // 乐观更新：todo 座位立刻亮慕斯粉圈（等下一次 poll 由服务端状态接管）
+        setPsyCheckSeats(
+          psySeats.map((s) => (s.status === 'done' ? s : { ...s, status: 'running' as const })),
+        )
+      }
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '开始心理检查失败，请重试')
+    } finally {
+      setBusy(null)
+    }
+  }
+  const personaButton = !hasPersonaSeats || !resultShown ? null : psyStarted || psyAllDone ? (
     <Button size="sm" variant="outline" onClick={() => void openPersonaReports()}>
-      <Brain className="h-4 w-4 text-purple-500" aria-hidden />
-      心理检查
+      <Brain className="h-4 w-4 text-[#e0568a]" aria-hidden />
+      心理检查状况{psyAnyRunning ? `（检查中 ${psySeats.filter((s) => s.status === 'running').length}）` : ''}
+    </Button>
+  ) : (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={() => void handleStartPsyCheck()}
+      disabled={busy !== null}
+    >
+      {busy === 'psyCheck' ? (
+        <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+      ) : (
+        <Brain className="h-4 w-4 text-[#e0568a]" aria-hidden />
+      )}
+      开始心理检查
     </Button>
   )
 
@@ -1320,6 +1368,10 @@ export default function GameRoom() {
                   pendingActs={replay.active ? [] : [
                     ...snapshot.pendingActs,
                     ...(snapshot.studyingSeats ?? []).map((seat) => ({ seat, kind: 'study' })),
+                    // 心理检查中（慕斯粉状态环，与顶栏按钮 Brain 图标同色）：poll 透出的在飞座位
+                    ...psySeats
+                      .filter((s) => s.status === 'running')
+                      .map((s) => ({ seat: s.seat, kind: 'psyCheck' })),
                   ]}
                   selectedSeat={selectedSeat}
                   onSelect={handleSelectSeat}
@@ -1582,7 +1634,7 @@ export default function GameRoom() {
           <DialogContent className="max-h-[88dvh] overflow-y-auto sm:max-w-[min(1200px,94dvw)]">
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
-                <Brain className="h-5 w-5 text-purple-500" aria-hidden />
+                <Brain className="h-5 w-5 text-[#e0568a]" aria-hidden />
                 心理检查报告
               </DialogTitle>
               <DialogDescription>
@@ -1596,8 +1648,8 @@ export default function GameRoom() {
               </p>
             ) : personaReports.length === 0 ? (
               <p className="py-8 text-center text-sm text-muted-foreground">
-                心理检查报告尚未生成。终局后由心理检查师自动产出（需配置分析师
-                AI）；生成后事件流会有「心理检查报告已生成」提示，届时重新打开本窗即可。
+                心理检查报告尚未生成。点击顶部「开始心理检查」按钮启动（中断后可重新点击续跑，
+                已完成的座位不会重复检查）；生成后事件流会有「心理检查报告已生成」提示。
               </p>
             ) : (
               <Tabs defaultValue={String(personaReports[0]!.seat)}>

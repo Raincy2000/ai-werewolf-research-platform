@@ -59,6 +59,8 @@ vi.mock("../queries/games", () => ({
     [...h.events]
       .filter((e) => e.gameId === gameId && e.type === "phase")
       .sort((a, b) => (b.seq as number) - (a.seq as number))[0] ?? null,
+  hasPostGameEvents: async (gameId: string) =>
+    h.events.some((e) => e.gameId === gameId && (e.phase as string).startsWith("postgame")),
 }));
 
 vi.mock("../queries/decisions", () => ({
@@ -606,6 +608,49 @@ describe("白日交刀宣布胜利审核", () => {
     expect(h.events.some((e) => e.gameId === gameId && e.title === "宣布胜利未通过审核")).toBe(false);
     await stopGame(gameId);
   }, 120_000);
+
+  it("审核驳回根治回归：引擎快照落定胜者 + auditSettle 重放一致 + 补开赛后照常跑完", async () => {
+    // 事故（对局 20261009001）：审核驳回走服务层旁路——引擎不知情，快照 winner 永为 null
+    //（横幅「对局已手动终止」），赛后讨论/心理检查/分析报告全部不触发，决策日志形态错误
+    const { gameService } = await import("./service");
+    h.winRateVary = false;
+    h.winRateText = '{"good":62,"reasons":["神民占优"]}';
+    h.playerHook = declareScript;
+    const { gameId } = await createAuditedGame({
+      boardId: "standard12",
+      seats: makeSeats(12),
+      options: AUDIT_OPTS,
+      winRateEnabled: true,
+    });
+    await gameService.control(gameId, "start");
+    await waitFor(() => registry.get(gameId)?.status === "finished", "审核终局", 90_000);
+
+    // ① 直播引擎快照落定胜者（此前为 null → 前端横幅「对局已手动终止」）
+    expect(registry.get(gameId)!.engine.getSnapshot().winner).toBe("good");
+    // ② 决策日志含 auditSettle 条目（重放原料；此前记的是 batch 待决配单条 skip）
+    expect(
+      h.decisions.filter((d) => d.gameId === gameId).map((d) => d.kind),
+    ).toContain("auditSettle");
+
+    // ③ 重放重建一致性：清内存补开赛后讨论（强制 postGameDiscuss 重放，覆盖 settleExternal
+    // 重放分支与赛后协程续接）——赛前一页【赛后讨论】事件出现且对局正常收敛终局
+    registry.delete(gameId);
+    const r = await gameService.startPostGame(gameId);
+    expect(r.started).toBe(true);
+    await waitFor(
+      () =>
+        h.events.some(
+          (e) => e.gameId === gameId && typeof e.phase === "string" && e.phase.startsWith("postgame"),
+        ),
+      "赛后讨论开始生成",
+      60_000,
+    );
+    await waitFor(() => registry.get(gameId)?.status === "finished", "赛后跑完收敛", 90_000);
+    // 重建后快照 winner 仍为 good（经 auditSettle 精确重放）
+    expect(registry.get(gameId)!.engine.getSnapshot().winner).toBe("good");
+    await stopGame(gameId);
+  }, 150_000);
+
 });
 
 describe("胜率缘由去重", () => {
@@ -633,4 +678,87 @@ describe("胜率缘由去重", () => {
     expect(winratesOf(gameId).length).toBe(1);
     await stopGame(gameId);
   }, 60_000);
+});
+
+describe("白日交刀审核：即时性铁律（auditDeclareVictory 直测）", () => {
+  // 用户裁定：拍刀时刻的局面必须即时重评，不得把滞后记录安在当前局面（否则误判）
+  // 锚点单调守门要求事件游标前进：给每个用例的对局铺一条 seq=100 的事件
+  const seedEvent = (gid: string) => {
+    h.events.push({
+      gameId: gid, seq: 100, day: 4, phase: "day.skill", type: "action",
+      actor: 2, title: "技能权衡", content: "2号权衡", thought: null, meta: null,
+    });
+  };
+  const fakeRt = () => ({
+    userId: "u1",
+    boardId: "standard12",
+    options: {
+      stepDelayMs: 0,
+      phaseBreakMs: 0,
+      sheriffEnabled: true,
+      allowSelfDestruct: true,
+      speechRoundsLimit: 2,
+    },
+    seatAIs: [
+      { seat: 1, provider: "kimi" as const, baseUrl: "http://test.local/v1", model: "m", apiKey: "k" },
+    ],
+    analystAi: null,
+    winRateEnabled: true,
+    winRateLastStoredSeq: 0,
+    winRateDirty: false,
+    engine: {
+      getSnapshot: () => ({
+        day: 4,
+        phase: "day.skill",
+        phaseLabel: "第4天 · 技能权衡",
+        winner: null,
+        finished: false,
+        pendingSeat: null,
+        pendingKind: null,
+        players: [],
+      }),
+    },
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  }) as any;
+
+  it("滞后记录狼优 100% + 即时重评 62% → 驳回（不沿用滞后记录）", async () => {
+    const { auditDeclareVictory } = await import("./service");
+    h.winRateVary = false;
+    h.winRateText = '{"good":62,"reasons":["神民已翻盘"]}'; // 即时重评的读数
+    seedEvent("g-audit");
+    h.winrates.push({
+      id: 1, gameId: "g-audit", day: 3, phase: "day.vote",
+      goodPct: 0, wolfPct: 100, reasons: ["旧读数"], triggerLabel: "滞后记录", createdAt: new Date(),
+    });
+    expect(await auditDeclareVictory("g-audit", fakeRt())).toBe("reject");
+    // 即时评估的新读数落库（替代滞后读数）
+    const last = h.winrates.filter((r) => r.gameId === "g-audit").at(-1)!;
+    expect(last.goodPct).toBe(62);
+  });
+
+  it("滞后记录仅 38% 狼优 + 即时重评 100% → 放行（不被早期偏低记录拖累）", async () => {
+    const { auditDeclareVictory } = await import("./service");
+    h.winRateVary = false;
+    h.winRateText = '{"good":0,"reasons":["狼队已必胜"]}';
+    seedEvent("g-audit2");
+    h.winrates.push({
+      id: 1, gameId: "g-audit2", day: 3, phase: "day.vote",
+      goodPct: 62, wolfPct: 38, reasons: ["旧读数"], triggerLabel: "滞后记录", createdAt: new Date(),
+    });
+    expect(await auditDeclareVictory("g-audit2", fakeRt())).toBe("pass");
+  });
+
+  it("即时评估不可用（解析失败）→ 回落最近记录兜底；无任何记录 → 审核不可用放行", async () => {
+    const { auditDeclareVictory } = await import("./service");
+    h.winRateVary = false;
+    h.winRateText = "这不是 JSON"; // 解析失败 → 即时评估 skip
+    seedEvent("g-audit3");
+    seedEvent("g-none");
+    h.winrates.push({
+      id: 1, gameId: "g-audit3", day: 3, phase: "day.vote",
+      goodPct: 0, wolfPct: 100, reasons: [], triggerLabel: null, createdAt: new Date(),
+    });
+    expect(await auditDeclareVictory("g-audit3", fakeRt())).toBe("pass"); // 兜底读旧记录 100% → 放行
+    expect(await auditDeclareVictory("g-none", fakeRt())).toBe("pass"); // 无记录：审核不可用放行
+  });
 });

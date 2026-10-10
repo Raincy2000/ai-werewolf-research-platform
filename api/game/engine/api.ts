@@ -121,6 +121,14 @@ export interface DecisionInput {
   duel?: number | null;     // 骑士决斗目标（daySpeech/daySkill 时可用）
   witchSave?: boolean;      // 女巫是否用解药（witchAction 时可用）
   batchInputs?: DecisionInput[]; // 与 PendingDecision.batch 一一对应的各玩家决策
+  /** 外部结算标记（服务层房规裁决：如白日交刀宣布胜利审核驳回→神民胜）——
+   *  不喂给引擎 decide()，而是经 engine.settleExternal() 落定；决策日志据此可确定性重放 */
+  auditSettle?: "wolf" | "good";
+  /** 外部结算的缘由注记（写入结果事件，如「（白日交刀宣布胜利未通过审核）」）；重放原样重现 */
+  auditNote?: string;
+  /** 外部结算的公开广播行（写入玩家可见的公开记录——赛后复盘的认知依据；
+   *  如「【审核】2号代表狼队宣布提前胜利——胜率审核未达 100%，宣布无效！」） */
+  auditPub?: string;
 }
 
 // ---------- 引擎实例 ----------
@@ -151,6 +159,12 @@ export interface Engine {
   advance(): { events: EngineEvent[]; pending: PendingDecision | null };
   // 应用 AI 决策（随后再调 advance 继续）
   decide(input: DecisionInput): EngineEvent[];
+  // 外部结算（引擎外房规裁决落定终局）：封存主流程协程与在飞待决，落定胜者并产出
+  // 与 endGame 同格式的结果事件；postGameDiscuss 开启时 finished 暂缓到赛后协程跑完
+  //（advance 驱动切换见上），与自然终局的「endGame → postGamePhase → finished」同语义。
+  // pubLine：裁决的公开广播行（写入玩家可见的公开记录）——玩家必须知道胜负的真实缘由，
+  // 否则赛后讨论对戏剧性逆转毫不知情（对局 20261009001 实锤：全员对拍刀驳回零提及）。
+  settleExternal(winner: "wolf" | "good", note?: string, pubLine?: string): EngineEvent[];
   isFinished(): boolean;
 }
 

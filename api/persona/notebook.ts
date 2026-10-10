@@ -113,11 +113,13 @@ export function buildWritebackPrompt(opts: {
     JSON.stringify(card.params.bigFive),
     "",
     "【输出契约】严格输出 JSON：",
-    `{"memories":[{"type":"trauma|relationship|general","content":"第一人称记忆（具体到人与事，≤120字）","emotionalWeight":0,"reinforceMemoryId":null}],"relationships":[{"targetName":"对方人格名或「N号玩家」","relation":"关系标签","affinityDelta":0,"trustDelta":0,"note":"关键事件一句"}],"drift":[{"path":"参数路径","delta":0,"reason":"漂移事由"}]}`,
+    `{"memories":[{"type":"trauma|relationship|general","content":"第一人称记忆（具体到人与事，≤120字）","emotionalWeight":0,"reinforceMemoryId":null}],"relationships":[{"targetName":"关系锚点（见规则3）","relation":"关系标签","affinityDelta":0,"trustDelta":0,"note":"关键事件一句"}],"drift":[{"path":"参数路径","delta":0,"reason":"漂移事由"}]}`,
     "规则：",
     "1. memories ≤4 条：只写真正塑造 TA 的事件（被背叛/被信任/濒死/翻盘/手刃……），type=trauma 留给真正的创伤；",
     "2. reinforceMemoryId：本条记忆与某条已有记忆同源（同一人物/同一主题）时填其 id——旧记忆会被强化而非重复；",
-    "3. relationships ≤4 条：只写本局与 TA 产生真实交互的对象；affinity/trust 用增量（如被票出局 trustDelta=-30）；",
+    "3. relationships ≤4 条：只写本局与 TA 产生真实交互的对象；affinity/trust 用增量（如被票出局 trustDelta=-30）。targetName 是关系的永久锚点，双轨制：",
+    "   - 对象是人格玩家（【本局其他人格】之一）：targetName 必须精确等于 TA 的人格名（如「五条悟」）——人格跨对局存续，锚定点是人格本身，禁止带座位号（每局座位绑定会变）；",
+    `   - 对象是无人格玩家：targetName 用「对局标题号·N号玩家」格式（本局如「${gameTitleNo}·10号玩家」）——无人格玩家每局都是不同的人，必须带对局编号才能区分；`,
     "4. drift ≤3 条：只有经历真正撼动人格时才漂移（如反复被背叛 → attachment.anxiety +8）；单参数幅度 ±12 内；",
     "5. 没有可写的内容就返回空数组——平庸的对局不产生记忆。",
     `6. 引用对局时一律使用标题号（本局为「${gameTitleNo}」，其他对局的标题号可从已有记忆中延续）——这是你与他人讨论对局的统一编号。`,
@@ -193,6 +195,36 @@ export function parseWriteback(text: string): {
   return { memories, relationships, drift };
 }
 
+/** 关系锚点归一化（双轨制的纯函数实现，供单测锚定）：
+ * - 人格玩家对象：锚点=人格名本身（座位号每局会变，绝不带）；
+ * - 无人格玩家对象：锚点=「对局标题号·N号玩家」（每局同代号是不同的人，必须带对局编号区分）。
+ * 模型不严格按格式写也能正确入库：先剥「」包裹与误贴的「标题号·」前缀再比对。 */
+export function normalizeRelationAnchor(
+  rawTargetName: string,
+  otherPersonas: { name: string; personaId: number }[],
+  gameTitleNo: string,
+): { targetName: string; targetPersonaId: number | null } {
+  // 已带「标题号·」前缀的锚点：内层是人格名则归一为人格锚点；否则原样保留历史对局锚点
+  // （绝不把历史对局的代号重贴到本局标题号——那会把别人对局里的人记错账）
+  const prefixed = rawTargetName.match(/^[「『"]?([0-9]{8,})·(.+?)[」』"]?$/);
+  if (prefixed) {
+    const inner = prefixed[2]!.trim();
+    const matched = otherPersonas.find((p) => p.name === inner);
+    if (matched) return { targetName: matched.name, targetPersonaId: matched.personaId };
+    return { targetName: `${prefixed[1]}·${inner}`, targetPersonaId: null };
+  }
+  const bare = rawTargetName.replace(/^[「『"]+|[」』"]+$/g, "").trim();
+  const matched = otherPersonas.find((p) => p.name === bare);
+  if (matched) return { targetName: matched.name, targetPersonaId: matched.personaId };
+  // 模型写成「3号玩家（五条悟）」这类代号+人格名混合形态：恰好提到一个人格名即归一到人格锚点
+  const contained = otherPersonas.filter((p) => bare.includes(p.name));
+  if (contained.length === 1) {
+    return { targetName: contained[0]!.name, targetPersonaId: contained[0]!.personaId };
+  }
+  if (/^\d+号玩家$/.test(bare)) return { targetName: `${gameTitleNo}·${bare}`, targetPersonaId: null };
+  return { targetName: bare, targetPersonaId: null };
+}
+
 /**
  * 执行记事簿回写：蒸馏 → 入库 → 强化/衰减 → 关系传递 → 漂移。
  * AI 失败/输出非法返回 null（调用方记事件，绝不影响对局收敛）。
@@ -256,11 +288,16 @@ export async function runNotebookWriteback(opts: {
   // 4. 关系传递（targetName 能匹配本局人格时建立卡间链接）
   let relTouched = 0;
   for (const r of parsed.relationships) {
-    const matched = otherPersonas.find((p) => p.name === r.targetName);
+    // 锚点归一化（双轨制代码兜底，模型不严格按格式写也能正确入库）
+    const { targetName, targetPersonaId } = normalizeRelationAnchor(
+      r.targetName,
+      otherPersonas,
+      opts.gameTitleNo,
+    );
     await upsertPersonaRelationship({
       personaId: card.id,
-      targetPersonaId: matched?.personaId ?? null,
-      targetName: r.targetName,
+      targetPersonaId,
+      targetName,
       relation: r.relation,
       affinityDelta: r.affinityDelta,
       trustDelta: r.trustDelta,

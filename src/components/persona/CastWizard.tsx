@@ -35,6 +35,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { CastStageBar } from './CastStageBar'
 
 // ---------------------------------------------------------------------------
 // 铸魂师双 AI 配置（localStorage 持久化）
@@ -451,7 +452,7 @@ export function CastWizard({
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o) reset(); onOpenChange(o) }}>
-      <DialogContent className="max-h-[90dvh] max-w-3xl overflow-y-auto">
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-[min(1100px,94dvw)]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Sparkles className="h-5 w-5" aria-hidden />
@@ -639,14 +640,22 @@ export function CastWizard({
           </div>
         ) : null}
 
-        {/* 第三步：铸造中（真实进度：阶段 label + 细节行；未回传时轮播兜底） */}
+        {/* 第三步：铸造中（三节点进度条实时跟随后端阶段；未回传时轮播兜底） */}
         {step === 'casting' ? (
-          <div className="flex flex-col items-center gap-4 py-12">
-            <Loader2 className="h-9 w-9 animate-spin text-god" aria-hidden />
-            <p className="text-base text-foreground">{progress?.label ?? CAST_STAGES[castStage]}</p>
-            {progress?.detail ? (
-              <p className="max-w-lg text-center text-[13px] leading-6 text-god">{progress.detail}</p>
-            ) : null}
+          <div className="flex flex-col items-center gap-6 py-10">
+            <CastStageBar
+              label={progress?.label}
+              fallbackStage={[1, 2, 2, 3][castStage] ?? 1}
+            />
+            <div className="flex flex-col items-center gap-2">
+              <p className="flex items-center gap-2 text-base text-foreground">
+                <Loader2 className="h-4 w-4 animate-spin text-god" aria-hidden />
+                {progress?.label ?? CAST_STAGES[castStage]}
+              </p>
+              {progress?.detail ? (
+                <p className="max-w-lg text-center text-[13px] leading-6 text-god">{progress.detail}</p>
+              ) : null}
+            </div>
             <p className="text-[13px] leading-6 text-muted-foreground">
               三位 AI 接力铸造不设时限、质量优先（流式生成，进度实时回传），请稍候，不要关闭窗口
             </p>

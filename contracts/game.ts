@@ -271,6 +271,9 @@ export interface PollResult {
   winRate?: { goodPct: number; wolfPct: number; entries: WinRateEntry[] };
   /** 补开赛后讨论资格：已结束、分了胜负、尚无赛后内容的对局为 true（前端据此显示「开启赛后讨论」按钮） */
   postGameEligible?: boolean;
+  /** 心理检查进度（有人格座位且已分出胜负的对局返回）：逐座位 pending=未检查/running=检查中/done=已生成
+   *  （心理检查为主动开启环节——按钮点击启动，中断后可续跑：已完成座位不重跑） */
+  psyCheck?: { seats: { seat: number; status: "pending" | "running" | "done" }[] } | null;
   /** 赛前学习进度（仅本局开启图书馆时返回）：done 完成数 / total 总数 / studying 学习中 / inFlight 正在学习的座位 */
   study?: { done: number; total: number; studying: boolean; inFlight?: number[] };
 }

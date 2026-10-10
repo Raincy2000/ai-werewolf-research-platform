@@ -30,6 +30,55 @@ const NEED_TARGET_KINDS: ReadonlySet<DecisionKind> = new Set([
   "whiteWolfTake",
 ]);
 
+// ---------- 发言长度保护 ----------
+// 历史事故（对局 20261009001 实锤）：硬 slice(0,300) 把人格玩家长发言从句子中间砍断——
+// 17 条人格发言 7 条恰好 300 字、结尾全部无标点（「说不完话」观感）。
+// 现策略：发言正文额度 800（人格契约告知 600 字内，留足余量），括号动作/神态描写
+// 不计入字数（机制上告知玩家：动作词不占发言额度，正文逻辑可以完整写尽）；
+// 整体硬上限 1400 防滥用；超限时在句末标点处收口，宁可少半句也不吐半句。
+const SPEECH_MAX = 800;
+const SPEECH_HARD_MAX = 1_400;
+/** 括号段（（动作）/(action)）不计入发言字数 */
+function spokenLength(s: string): number {
+  return s.replace(/（[^）]*）|\([^)]*\)/g, "").length;
+}
+export function truncateSpeech(text: string, max: number = SPEECH_MAX): string {
+  const t = text.trim();
+  if (spokenLength(t) <= max && t.length <= SPEECH_HARD_MAX) return t;
+  // 找「正文字数达到 max」的字符位置（括号段跳过不计数）
+  let pos = t.length;
+  let count = 0;
+  let inParen = false;
+  let parenOpen = "";
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i]!;
+    if (!inParen && (ch === "（" || ch === "(")) {
+      inParen = true;
+      parenOpen = ch;
+      continue;
+    }
+    if (inParen && ((parenOpen === "（" && ch === "）") || (parenOpen === "(" && ch === ")"))) {
+      inParen = false;
+      continue;
+    }
+    if (!inParen) {
+      count++;
+      if (count > max) {
+        pos = i;
+        break;
+      }
+    }
+  }
+  pos = Math.min(pos, SPEECH_HARD_MAX);
+  if (pos >= t.length) return t;
+  const cut = t.slice(0, pos);
+  // 在最后一个句末标点处收口（句号/问号/叹号/省略号/右引号/右括号）；
+  // 收口点太靠前（不足额度一半，说明前段几乎没有完整句子）则退回硬切
+  const m = cut.match(/[\s\S]*[。！？!?…」”’”）)]/);
+  if (m && m[0].length >= pos * 0.5) return m[0];
+  return cut;
+}
+
 function asTrimmedString(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
 }
@@ -162,7 +211,7 @@ function salvageFields(text: string): DecisionInput | null {
   const speech = grab("speech").trim();
   if (!thought && !speech) return null;
   const decision: DecisionInput = { thought: (thought || speech).slice(0, 600) };
-  if (speech) decision.speech = speech.slice(0, 300);
+  if (speech) decision.speech = truncateSpeech(speech);
   return decision;
 }
 
@@ -229,7 +278,7 @@ export function parseDecision(rawText: string, pending: PendingDecision): Decisi
   }
 
   const decision: DecisionInput = { thought: thought.slice(0, 600) };
-  if (speech) decision.speech = speech.slice(0, 300);
+  if (speech) decision.speech = truncateSpeech(speech);
   if (targets.length > 0) decision.targets = targets;
   if (skip) decision.skip = true;
   if (o.selfDestruct === true) decision.selfDestruct = true;

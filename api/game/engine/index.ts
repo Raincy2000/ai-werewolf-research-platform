@@ -144,6 +144,10 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
   let eventPhase = "game.init";
   let winner: "wolf" | "good" | null = null;
   let finished = false;
+  // 外部结算（服务层房规裁决，如白日交刀宣布胜利审核驳回）：主流程协程封存后，
+  // 赛后讨论由独立协程驱动（postGamePhase 只依赖 players/winner 等模块状态，不依赖主流程断点）
+  let mainAbandoned = false;
+  let postgameGen: Flow | null = null;
 
   const players: PlayerState[] = seatRoles.map((role, i) => ({
     seat: i + 1,
@@ -2223,7 +2227,18 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     advance() {
       if (finished) return { events: drain(), pending: null };
       if (awaiting) return { events: [], pending: buildPendingAny(awaiting) };
-      const r = gen.next();
+      // 外部结算后的驱动切换：主流程已封存，开启赛后讨论则新建赛后协程驱动尾声环节
+      //（与自然终局 mainFlow 内 yield* postGamePhase() 完全同权——同一套聊天室机制与待决形态）
+      let driver = postgameGen ?? gen;
+      if (mainAbandoned && !postgameGen) {
+        if (!options.postGameDiscuss) {
+          finished = true;
+          return { events: drain(), pending: null };
+        }
+        postgameGen = postGamePhase();
+        driver = postgameGen;
+      }
+      const r = driver.next();
       if (r.done) {
         finished = true;
         return { events: drain(), pending: null };
@@ -2232,9 +2247,31 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       return { events: drain(), pending: buildPendingAny(awaiting) };
     },
 
+    // 外部结算（引擎外房规裁决落定终局）：封存主流程协程与在飞待决，落定胜者并产出
+    // 与 endGame 同格式的结果事件；postGameDiscuss 开启时 finished 暂缓到赛后协程跑完
+    //（advance 驱动切换见上），与自然终局的「endGame → postGamePhase → finished」同语义。
+    settleExternal(w: "wolf" | "good", note?: string, pubLine?: string): EngineEvent[] {
+      winner = w;
+      awaiting = null; // 在飞待决封存（主流程协程不再恢复）
+      mainAbandoned = true;
+      setPhase("game.over", "游戏结束");
+      const table = players
+        .map((p) => `${p.seat}号【${roleName(p.role)}】${p.alive ? "存活" : "出局"}`)
+        .join("，");
+      // 裁决缘由先入公开记录（玩家可见——赛后复盘的认知依据），再出胜负公告
+      if (pubLine) pub(pubLine);
+      else if (note) pub(`【终局裁决】${note}`);
+      emit("result", null, "游戏结果", `${w === "wolf" ? "狼人" : "好人"}阵营胜利！${note ?? ""}${table}`);
+      pub(`【游戏结束】${w === "wolf" ? "狼人" : "好人"}阵营胜利。`);
+      if (!options.postGameDiscuss) finished = true;
+      return drain();
+    },
+
     decide(input: DecisionInput) {
       if (!awaiting) throw new Error("当前没有待决的决策");
       const req = awaiting;
+      // 活跃协程路由：外部结算后主流程封存，赛后讨论决策喂给赛后协程
+      const driver = postgameGen ?? gen;
       if (isBatchReq(req)) {
         // 批量待决：逐个子请求校验对应子决策（非法即抛错，状态不变，可重试）
         const inputs = input.batchInputs ?? [];
@@ -2247,7 +2284,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
           sp.bloodMoonNotice = false;
         }
         awaiting = null; // 校验通过后才清除待决（校验失败保留可重试）
-        const r = gen.next(inputs);
+        const r = driver.next(inputs);
         if (r.done) {
           finished = true;
         } else {
@@ -2260,7 +2297,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       const p = at(req.seat);
       p.fearedNotice = false;
       p.bloodMoonNotice = false;
-      const r = gen.next(input);
+      const r = driver.next(input);
       if (r.done) {
         finished = true;
       } else {

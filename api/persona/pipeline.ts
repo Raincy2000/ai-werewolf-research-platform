@@ -323,7 +323,7 @@ export function mirrorFallbackReport(card: PersonaCard, pending: PendingDecision
 // 涌现层：在状态报告约束下生长台词与决策
 // ============================================================
 
-const PERSONA_OUTPUT_CONTRACT = `{"speech":"公开发言（发言类必填，300字内；可用（括号）夹带动作/神态/语气描写——其他玩家也看得到；非发言类留空串）","thought":"涌现输出：你此刻最真实的反应（200字内，禁止任何心理学术语，像活人内心独白）","bodyTrace":"身体痕迹：此刻的副语言（姿态/表情/声音变化，一句）","analysisGt":"这一步的博弈论解释（一句，≤80字）","analysisPsy":"这一步的人格动力学解释（一句，≤80字，这里允许术语）","targets":[座位号],"skip":false,"selfDestruct":false,"duel":null,"witchSave":false}`;
+const PERSONA_OUTPUT_CONTRACT = `{"speech":"公开发言（发言类必填：正文600字内，（括号）夹带的动作/神态/语气描写不计入字数——动作尽管写，正文逻辑要完整说完；非发言类留空串）","thought":"涌现输出：你此刻最真实的反应（200字内，禁止任何心理学术语，像活人内心独白）","bodyTrace":"身体痕迹：此刻的副语言（姿态/表情/声音变化，一句）","analysisGt":"这一步的博弈论解释（一句，≤80字）","analysisPsy":"这一步的人格动力学解释（一句，≤80字，这里允许术语）","targets":[座位号],"skip":false,"selfDestruct":false,"duel":null,"witchSave":false}`;
 
 function personaSystemBlock(card: PersonaCard): string {
   const pr = card.profile;

@@ -70,7 +70,7 @@ import { SPEECH_REQUIRED_KINDS } from "./engine/api";
 import { callAi } from "./ai/providers";
 import { defaultCallTimeoutMs, isThinkingModel } from "./ai/modelCaps";
 import { buildPrompt, modelContextTokens } from "./ai/prompts";
-import { parseDecision } from "./ai/parse";
+import { parseDecision, parseJsonRobust } from "./ai/parse";
 import { buildPersonaCircleText, injectCircleText, type PersonaBondInfo } from "./personaVisibility";
 import type { PersonaCard, PersonaEventMeta, PersonaSeatInfo } from "../../contracts/persona";
 import {
@@ -92,6 +92,12 @@ export interface GameService {
   control(gameId: string, action: "start" | "pause" | "terminate" | "stopPostGame", userId?: string): Promise<{ ok: boolean }>;
   // 已结束对局补开赛后讨论（started=false 时 reason 给出原因；幂等）
   startPostGame(gameId: string, userId?: string): Promise<{ started: boolean; reason?: string }>;
+  // 开始心理检查（手动开启的终局收尾，分出胜负即可；可续跑：已完成座位跳过；幂等）
+  startPsyCheck(
+    gameId: string,
+    analystAi?: AnalystAiConfig | null,
+    userId?: string,
+  ): Promise<{ started: boolean; reason?: string }>;
   /** 赛前学习心得（图书馆对局）：内存实时值与落库值合并按座位返回 */
   studyNotes(gameId: string, userId?: string): Promise<{ seat: number; notes: string }[]>;
   poll(gameId: string, afterSeq: number, lastSig?: string, userId?: string, afterWinRateId?: number): Promise<PollResult>;
@@ -200,11 +206,17 @@ export interface GameRuntime {
   personaMemory?: Map<number, string>;
   // 涌现事件注解暂存（座位 → 本决策点的人格注解）：事件落盘前富化到 meta.persona 后清空
   personaEventMeta?: Map<number, PersonaEventMeta>;
-  // 终局收尾（心理检查+记忆回写）防重标记
-  personaEpilogueDone?: boolean;
   // 圈层羁绊缓存（观察者 personaId → 与在场人格的关系行）：首个人格决策点惰性加载，
   // 局内不变（关系只在终局回写时更新），避免每决策点重复查库
   personaBondRows?: Map<number, RelationshipRowLite[]>;
+  // 心理检查（手动开启环节）运行时状态：在飞座位 / 已完成座位（poll 透出进度）
+  psyCheckRunning?: Set<number>;
+  psyCheckDone?: Set<number>;
+  // ---------- 犯规裁判（分析师担任，实时审查公开发言的内容级犯规） ----------
+  // 赛后讨论与狼人频道豁免；判罚经 settleExternal 落定对立阵营获胜（与拍刀驳回同一外部结算路径）
+  foulQueue?: EngineEvent[]; // 待审公开发言事件（事件落盘即入队，逐个审查）
+  foulInFlight?: boolean;    // 审查在飞标记（只审最新，不排队积压审查调用）
+  foulSettled?: boolean;     // 本局已判罚（一局至多一次判罚结算，防止重复落定）
 }
 
 /** 圈层羁绊的关系行最简形态（查询层 RelationshipRow 的字段子集，service 内自洽） */
@@ -1025,7 +1037,21 @@ async function decideBatchWithAi(
       failReasons.set(sub.seat, (res.error ?? "AI 调用失败").slice(0, 120));
       return heuristicDecision(sub, "[AI连续无响应，系统托管]");
     }
-    return sanitizeBatchInput(sub, res.decision);
+    // 清洗落托管（「AI输出非法，系统托管」）时透出真实原因与原始输出截断——
+    // 历史缺口：sanitizeBatchInput 兜底只换标记，事件 meta 无原因、原始输出丢失，
+    // 线上排查无法复盘 AI 到底输出了什么（对局 20261009001 的 2 处托管即此类）
+    const sanitized = sanitizeBatchInput(sub, res.decision);
+    if (
+      typeof sanitized.thought === "string" &&
+      sanitized.thought.startsWith("[AI输出非法") &&
+      res.decision.thought !== sanitized.thought
+    ) {
+      failReasons.set(
+        sub.seat,
+        `AI输出非法已兜底（原始输出：${JSON.stringify(res.decision).replace(/\s+/g, " ").slice(0, 120)}）`,
+      );
+    }
+    return sanitized;
   };
   // 简易并发池：最多 AI_BATCH_CONCURRENCY 路并发
   const inputs: DecisionInput[] = new Array(subs.length);
@@ -1085,62 +1111,70 @@ async function decideBatchWithAi(
 }
 
 /** 白日交刀宣布胜利审核：取最新胜率记录判断狼人胜率是否达 100%。
- * 无记录时做一次阻塞式即时评估；仍不可得（审核不可用）则放行原规则。 */
-async function auditDeclareVictory(gameId: string, rt: GameRuntime): Promise<"pass" | "reject"> {
-  let latest = await getLatestWinRate(gameId);
-  if (!latest && rt.winRateEnabled) {
-    await runWinRateAnalysis(gameId, rt).catch(() => "skip");
-    latest = await getLatestWinRate(gameId);
+ * 即时性铁律（用户裁定）：拍刀时刻的局面必须即时重评——不沿用既有记录
+ *（记录对拍刀时刻必然滞后：上次评估可能生成于数步之前，滞后读数安在当前局面=误判）。
+ * 审核不可用（评估失败且无任何记录）时按原规则放行。 */
+/** 白日交刀宣布胜利审核：取最新胜率记录判断狼人胜率是否达 100%。
+ * 即时性铁律（用户裁定）：拍刀时刻的局面必须即时重评——不沿用既有记录
+ *（记录对拍刀时刻必然滞后：上次评估可能生成于数步之前，滞后读数安在当前局面=误判）。
+ * 审核不可用（评估失败且无任何记录）时按原规则放行。
+ * 导出供测试：即时性语义（不沿用滞后记录）的单测锚点。 */
+export async function auditDeclareVictory(gameId: string, rt: GameRuntime): Promise<"pass" | "reject"> {
+  // 第一步永远是即时评估当前局面（结果经锚点单调守门禁乱序；与上次相同则按最新读数处理）
+  const fresh = rt.winRateEnabled
+    ? await runWinRateAnalysis(gameId, rt).catch(() => "skip" as const)
+    : ("skip" as const);
+  if (fresh === "stored" || fresh === "same") {
+    // stored=新评估已落库；same=即时评估与最近记录一致（此刻该记录即当前局面的读数）
+    const latest = await getLatestWinRate(gameId);
+    if (latest) return latest.wolfPct >= 100 ? "pass" : "reject";
   }
-  if (!latest) return "pass"; // 审核不可用：按原规则放行
+  // 即时评估不可用（AI 故障/解析失败）：回落最近记录兜底；记录也没有 → 审核不可用放行
+  const latest = await getLatestWinRate(gameId);
+  if (!latest) return "pass";
   return latest.wolfPct >= 100 ? "pass" : "reject";
 }
 
-/** 宣布胜利未通过审核：宣布无效，神民阵营取胜（房规结算） */
+/** 宣布胜利未通过审核：宣布无效，神民阵营取胜（房规结算）。
+ * 经引擎外部结算落定（settleExternal）——胜者进引擎快照、结果事件与自然终局同格式、
+ * 赛后讨论/终局收尾（胜率终评/人格心理检查/分析报告）走同一 finalize 路径。
+ * 历史事故（对局 20261009001）：旁路直写 rt.status+updateGame，引擎完全不知情——
+ * 快照 winner 取引擎 → 横幅显示「对局已手动终止」；赛后讨论与心理检查永不触发；
+ * 决策日志记的是 batch 待决配单条 skip，恢复重放必分叉。 */
 function settleDeclareAuditFail(
-  gameId: string,
+  _gameId: string,
   rt: GameRuntime,
   seat: number,
 ): { events: EngineEvent[]; input: DecisionInput } {
   const snap = rt.engine.getSnapshot();
-  const events: EngineEvent[] = [
-    {
-      day: snap.day,
-      phase: snap.phase,
-      type: "system",
-      actor: null,
-      title: "宣布胜利未通过审核",
-      content: `${seat}号代表狼队宣布提前胜利——分析师审核当前狼人胜率未达 100%，宣布无效！神民阵营获胜。`,
-      thought: null,
-      meta: { auditReject: true },
+  const auditEvent: EngineEvent = {
+    day: snap.day,
+    phase: snap.phase,
+    type: "system",
+    actor: null,
+    title: "宣布胜利未通过审核",
+    content: `${seat}号代表狼队宣布提前胜利——分析师审核当前狼人胜率未达 100%，宣布无效！神民阵营获胜。`,
+    thought: null,
+    meta: { auditReject: true },
+  };
+  // 引擎外部结算：落定胜者 + 结果事件（含存活表，与自然终局同格式；缘由注记写入结果文案）；
+  // 公开广播行携带完整裁决缘由——玩家公开记录必须知道「狼队拍了刀但被驳回」，
+  // 否则赛后讨论对胜负逆转毫不知情（对局 20261009001 实锤：全员零提及）
+  const engineEvents = rt.engine.settleExternal(
+    "good",
+    "（白日交刀宣布胜利未通过审核）",
+    `【审核】${seat}号代表狼队宣布提前胜利——分析师即时复审当前局面，狼人胜率未达 100%，宣布无效！神民阵营获胜。`,
+  );
+  return {
+    events: [auditEvent, ...engineEvents],
+    // 决策日志记 auditSettle（重放时直接调 settleExternal 精确重建，不进 advance/decide 校验）
+    input: {
+      thought: "",
+      auditSettle: "good",
+      auditNote: "（白日交刀宣布胜利未通过审核）",
+      auditPub: `【审核】${seat}号代表狼队宣布提前胜利——分析师即时复审当前局面，狼人胜率未达 100%，宣布无效！神民阵营获胜。`,
     },
-    {
-      day: snap.day,
-      phase: "game.over",
-      type: "result",
-      actor: null,
-      title: "游戏结果",
-      content: "神民阵营胜利！（狼人白日交刀宣布提前胜利未通过胜率审核）",
-      thought: null,
-      meta: null,
-    },
-  ];
-  // 对局即终：状态收敛 finished + 神民胜（事件由调用方照常落决策日志与持久化）
-  rt.status = "finished";
-  rt.pending = null;
-  if (rt.timer) {
-    clearTimeout(rt.timer);
-    rt.timer = null;
-  }
-  rt.decidedPersisted = true;
-  void withTimeout(
-    updateGame(gameId, { status: "finished", winner: "good", dayCount: snap.day }),
-    DB_TIMEOUT_MS,
-    "审核终局落库超时",
-  ).catch(() => {
-    /* 内存已收敛 */
-  });
-  return { events, input: { thought: "", skip: true } };
+  };
 }
 
 // 返回引擎事件 + 实际被引擎采纳的决策输入（供决策日志落盘，断点重放恢复的原料）
@@ -1828,6 +1862,213 @@ function maybeWinRateTick(gameId: string, rt: GameRuntime): void {
     });
 }
 
+// ---------- 犯规裁判（分析师担任）：实时审查公开发言的内容级犯规 ----------
+// 由来（对局 20261009001 实锤）：夜神月（平民）被放逐后在遗言里「把牌正过来放回桌面」
+// 翻牌自证——平民无翻牌权，此属违规亮牌。规则红线已写进玩家 prompt（明知故犯允许，但必被罚）。
+// 判罚：犯规成立即本局结束、犯规方对立阵营获胜（settleExternal，与拍刀驳回同一外部结算路径）。
+// 豁免：赛后讨论（信息壁垒已解除）与狼人频道（非公开发言）不审查。
+
+type FoulType = "unauthorizedReveal" | "aiLeak" | "metaGaming";
+interface FoulVerdict {
+  foul: boolean;
+  type?: FoulType;
+  evidence?: string;
+  verdict?: string;
+}
+
+const FOUL_TYPE_LABEL: Record<FoulType, string> = {
+  unauthorizedReveal: "违规亮牌自证",
+  aiLeak: "AI身份泄露",
+  metaGaming: "元游戏言论",
+};
+const FOUL_CHECK_TIMEOUT_MS = 45_000;
+
+/** 裁判配置：优先分析师配置，缺省回落 1 号座位配置（与胜率分析同一回落链） */
+function foulRefereeCfg(rt: GameRuntime): SeatAiConfig | null {
+  const base = rt.analystAi ?? rt.seatAIs[0];
+  if (!base) return null;
+  return {
+    seat: 0,
+    provider: base.provider,
+    baseUrl: base.baseUrl,
+    model: base.model,
+    apiKey: base.apiKey,
+  };
+}
+
+/** 构建裁判 prompt：发言者真实身份是裁判专用信息（判「亮牌是否属实」的依据），绝不外泄 */
+export function buildFoulCheckPrompt(opts: {
+  seat: number;
+  roleName: string;
+  eventTitle: string;
+  day: number;
+  speech: string;
+}): { system: string; user: string } {
+  const system = [
+    "你是狼人杀对局的裁判，负责审查玩家公开发言是否触犯规则红线。你只输出 JSON，禁止任何其他文字。",
+    "保守原则：只有明确违反才判犯规；模棱两可、口头身份声称、正常的规则讨论一律不判。",
+  ].join("\n");
+  const user = [
+    `【发言者】${opts.seat}号玩家（真实身份：${opts.roleName}——裁判专用，绝不外泄）`,
+    `【发言场景】第${opts.day}天 · ${opts.eventTitle}`,
+    `【发言内容】${opts.speech.slice(0, 900)}`,
+    "",
+    "【犯规判定标准】满足以下任一即判犯规：",
+    "1. 违规亮牌自证（unauthorizedReveal）：没有翻牌权的玩家，在公开发言中翻开、亮出、展示自己的真实身份底牌以自证（如「我把牌翻开给大家看，是民牌」「（把底牌亮出来）」）。",
+    "   有翻牌权、不算犯规的情形：白痴被放逐时翻牌免死；骑士翻牌决斗；猎人/狼王出局开枪亮身份；白狼王自爆带人；狼人自爆。",
+    "   关键区分：口头声称「我是平民/我是预言家」是正常发言，不是亮牌——只有「翻牌/亮牌/展示底牌」这一动作描写才算违规。",
+    "2. AI身份泄露（aiLeak）：自称或暗示自己是 AI、人工智能、语言模型、程序、机器人。",
+    "3. 元游戏言论（metaGaming）：提及提示词、系统指令、状态报告、模拟实验、开发者等游戏世界外的存在。",
+    "",
+    "【输出契约】严格输出 JSON：",
+    '{"foul":false} 或 {"foul":true,"type":"unauthorizedReveal|aiLeak|metaGaming","evidence":"犯规原句（≤50字）","verdict":"判罚理由一句"}',
+  ].join("\n");
+  return { system, user };
+}
+
+/** 解析裁判裁决；解析失败/非法输出返回 null（裁判不可用=不判罚，绝不误判） */
+export function parseFoulVerdict(text: string): FoulVerdict | null {
+  const cleaned = text.replace(/```(?:json)?/gi, "");
+  const start = cleaned.indexOf("{");
+  if (start < 0) return null;
+  const end = cleaned.lastIndexOf("}");
+  const obj = parseJsonRobust(cleaned.slice(start, end > start ? end + 1 : undefined));
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
+  const o = obj as Record<string, unknown>;
+  if (o.foul !== true) return { foul: false };
+  const type = String(o.type ?? "");
+  if (!Object.hasOwn(FOUL_TYPE_LABEL, type)) return { foul: false }; // 类型缺失/非法：保守不判
+  return {
+    foul: true,
+    type: type as FoulType,
+    evidence: String(o.evidence ?? "").trim().slice(0, 80),
+    verdict: String(o.verdict ?? "").trim().slice(0, 120),
+  };
+}
+
+/** 公开发言事件落盘后触发犯规审查（非阻塞）：在飞则排队，判罚落定前逐条审查 */
+function maybeFoulCheck(gameId: string, rt: GameRuntime, events: EngineEvent[]): void {
+  if (rt.status !== "running" || rt.foulSettled) return;
+  // 只审公开发言（type=speech）；赛后讨论（postgame.* 阶段）豁免；狼人频道是 action 类事件，天然不在此列
+  const suspects = events.filter(
+    (ev) =>
+      ev.type === "speech" &&
+      ev.actor != null &&
+      !ev.phase.startsWith("postgame") &&
+      typeof ev.content === "string" &&
+      ev.content.trim().length > 0,
+  );
+  if (suspects.length === 0) return;
+  (rt.foulQueue ??= []).push(...suspects);
+  if (rt.foulInFlight) return;
+  rt.foulInFlight = true;
+  void runFoulQueue(gameId, rt)
+    .catch(() => {
+      /* 裁判故障静默：绝不阻塞对局 */
+    })
+    .finally(() => {
+      rt.foulInFlight = false;
+    });
+}
+
+async function runFoulQueue(gameId: string, rt: GameRuntime): Promise<void> {
+  const cfg = foulRefereeCfg(rt);
+  if (!cfg) {
+    rt.foulQueue = [];
+    return;
+  }
+  while ((rt.foulQueue?.length ?? 0) > 0) {
+    if (rt.status !== "running" || rt.foulSettled) {
+      rt.foulQueue = [];
+      return;
+    }
+    const ev = rt.foulQueue!.shift()!;
+    const roleName =
+      ROLE_META[rt.engine.getSnapshot().players.find((p) => p.seat === ev.actor)?.role as RoleId]
+        ?.name ?? "未知身份";
+    const prompt = buildFoulCheckPrompt({
+      seat: ev.actor!,
+      roleName,
+      eventTitle: ev.title,
+      day: ev.day,
+      speech: ev.content,
+    });
+    const res = await callAi(cfg, prompt.system, prompt.user, {
+      timeoutMs: FOUL_CHECK_TIMEOUT_MS,
+      maxRetries: 0,
+    }).catch(() => null);
+    const verdict = res?.ok && res.text ? parseFoulVerdict(res.text) : null;
+    if (verdict?.foul) {
+      await settleFoul(gameId, rt, ev, verdict);
+      rt.foulQueue = [];
+      return;
+    }
+  }
+}
+
+/** 犯规判罚落定：本局立即结束，犯规方对立阵营获胜。
+ * 与 tick 串行化：等静默窗口（无 tick 在飞）再结算——settleExternal 封存主流程协程，
+ * 与进行中的 decide/advance 互斥；等待期间对局暂停/终局则放弃判罚（保守）。 */
+async function settleFoul(
+  gameId: string,
+  rt: GameRuntime,
+  ev: EngineEvent,
+  verdict: FoulVerdict,
+): Promise<void> {
+  const waitStart = Date.now();
+  while (rt.ticking && rt.status === "running" && Date.now() - waitStart < 180_000) {
+    await new Promise((r) => setTimeout(r, 50)); // 50ms 轮询：tick 间隙窗口毫秒级出现，快速接管
+  }
+  if (rt.status !== "running" || rt.ticking || rt.foulSettled) return;
+  rt.foulSettled = true;
+  rt.ticking = true; // 占住 tick 闸：判罚落定期间不许新 tick 插入
+  try {
+    const snap = rt.engine.getSnapshot();
+    const offender = snap.players.find((p) => p.seat === ev.actor);
+    if (!offender) return;
+    const winner: "wolf" | "good" = offender.camp === "wolf" ? "good" : "wolf";
+    const winnerLabel = winner === "good" ? "神民" : "狼人";
+    const roleName = ROLE_META[offender.role as RoleId]?.name ?? offender.role;
+    const typeLabel = FOUL_TYPE_LABEL[verdict.type ?? "metaGaming"];
+    const evidence = verdict.evidence ? `「${verdict.evidence}」` : "";
+    const note = `（犯规判罚：${ev.actor}号${typeLabel}）`;
+    const pub = `【裁判】${ev.actor}号玩家犯规——${typeLabel}${evidence ? `：${evidence}` : ""}。依据规则红线，本局立即结束，${winnerLabel}阵营获胜。`;
+    const engineEvents = rt.engine.settleExternal(winner, note, pub);
+    const foulEvent: EngineEvent = {
+      day: snap.day,
+      phase: snap.phase,
+      type: "system",
+      actor: null,
+      title: "犯规判罚",
+      content: `${ev.actor}号玩家（${roleName}）${typeLabel}${evidence}——${verdict.verdict ?? "触犯规则红线"}。本局立即结束，${winnerLabel}阵营获胜。`,
+      thought: null,
+      meta: { foul: true, foulType: verdict.type, foulSeat: ev.actor },
+    };
+    // 决策日志记 auditSettle（与拍刀驳回同类：重放时调 settleExternal 精确重建）
+    await withTimeout(
+      appendDecision({
+        gameId,
+        idx: rt.decisionIdx,
+        kind: "auditSettle",
+        seat: ev.actor!,
+        decision: { thought: "", auditSettle: winner, auditNote: note, auditPub: pub },
+      }),
+      DB_TIMEOUT_MS,
+      "决策日志写入超时",
+    );
+    rt.decisionIdx += 1;
+    rt.pending = null; // 被封存的待决不再有效
+    await persistWithPhaseBreak(gameId, rt, [foulEvent, ...engineEvents]);
+    rt.acts = rt.engine.getSnapshot().pendingActs;
+    await markDecidedIfNeeded(gameId, rt);
+    if (await finishIfDone(gameId, rt)) return;
+    // 引擎未 finished（赛后讨论开启）：续上正常 tick 链，赛后环节照常推进
+    if (rt.status === "running") scheduleTick(gameId, rt, rt.options.stepDelayMs);
+  } finally {
+    rt.ticking = false;
+  }
+}
+
 /** 配置了分析师且选择「自动生成」的对局，分出胜负后自动复盘并蒸馏进指南
  *（「手动生成」的对局在观察室由用户点击生成；失败只落系统事件，绝不上抛阻塞对局） */
 function triggerAutoAnalysis(gameId: string, rt: GameRuntime, snap: { day: number; phase: string }): void {
@@ -1895,62 +2136,44 @@ async function finishIfDone(gameId: string, rt: GameRuntime): Promise<boolean> {
   // 自动分析触发：统一由开头 markDecidedIfNeeded 完成（分出胜负即启动，此处不重复启动）
   // 终局保底：最后再评估一次胜率（在飞则记 winRateFinalPending，在飞完成的 finally 里补）
   maybeWinRateTick(gameId, rt);
-  // 人格研究库终局收尾：记事簿回写（记忆/关系/漂移）+ 心理检查报告（铁律3/4，自主调度关键节点）
-  triggerPersonaEpilogue(gameId, rt);
+  // 心理检查（记事簿回写+心理检查报告）为主动开启环节：分出胜负后顶栏出现「开始心理检查」按钮，
+  // 由 startPsyCheck 启动（可续跑）——不再终局自动触发（被动中断难以补齐，见对局 20261009001）
   return true;
 }
 
-/** 人格终局收尾编排：对每个人格座位「记事簿回写 → 心理检查报告 → 参战计数」，人格之间并行、
- * 单人格局部保序（漂移先于心理检查，报告反映漂移后参数）——全部人格串行曾是纯浪费
- * （5 人格 × 2 次长调用串行 5-40 分钟尾巴；各人格链路相互独立，并行不损内容质量）。
- * 关键节点写事件流汇报（铁律5：自行决定，汇报结果）；复用分析师配置（未配置则跳过） */
-function triggerPersonaEpilogue(gameId: string, rt: GameRuntime): void {
-  if (rt.personaEpilogueDone) return;
-  if (!rt.personaCards || rt.personaCards.size === 0) return;
-  rt.personaEpilogueDone = true;
-  void runPersonaEpilogueJob(gameId, rt).catch(async (err) => {
-    try {
-      const snap = rt.engine.getSnapshot();
-      await appendEvents([
-        {
-          gameId,
-          seq: ++rt.seq,
-          day: snap.day,
-          phase: snap.phase,
-          type: "system",
-          actor: null,
-          actorLabel: null,
-          title: "人格收尾失败",
-          content: `人格终局收尾（记事簿/心理检查）异常：${errMessage(err).slice(0, 300)}`,
-          thought: null,
-          meta: null,
-        },
-      ]);
-    } catch {
-      /* 记日志失败也不再上抛 */
-    }
-  });
-}
+// ---------- 心理检查（手动开启的终局收尾，可续跑） ----------
+// 语义变迁（对局 20261009001 实锤）：曾是终局自动触发——被动模式一旦中断（未配分析师/
+// 进程重启丢内存配置/平台回收）就难以补齐，该局心理检查从未发生。
+// 现改为用户主动开启：分出胜负后顶栏出现「开始心理检查」，点击启动；中断后再点只补未完成座位
+//（已有报告的座位不重跑；已有回写事件的座位不重写——人格演进不重复入账）。
 
-async function runPersonaEpilogueJob(gameId: string, rt: GameRuntime): Promise<void> {
-  const analyst = rt.analystAi;
-  if (!analyst || analyst.autoGenerate === false) return; // 心理检查师/记事簿复用分析师配置
-  const cfg: SeatAiConfig = { ...analyst, seat: 0 };
-  const row = await getGame(gameId);
-  if (!row) return;
-  const events = await getAllEvents(gameId);
-  const snapshot = snapshotFromRuntime(gameId, row, rt);
-  const digest = buildLogDigest(snapshot, events);
-  const winnerText = snapshot.winner === "wolf" ? "狼人阵营胜利" : snapshot.winner === "good" ? "神民阵营胜利" : "未分胜负";
-  const seats = [...(rt.personaCards?.entries() ?? [])];
-  const others = seats.map(([seat, card]) => ({ seat, name: card.name, personaId: card.id }));
+/** 心理检查在飞座位与完成座位的运行时状态键（rt.psyCheckRunning / rt.psyCheckDone） */
 
-  // 单个人格的收尾链（局部保序：回写→心理检查→计数）；人格之间并行
-  const epilogueForSeat = async (seat: number, card: (typeof seats)[number][1]): Promise<void> => {
-    const player = snapshot.players.find((p) => p.seat === seat);
-    const roleName = player?.roleName ?? "未知身份";
-    const outcome = `${winnerText}${player && !player.alive ? `；出局（${player.deathInfo ?? "死亡"}）` : "；存活"}`;
-    // ---- 记事簿回写：记忆入库/强化/衰减、关系传递、人格漂移 ----
+/** 单个人格的检查链（局部保序：记事簿回写 → 心理检查报告 → 参战计数）；
+ * 续跑跳过：已有回写事件的座位不重写（防记忆重复入账），报告由调用方按 todo 控制 */
+async function runPsyCheckForSeat(
+  gameId: string,
+  rt: GameRuntime,
+  ctx: {
+    cfg: SeatAiConfig;
+    snapshot: GameSnapshot;
+    digest: string;
+    winnerText: string;
+    titleNo: string;
+    others: { seat: number; name: string; personaId: number }[];
+    writebackDoneSeats: Set<number>;
+  },
+  seat: number,
+  card: PersonaCard,
+): Promise<void> {
+  const { cfg, snapshot, digest, winnerText, titleNo, others, writebackDoneSeats } = ctx;
+  const player = snapshot.players.find((p) => p.seat === seat);
+  const roleName = player?.roleName ?? "未知身份";
+  const outcome = `${winnerText}${player && !player.alive ? `；出局（${player.deathInfo ?? "死亡"}）` : "；存活"}`;
+  // ---- 记事簿回写：记忆入库/强化/衰减、关系传递、人格漂移（续跑跳过已完成座位） ----
+  if (writebackDoneSeats.has(seat)) {
+    // 已回写过：漂移已生效、记忆已入账——不重复执行
+  } else {
     try {
       const wb = await runNotebookWriteback({
         cfg,
@@ -1958,7 +2181,7 @@ async function runPersonaEpilogueJob(gameId: string, rt: GameRuntime): Promise<v
         seat,
         roleName,
         outcome,
-        gameTitleNo: row.titleNo ?? "",
+        gameTitleNo: titleNo,
         digest,
         gameId,
         otherPersonas: others.filter((o) => o.seat !== seat),
@@ -1997,64 +2220,185 @@ async function runPersonaEpilogueJob(gameId: string, rt: GameRuntime): Promise<v
         },
       ]);
     }
-    // ---- 心理检查师：《心理检查报告》 ----
-    try {
-      const report = await runPsyCheck(cfg, { card, seat, roleName, outcome, digest, gameTitleNo: row.titleNo ?? "" });
-      await upsertPersonaReport({ gameId, personaId: card.id, seat, report, model: cfg.model });
-      await appendEvents([
-        {
-          gameId,
-          seq: ++rt.seq,
-          day: snapshot.day,
-          phase: snapshot.phase,
-          type: "system",
-          actor: null,
-          actorLabel: null,
-          title: "心理检查报告已生成",
-          content: `「${card.name}」（${seat}号）的《心理检查报告》已生成：三个转折点 + 参数撕裂还原 + 人格状态与走向，可在本页「心理检查」按钮与人格详情页查看。`,
-          thought: null,
-          meta: null,
-        },
-      ]);
-    } catch (err) {
-      await appendEvents([
-        {
-          gameId,
-          seq: ++rt.seq,
-          day: snapshot.day,
-          phase: snapshot.phase,
-          type: "system",
-          actor: null,
-          actorLabel: null,
-          title: "心理检查报告生成失败",
-          content: `「${card.name}」（${seat}号）心理检查报告生成失败：${errMessage(err).slice(0, 200)}`,
-          thought: null,
-          meta: null,
-        },
-      ]);
-    }
-    // ---- 参战计数（参与对局数随完赛累积） ----
-    try {
-      await incrementPersonaGameCount(card.id);
-    } catch {
-      /* 计数失败无害 */
-    }
-  };
+  }
+  // ---- 心理检查师：《心理检查报告》 ----
+  try {
+    const report = await runPsyCheck(cfg, { card, seat, roleName, outcome, digest, gameTitleNo: titleNo });
+    await upsertPersonaReport({ gameId, personaId: card.id, seat, report, model: cfg.model });
+    await appendEvents([
+      {
+        gameId,
+        seq: ++rt.seq,
+        day: snapshot.day,
+        phase: snapshot.phase,
+        type: "system",
+        actor: null,
+        actorLabel: null,
+        title: "心理检查报告已生成",
+        content: `「${card.name}」（${seat}号）的《心理检查报告》已生成：三个转折点 + 参数撕裂还原 + 人格状态与走向，可在本页「心理检查」按钮与人格详情页查看。`,
+        thought: null,
+        meta: null,
+      },
+    ]);
+    rt.psyCheckDone?.add(seat);
+  } catch (err) {
+    await appendEvents([
+      {
+        gameId,
+        seq: ++rt.seq,
+        day: snapshot.day,
+        phase: snapshot.phase,
+        type: "system",
+        actor: null,
+        actorLabel: null,
+        title: "心理检查报告生成失败",
+        content: `「${card.name}」（${seat}号）心理检查报告生成失败：${errMessage(err).slice(0, 200)}`,
+        thought: null,
+        meta: null,
+      },
+    ]);
+  }
+  // ---- 参战计数：已迁移至 createGame「落座即计」（对局创建成功即入数）——
+  // 收尾链不再重复计数（重启续跑/补跑检查都不再触碰计数） ----
+}
 
-  // 并行池：人格收尾链相互独立（各 2 次长 AI 调用），并发 3 路——
-  // 串行尾巴（人格数 × 2 × 单次耗时）压缩到约 1/3；过高并发只会撞限流转重试，不降质量
-  const EPILOGUE_CONCURRENCY = 3;
+/** 心理检查后台任务：todo 座位并行（并发 3），完成进度写 rt.psyCheckRunning/done（poll 透出） */
+async function runPsyCheckJob(
+  gameId: string,
+  rt: GameRuntime,
+  cfg: SeatAiConfig,
+  todoSeats: number[],
+): Promise<void> {
+  const row = await getGame(gameId);
+  if (!row) return;
+  const events = await getAllEvents(gameId);
+  const snapshot = snapshotFromRuntime(gameId, row, rt);
+  const digest = buildLogDigest(snapshot, events);
+  const winnerText = snapshot.winner === "wolf" ? "狼人阵营胜利" : snapshot.winner === "good" ? "神民阵营胜利" : "未分胜负";
+  const others = (rt.seatPersonas ?? []).map((b) => ({
+    seat: b.seat,
+    name: rt.personaCards?.get(b.seat)?.name ?? b.name,
+    personaId: b.personaId,
+  }));
+  // 回写完成判定：事件流里该座位的「记事簿回写」成功事件（内容以「名字」（N号）开头）
+  const writebackDoneSeats = new Set(
+    events
+      .filter((e) => e.title === "记事簿回写")
+      .map((e) => /^「.+」（(\d+)号）/.exec(e.content)?.[1])
+      .filter((s): s is string => !!s)
+      .map(Number),
+  );
+  const ctx = {
+    cfg,
+    snapshot,
+    digest,
+    winnerText,
+    titleNo: row.titleNo ?? "",
+    others,
+    writebackDoneSeats,
+  };
+  const CONCURRENCY = 3; // 各人格链相互独立；过高并发只会撞限流转重试，不降质量
   let cursor = 0;
   const worker = async () => {
-    while (cursor < seats.length) {
-      const [seat, card] = seats[cursor++]!;
-      await epilogueForSeat(seat, card);
+    while (cursor < todoSeats.length) {
+      const seat = todoSeats[cursor++]!;
+      const card = rt.personaCards?.get(seat);
+      if (!card) {
+        rt.psyCheckRunning?.delete(seat);
+        continue;
+      }
+      await runPsyCheckForSeat(gameId, rt, ctx, seat, card);
+      rt.psyCheckRunning?.delete(seat);
     }
   };
   await Promise.all(
-    Array.from({ length: Math.min(EPILOGUE_CONCURRENCY, seats.length) }, () => worker()),
+    Array.from({ length: Math.min(CONCURRENCY, todoSeats.length) }, () => worker()),
   );
 }
+
+/** 心理检查任务的进度透出载荷：有人格座位且已分出胜负的对局，逐座位 pending/running/done */
+async function psyCheckPayload(
+  gameId: string,
+  row: GameRow,
+  rt: GameRuntime | null,
+): Promise<PollResult["psyCheck"]> {
+  const binds = rt?.seatPersonas ?? ((row.setup as StoredSetup)?.seatPersonas ?? []);
+  if (binds.length === 0 || row.winner == null) return null;
+  const reports = await getPersonaReportsForGame(gameId).catch(() => []);
+  const doneIds = new Set(reports.map((r) => r.personaId));
+  return {
+    seats: binds.map((b) => ({
+      seat: b.seat,
+      status: rt?.psyCheckRunning?.has(b.seat)
+        ? ("running" as const)
+        : doneIds.has(b.personaId)
+          ? ("done" as const)
+          : ("pending" as const),
+    })),
+  };
+}
+
+/** 开始心理检查（用户主动开启，可续跑）：分出胜负即可（无赛后讨论/赛后待开始同样开放）。
+ *  AI 配置：前端分析师配置 → 对局分析师配置 → 1 号座位配置（逐级兜底，与胜率分析同规）。
+ *  幂等：进行中的调用直接复视；已完成座位跳过；写库失败记事件不阻塞其余座位。 */
+async function startPsyCheck(
+  gameId: string,
+  analystCfg: AnalystAiConfig | null | undefined,
+  userId?: string,
+): Promise<{ started: boolean; reason?: string }> {
+  const row = await requireOwnedGame(gameId, userId);
+  if (row.winner == null) return { started: false, reason: "对局尚未分出胜负——心理检查在分出胜负后开放" };
+  const setup = row.setup as StoredSetup;
+  const binds = setup.seatPersonas ?? [];
+  if (binds.length === 0) return { started: false, reason: "本局没有人格座位" };
+  // 运行时缺失则重放重建（读人格卡/快照；paused/finished 对局不补链不续跑）
+  let rt = registry.get(gameId) ?? null;
+  if (!rt) {
+    rt = await recoverGame(gameId).catch(() => null);
+    if (!rt) return { started: false, reason: "对局恢复原料缺失，无法开始心理检查" };
+  }
+  if (!rt.personaCards || rt.personaCards.size === 0) {
+    return { started: false, reason: "人格卡已不可用（可能被删除），无法检查" };
+  }
+  if ((rt.psyCheckRunning?.size ?? 0) > 0) return { started: true }; // 幂等复视：已在进行中
+  const cfgSource = analystCfg ?? rt.analystAi ?? (rt.seatAIs[0] ?? null);
+  if (!cfgSource) return { started: false, reason: "没有可用的 AI 配置" };
+  const cfg: SeatAiConfig = { ...cfgSource, seat: 0 };
+  // 续跑核心：只补「还没有心理检查报告」的座位
+  const reports = await getPersonaReportsForGame(gameId).catch(() => []);
+  const doneIds = new Set(reports.map((r) => r.personaId));
+  const todoSeats = binds.filter((b) => !doneIds.has(b.personaId)).map((b) => b.seat);
+  if (todoSeats.length === 0) return { started: false, reason: "全部人格的心理检查已完成" };
+  rt.psyCheckRunning = new Set(todoSeats);
+  void runPsyCheckJob(gameId, rt, cfg, todoSeats)
+    .catch(async (err) => {
+      try {
+        const snap = rt.engine.getSnapshot();
+        await appendEvents([
+          {
+            gameId,
+            seq: ++rt.seq,
+            day: snap.day,
+            phase: snap.phase,
+            type: "system",
+            actor: null,
+            actorLabel: null,
+            title: "心理检查失败",
+            content: `心理检查任务异常中断：${errMessage(err).slice(0, 300)}——重新点击「开始心理检查」可从断点续跑。`,
+            thought: null,
+            meta: null,
+          },
+        ]);
+      } catch {
+        /* 记日志失败也不再上抛 */
+      }
+    })
+    .finally(() => {
+      rt.psyCheckRunning?.clear();
+    });
+  return { started: true };
+}
+
 
 async function handleTickError(gameId: string, rt: GameRuntime, err: unknown): Promise<void> {
   const message = err instanceof Error ? err.message : String(err);
@@ -2129,6 +2473,7 @@ async function runTick(gameId: string): Promise<void> {
       await markDecidedIfNeeded(gameId, rt); // 分出胜负即落库（赛后讨论期间引擎仍 running）
       if (await finishIfDone(gameId, rt)) return;
       if (events.length > 0) maybeWinRateTick(gameId, rt); // 事件落盘后触发胜率评估（非阻塞）
+      if (events.length > 0) maybeFoulCheck(gameId, rt, events); // 公开发言落盘后触发犯规审查（非阻塞）
     }
 
     if (pending) {
@@ -2196,8 +2541,16 @@ async function runTick(gameId: string): Promise<void> {
         const { events: decideEvents, input } = await decideWithAi(rt, pending, gameId);
         rt.pending = null;
         // 先落决策日志（断点重放的原料），再落事件：最坏情况只丢该决策的事件流水，状态不分叉
+        // 外部结算（审核驳回等房规裁决）记 auditSettle 类：重放时调 settleExternal 精确重建，
+        // 不进 advance/decide 一致性校验（其时刻引擎待决被封存而非消费）
         await withTimeout(
-          appendDecision({ gameId, idx: rt.decisionIdx, kind: pending.kind, seat: pending.seat, decision: input }),
+          appendDecision({
+            gameId,
+            idx: rt.decisionIdx,
+            kind: input.auditSettle ? "auditSettle" : pending.kind,
+            seat: pending.seat,
+            decision: input,
+          }),
           DB_TIMEOUT_MS,
           "决策日志写入超时",
         );
@@ -2210,6 +2563,7 @@ async function runTick(gameId: string): Promise<void> {
         await markDecidedIfNeeded(gameId, rt); // 分出胜负即落库（赛后讨论期间引擎仍 running）
         if (await finishIfDone(gameId, rt)) return;
         if (decideEvents.length > 0) maybeWinRateTick(gameId, rt); // 事件落盘后触发胜率评估（非阻塞）
+        if (decideEvents.length > 0) maybeFoulCheck(gameId, rt, decideEvents); // 公开发言落盘后触发犯规审查（非阻塞）
       } catch (err) {
         if (err instanceof SuspendDecision) {
           // 暂停挂起：rt.pending 保留（决策未结算），tick 链到此停稳；待 control("start") 恢复
@@ -2411,6 +2765,17 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
       ...(personaInfos ? { seatPersonas: personaInfos } : {}),
     } satisfies StoredSetup,
   });
+
+  // 人格参战计数「落座即计」（契约语义：对局落座即计）——对局创建成功即入数，
+  // 不再挂在收尾链上（历史 bug：计数在心理检查链末端，对局中断/未跑检查即漏计——
+  // 对局 20260930002 被手动终止后五人格各漏计一局，用户实锤「参赛次数少了」）
+  if (personaInfos) {
+    for (const info of personaInfos) {
+      await incrementPersonaGameCount(info.personaId).catch(() => {
+        /* 计数失败无害，不阻塞建局 */
+      });
+    }
+  }
 
   registry.set(gameId, {
     engine,
@@ -2701,9 +3066,24 @@ async function buildRuntimeFromStore(
   // 重放只能恢复引擎状态，事件必须由恢复流程比对补齐（见下方断点事件补漏）。
   let lastDrained: EngineEvent[] = [];
   for (let i = 0; i < decisions.length; i++) {
+    const rec = decisions[i];
+    // 外部结算条目（auditSettle）：不喂 advance/decide（其时刻待决是被封存而非消费），
+    // 直接调引擎 settleExternal 落定胜者——引擎快照 winner/phase 与赛后衔接全部精确重建
+    //（kind 落库为自由字符串；auditSettle 不在 DecisionKind 枚举内——它是服务层结算标记）
+    if ((rec.kind as string) === "auditSettle") {
+      const d = rec.decision as { auditSettle?: unknown; auditNote?: unknown; auditPub?: unknown };
+      if (d.auditSettle !== "wolf" && d.auditSettle !== "good") {
+        throw new Error(`恢复重放分叉：auditSettle 条目胜者非法（${JSON.stringify(d.auditSettle)}，${gameId}）`);
+      }
+      lastDrained = engine.settleExternal(
+        d.auditSettle,
+        typeof d.auditNote === "string" ? d.auditNote : undefined,
+        typeof d.auditPub === "string" ? d.auditPub : undefined,
+      );
+      continue;
+    }
     const adv = engine.advance();
     if (!adv.pending) throw new Error(`恢复重放分叉：第 ${i} 步前引擎已无待决（${gameId}）`);
-    const rec = decisions[i];
     if (adv.pending.kind !== rec.kind || adv.pending.seat !== rec.seat) {
       throw new Error(
         `恢复重放分叉：第 ${i} 步期望 ${rec.kind}@seat${rec.seat}，实际 ${adv.pending.kind}@seat${adv.pending.seat}（${gameId}）`,
@@ -2869,8 +3249,17 @@ async function startPostGame(
   // 路径A：分出胜负后挂起待开始（内存有运行时、停在 postgameSpeak）——
   // 「开启赛后讨论」的专用恢复通道：不再占用 control("start")（与继续键职责分离）
   if (row.status === "paused" && row.winner != null) {
-    const rt = registry.get(gameId);
-    if (!rt || !rt.pending || rt.pending.kind !== "postgameSpeak") {
+    // 内存没有运行时则先重放重建（paused 不自动补链）——覆盖「服务重启后待开始」的场景
+    const rt = registry.get(gameId) ?? (await recoverGame(gameId));
+    if (!rt) return { started: false, reason: "对局恢复原料缺失，无法开启赛后讨论" };
+    // 重放只恢复引擎状态、rt.pending 为空：从引擎补取当前待决（引擎幂等——待决在飞则原样返回；
+    // 外部结算修复的对局由此推进出首个赛后待决，其开场事件经 persistWithPhaseBreak 落盘）
+    if (!rt.pending && !rt.engine.isFinished()) {
+      const adv = rt.engine.advance();
+      if (adv.events.length > 0) await persistWithPhaseBreak(gameId, rt, adv.events);
+      rt.pending = adv.pending;
+    }
+    if (!rt.pending || rt.pending.kind !== "postgameSpeak") {
       return { started: false, reason: "当前不在赛后讨论待开始状态" };
     }
     rt.postgameAutoHeld = true; // 用户显式开启：挂起拦截已消费
@@ -3038,16 +3427,21 @@ async function poll(gameId: string, afterSeq: number, lastSig?: string, userId?:
     rt.snapCache = { tickKey, snapshot };
     const events = await getEventsAfter(gameId, afterSeq);
     const winRate = await winRatePayload(gameId, rt, afterWinRateId ?? 0);
-    // 补开赛后讨论资格透出：已结束、分了胜负、引擎从未跑过赛后（options.postGameDiscuss 非 true）
-    // 且库里确无赛后事件 → 前端据此显示「开启赛后讨论」按钮；查库失败静默不附旗标
+    // 补开赛后讨论资格透出：已结束或暂停待续、分了胜负、且库里确无赛后事件 →
+    // 前端据此显示「开启赛后讨论」按钮；查库失败静默不附旗标。
+    //（paused 纳入：分出胜负即落库 winner——审核驳回修复等对局停在「胜负已定、赛后未启」的
+    //  暂停态，与「赛后挂起待开始」同权；options 不再过滤——开启赛后讨论的对局若因异常
+    //  没跑成赛后，同样需要补开入口）
     let postGameEligible: boolean | undefined;
-    if (rt.status === "finished" && row.winner != null && rt.options.postGameDiscuss !== true) {
+    if ((rt.status === "finished" || rt.status === "paused") && row.winner != null) {
       try {
         if (!(await hasPostGameEvents(gameId))) postGameEligible = true;
       } catch {
         /* 查库失败静默不附旗标 */
       }
     }
+    // 心理检查进度透出（有人格座位且分出胜负的对局）
+    const psyCheck = await psyCheckPayload(gameId, row, rt);
     return {
       unchanged: false,
       tickKey,
@@ -3055,6 +3449,7 @@ async function poll(gameId: string, afterSeq: number, lastSig?: string, userId?:
       events,
       ...(winRate ? { winRate } : {}),
       ...(postGameEligible ? { postGameEligible } : {}),
+      ...(psyCheck ? { psyCheck } : {}),
       // 赛前学习进度透出（仅开启图书馆的对局）
       ...(rt.options.libraryEnabled
         ? {
@@ -3078,21 +3473,24 @@ async function poll(gameId: string, afterSeq: number, lastSig?: string, userId?:
     return { unchanged: true, events: [] };
   }
   // 补开赛后讨论资格透出（行快照路径：恢复原料缺失/重放分叉的旧对局同样可能补开失败，
-  // 但资格语义只看「已结束、分了胜负、还没有赛后内容」；补开可行性由 startPostGame 裁决）
+  // 但资格语义只看「已结束或暂停待续、分了胜负、还没有赛后内容」；补开可行性由 startPostGame 裁决）
   let postGameEligible: boolean | undefined;
-  if (row.status === "finished" && row.winner != null) {
+  if ((row.status === "finished" || row.status === "paused") && row.winner != null) {
     try {
       if (!(await hasPostGameEvents(gameId))) postGameEligible = true;
     } catch {
       /* 查库失败静默不附旗标 */
     }
   }
+  // 心理检查进度透出（行快照路径同样透出：无运行时的旧对局也能看到检查状态）
+  const psyCheckRow = await psyCheckPayload(gameId, row, null);
   return {
     unchanged: false,
     tickKey,
     snapshot,
     events,
     ...(postGameEligible ? { postGameEligible } : {}),
+    ...(psyCheckRow ? { psyCheck: psyCheckRow } : {}),
   };
 }
 
@@ -3289,6 +3687,7 @@ export const gameService: GameService = {
   createGame,
   control,
   startPostGame,
+  startPsyCheck,
   studyNotes,
   poll,
   list,

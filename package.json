@@ -15,9 +15,10 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "node scripts/guard-push.cjs",
+    "db:start": "tools\\db-start.cmd",
+    "db:stop": "tools\\db-stop.cmd",
     "app:start": "npm --prefix desktop run start",
-    "app:pack": "npm --prefix desktop run pack",
-    "app:dist": "npm --prefix desktop run dist"
+    "app:pack": "npm --prefix desktop run pack"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.3",

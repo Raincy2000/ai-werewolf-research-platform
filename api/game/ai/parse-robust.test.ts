@@ -6,7 +6,7 @@
 // 5) 完全非 JSON → null（交兜底）
 import { describe, it, expect } from "vitest";
 import type { PendingDecision, PlayerView } from "../engine/api";
-import { parseDecision } from "./parse";
+import { parseDecision, truncateSpeech } from "./parse";
 
 const view: PlayerView = {
   seat: 3,
@@ -90,5 +90,54 @@ describe("parseDecision 鲁棒修复", () => {
       pending,
     );
     expect(d!.speech).toBe("大家好我是好人");
+  });
+});
+
+describe("truncateSpeech（发言长度保护：句界收口，不再腰斩）", () => {
+  // 测试辅助：剥括号段后的正文字数（与 parse.ts 内部口径一致）
+  const spokenOnly = (s: string) => s.replace(/（[^）]*）|\([^)]*\)/g, "");
+  // 事故回归（对局 20261009001）：硬 slice(0,300) 把人格发言从句中砍断，
+  // 17 条人格发言 7 条恰好 300 字结尾无标点（「说不完话」观感）
+  it("额度内原样保留", () => {
+    expect(truncateSpeech("完整的发言。")).toBe("完整的发言。");
+    expect(truncateSpeech("a".repeat(800))).toBe("a".repeat(800));
+  });
+
+  it("超额在句末标点处收口（不吐半句话）", () => {
+    const head = "第一段完整发言。".repeat(20); // 160 字
+    const tail = "第二段说到一半被砍";
+    const s = truncateSpeech(head + tail, 100);
+    expect(s).toBe("第一段完整发言。".repeat(12)); // 96 字，落在句界
+    expect(s.endsWith("。")).toBe(true);
+  });
+
+  it("括号动作描写不计入字数：正文短则整段保留（含大段动作）", () => {
+    const s = truncateSpeech(`${"（顿了顿，环视全场）".repeat(8)}话说到这里就完了。`, 60);
+    expect(s).toContain("话说到这里就完了。");
+    expect(s).toContain("（顿了顿，环视全场）");
+  });
+
+  it("括号豁免 + 正文超限：按正文计数定位后在句界收口", () => {
+    const speech = `${"（皱眉）"}${"我是一条完整的发言句子。".repeat(70)}`; // 正文 840 字
+    const s = truncateSpeech(speech);
+    expect(spokenOnly(s).length).toBeLessThanOrEqual(800);
+    expect(s.endsWith("。")).toBe(true);
+    expect(s.startsWith("（皱眉）")).toBe(true); // 前置动作保留
+  });
+
+  it("前段几乎没有完整句子时退回硬切（防收口太靠前丢失内容）", () => {
+    const s = truncateSpeech(`${"啊".repeat(150)}。`, 100);
+    expect(s.length).toBe(100); // 句界在 150 字处（>max），且不足额度一半 → 硬切
+  });
+
+  it("parseDecision 长发言：人格 600 字级发言完整保留，超 800 句界收口", () => {
+    const speech = `${"我是一条完整的发言句子。".repeat(70)}`; // 840 字
+    const d = parseDecision(JSON.stringify({ thought: "t", speech }), pending);
+    expect(d!.speech!.length).toBeLessThanOrEqual(800);
+    expect(d!.speech!.endsWith("。")).toBe(true);
+    // 600 字内的发言不再被砍（旧逻辑 300 硬切的回归锚点）
+    const mid = "我是一条完整的发言句子。".repeat(50); // 600 字
+    const d2 = parseDecision(JSON.stringify({ thought: "t", speech: mid }), pending);
+    expect(d2!.speech).toBe(mid);
   });
 });
