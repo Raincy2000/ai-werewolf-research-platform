@@ -18,7 +18,8 @@
     "db:start": "tools\\db-start.cmd",
     "db:stop": "tools\\db-stop.cmd",
     "app:start": "npm --prefix desktop run start",
-    "app:pack": "npm --prefix desktop run pack"
+    "app:pack": "npm --prefix desktop run pack",
+    "app:dist": "npm --prefix desktop run dist"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.3",
