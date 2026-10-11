@@ -116,7 +116,8 @@ export interface PersonaDetail {
   memories: PersonaMemory[]
   relationships: PersonaRelationship[]
   drift: PersonaDriftEntry[]
-  relationshipHistory: PersonaRelationshipHistory[] // 人格锚点关系的逐局沿革（折叠栏）
+  relationshipHistory: PersonaRelationshipHistory[] // 人格锚点关系的逐局沿革（折叠栏；双向）
+  incomingRelationships: (PersonaRelationship & { sourceName: string })[] // TA 对我（反向汇总）
 }
 
 // ---------------------------------------------------------------------------

@@ -140,6 +140,7 @@ interface PersonaFormState {
   name: string
   originName: string
   originSource: string
+  gender: string // 性别（男/女/其他/空=未知）：圈层可见时决定人称代词
   summary: string
   persona: string
   experiences: string
@@ -167,6 +168,7 @@ function formFromCard(card: PersonaCard): PersonaFormState {
     name: card.name,
     originName: card.originName ?? '',
     originSource: card.originSource ?? '',
+    gender: pr.gender ?? '',
     summary: pr.summary,
     persona: pr.persona,
     experiences: pr.experiences,
@@ -195,6 +197,7 @@ function blankForm(): PersonaFormState {
     name: '',
     originName: '',
     originSource: '',
+    gender: '',
     summary: p.summary,
     persona: p.persona,
     experiences: p.experiences,
@@ -223,6 +226,7 @@ function formToInput(form: PersonaFormState): PersonaCardInput {
     originName: form.originName.trim() || null,
     originSource: form.originSource.trim() || null,
     profile: {
+      gender: form.gender || undefined,
       summary: form.summary.trim(),
       persona: form.persona.trim(),
       experiences: form.experiences.trim(),
@@ -532,6 +536,7 @@ export default function Personas() {
         name: draft.name,
         originName: draft.originName ?? '',
         originSource: draft.originSource ?? '',
+        gender: draft.profile.gender ?? '',
         summary: draft.profile.summary,
         persona: draft.profile.persona,
         experiences: draft.profile.experiences,
@@ -1050,6 +1055,25 @@ export default function Personas() {
                 <h3 className="text-sm font-medium text-foreground">人物档案（供心镜与涌现层约束）</h3>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
+                    <Label>性别</Label>
+                    <Select
+                      value={form.gender || '__unknown__'}
+                      onValueChange={(v) =>
+                        setEditor((p) => p && { ...p, form: { ...p.form, gender: v === '__unknown__' ? '' : v } })
+                      }
+                    >
+                      <SelectTrigger className="h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__unknown__">未知/不指定</SelectItem>
+                        <SelectItem value="男">男（人称「他」）</SelectItem>
+                        <SelectItem value="女">女（人称「她」）</SelectItem>
+                        <SelectItem value="其他">其他（人称「TA」）</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-1.5">
                     <Label>基本概要</Label>
                     <Textarea
                       rows={3}
@@ -1390,6 +1414,7 @@ export default function Personas() {
                   ) : null}
                   {(
                     [
+                      ['性别', detail.card.profile.gender ? `${detail.card.profile.gender}（人称「${detail.card.profile.gender === '男' ? '他' : detail.card.profile.gender === '女' ? '她' : 'TA'}」）` : ''],
                       ['基本概要', detail.card.profile.summary],
                       ['人设与性格画像', detail.card.profile.persona],
                       ['外貌与气质', detail.card.profile.appearance ?? ''],
@@ -1546,9 +1571,20 @@ export default function Personas() {
                     <ul className="space-y-2">
                       {detail.relationships.map((r) => {
                         // 人格锚点的关系才有沿革（无人格锚点每局一个锚点，本身就是逐局的）
+                        // 双向：我→TA（我的回写/补史）与 TA→我（对方的回写/补史）分组展示
                         const history = r.targetPersonaId != null
-                          ? detail.relationshipHistory.filter((h) => h.targetName === r.targetName)
+                          ? detail.relationshipHistory.filter(
+                              (h) => h.personaId === detail.card.id && h.targetName === r.targetName,
+                            )
                           : []
+                        const incoming = r.targetPersonaId != null
+                          ? detail.relationshipHistory.filter(
+                              (h) => h.targetPersonaId === detail.card.id && h.personaId === r.targetPersonaId,
+                            )
+                          : []
+                        const incomingAgg = r.targetPersonaId != null
+                          ? detail.incomingRelationships.find((x) => x.personaId === r.targetPersonaId)
+                          : undefined
                         const expandable = r.targetPersonaId != null
                         const expanded = expandable && expandedRels.has(r.id)
                         return (
@@ -1589,34 +1625,49 @@ export default function Personas() {
                             </div>
                             {r.note ? <p className="text-xs text-muted-foreground">{r.note}</p> : null}
                             {expanded ? (
-                              <ul className="mt-2 space-y-1.5 border-t border-border/60 pt-2">
-                                {history.length === 0 ? (
-                                  <li className="py-1 text-xs text-muted-foreground">
-                                    暂无沿革记录——关系历史从功能上线后的下一局开始逐局留痕。
-                                  </li>
-                                ) : (
-                                  history.map((h) => (
-                                    <li key={h.id} className="rounded-md bg-secondary/40 px-2.5 py-1.5 text-xs">
-                                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                                        <span className="font-mono text-muted-foreground">{h.titleNo || h.gameId?.slice(0, 8)}</span>
-                                        {h.backfill ? (
-                                          <Badge variant="secondary" className="px-1 text-[10px] font-normal" title="追溯回填：由历史对局日志事后蒸馏补史">
-                                            溯
-                                          </Badge>
-                                        ) : null}
-                                        <Badge variant="outline" className="px-1 text-[10px] font-normal">
-                                          {h.relation || '未命名'}
-                                        </Badge>
-                                        <span className="text-muted-foreground">
-                                          亲疏 {h.affinityDelta >= 0 ? '+' : ''}{h.affinityDelta} → {h.affinity}
-                                          {' · '}信任 {h.trustDelta >= 0 ? '+' : ''}{h.trustDelta} → {h.trust}
-                                        </span>
-                                      </div>
-                                      {h.note ? <p className="mt-0.5 leading-5 text-muted-foreground">{h.note}</p> : null}
-                                    </li>
-                                  ))
-                                )}
-                              </ul>
+                              <div className="mt-2 space-y-3 border-t border-border/60 pt-2">
+                                {(
+                                  [
+                                    ['我 → TA', history],
+                                    ['TA → 我', incoming],
+                                  ] as const
+                                ).map(([dirLabel, rows]) => (
+                                  <div key={dirLabel}>
+                                    <p className="mb-1 text-[11px] font-medium text-muted-foreground">
+                                      {dirLabel}
+                                      {dirLabel === 'TA → 我' && incomingAgg
+                                        ? `（现状：${incomingAgg.relation || '未命名'} · 亲疏 ${incomingAgg.affinity} · 信任 ${incomingAgg.trust}）`
+                                        : ''}
+                                    </p>
+                                    {rows.length === 0 ? (
+                                      <p className="py-0.5 text-xs text-muted-foreground/70">暂无记录</p>
+                                    ) : (
+                                      <ul className="space-y-1.5">
+                                        {rows.map((h) => (
+                                          <li key={h.id} className="rounded-md bg-secondary/40 px-2.5 py-1.5 text-xs">
+                                            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                              <span className="font-mono text-muted-foreground">{h.titleNo || h.gameId?.slice(0, 8)}</span>
+                                              {h.backfill ? (
+                                                <Badge variant="secondary" className="px-1 text-[10px] font-normal" title="追溯回填：由历史对局日志事后蒸馏补史">
+                                                  溯
+                                                </Badge>
+                                              ) : null}
+                                              <Badge variant="outline" className="px-1 text-[10px] font-normal">
+                                                {h.relation || '未命名'}
+                                              </Badge>
+                                              <span className="text-muted-foreground">
+                                                亲疏 {h.affinityDelta >= 0 ? '+' : ''}{h.affinityDelta} → {h.affinity}
+                                                {' · '}信任 {h.trustDelta >= 0 ? '+' : ''}{h.trustDelta} → {h.trust}
+                                              </span>
+                                            </div>
+                                            {h.note ? <p className="mt-0.5 leading-5 text-muted-foreground">{h.note}</p> : null}
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
                             ) : null}
                           </li>
                         )

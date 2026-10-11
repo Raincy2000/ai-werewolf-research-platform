@@ -1,6 +1,6 @@
 // 人格研究库查询层：personas / persona_memories / persona_relationships / persona_drift_log / persona_reports
 // 账户体系：人格卡按 userId 隔离（与 api_presets 同规）；profile/params 为 JSON 列（结构见 contracts/persona）
-import { and, desc, eq, inArray, isNotNull, isNull, lt } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lt, or } from "drizzle-orm";
 import { getDb } from "./connection";
 import { env } from "../lib/env";
 import {
@@ -317,6 +317,31 @@ export async function listPersonaRelationships(
   return rows.map(toRelationship);
 }
 
+/** 反向关系汇总（TA 对我：targetPersonaId=我 的行，来源人格名一并解析） */
+export async function listIncomingPersonaRelationships(
+  personaId: number,
+  userId: string,
+): Promise<(PersonaRelationship & { sourceName: string })[] | null> {
+  const owner = await getPersona(personaId, userId);
+  if (!owner) return null;
+  const db = getDb();
+  const rows: RelationshipRow[] = await db
+    .select()
+    .from(personaRelationships)
+    .where(eq(personaRelationships.targetPersonaId, personaId))
+    .orderBy(desc(personaRelationships.updatedAt));
+  // 来源人格名解析（同库一查补齐）
+  const ids = [...new Set(rows.map((r) => r.personaId))];
+  const nameRows = ids.length
+    ? await db
+        .select({ id: personas.id, name: personas.name })
+        .from(personas)
+        .where(inArray(personas.id, ids))
+    : [];
+  const names = new Map<number, string>(nameRows.map((n: { id: number; name: string }) => [n.id, n.name]));
+  return rows.map((r) => ({ ...toRelationship(r), sourceName: names.get(r.personaId) ?? "未知人格" }));
+}
+
 /** 查一组人格卡两两之间的在场关系（对局圈层羁绊注入用：观察者与被观察者都在集合内）。
  *  服务层内部调用（已按对局绑定过滤，无需 userId 维度）。 */
 export async function listRelationshipsAmong(personaIds: number[]): Promise<RelationshipRow[]> {
@@ -564,7 +589,29 @@ export async function insertPersonaRelationshipHistory(input: {
   });
 }
 
-/** 人格的关系历史（详情页折叠栏用；按产生时间正序——沿革的本质是时间线） */
+/** 沿革行存在性（回写幂等守卫：同 persona+target+game 已有沿革则不再追加——
+ *  追溯回填补过的局，赛后实时回写不得双写） */
+export async function hasPersonaRelationshipHistory(
+  personaId: number,
+  targetPersonaId: number,
+  gameId: string,
+): Promise<boolean> {
+  const db = getDb();
+  const rows = await db
+    .select({ id: personaRelationshipHistory.id })
+    .from(personaRelationshipHistory)
+    .where(
+      and(
+        eq(personaRelationshipHistory.personaId, personaId),
+        eq(personaRelationshipHistory.targetPersonaId, targetPersonaId),
+        eq(personaRelationshipHistory.gameId, gameId),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
+}
+
+/** 人格的关系历史（详情页折叠栏用；双向：我→TA 与 TA→我 都取——沿革的本质是双方视角的时间线） */
 export async function listPersonaRelationshipHistory(
   personaId: number,
   userId: string,
@@ -575,8 +622,14 @@ export async function listPersonaRelationshipHistory(
   const rows = await db
     .select()
     .from(personaRelationshipHistory)
-    .where(eq(personaRelationshipHistory.personaId, personaId))
-    .orderBy(personaRelationshipHistory.createdAt);
+    .where(
+      or(
+        eq(personaRelationshipHistory.personaId, personaId),
+        eq(personaRelationshipHistory.targetPersonaId, personaId),
+      ),
+    )
+    // 沿革按对局时间线（标题号即日期+序号），同局内按写入次序；与写入先后解耦（追溯回填友好）
+    .orderBy(personaRelationshipHistory.titleNo, personaRelationshipHistory.createdAt);
   return rows.map((r: typeof personaRelationshipHistory.$inferSelect) => ({
     id: r.id,
     personaId: r.personaId,

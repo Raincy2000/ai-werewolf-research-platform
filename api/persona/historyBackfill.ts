@@ -184,14 +184,45 @@ export async function runHistoryBackfill(
 
   // 3) 人格锚点关系逐条回溯
   const relRows = await db.select().from(personaRelationships);
-  let personaLinked = relRows.filter((r: typeof personaRelationships.$inferSelect) => r.targetPersonaId != null);
-  // 分片执行（关系索引取模）：单次运行时长可控，幂等跳过保证可分次续跑
+  const personaLinked = relRows.filter((r: typeof personaRelationships.$inferSelect) => r.targetPersonaId != null);
+  // 全覆盖：同场对局的全部有序人格对（双向）——只跑既有汇总行的方向会漏掉
+  // 「TA 对我」从未落笔的方向（夜神月页看不到艾伦份量的实锤根因）
+  const pairSeen = new Map<string, { observerId: number; targetId: number }>();
+  for (const g of gameMap.values()) {
+    for (const ob of g.bindings) {
+      for (const tg of g.bindings) {
+        if (ob.personaId === tg.personaId) continue;
+        if (g.visibility === "none") continue;
+        if (g.visibility === "partial" && g.fogSeats.includes(tg.seat)) continue;
+        const key = `${ob.personaId}|${tg.personaId}`;
+        if (!pairSeen.has(key)) pairSeen.set(key, { observerId: ob.personaId, targetId: tg.personaId });
+      }
+    }
+  }
+  const covered = new Set(personaLinked.map((r: typeof personaRelationships.$inferSelect) => `${r.personaId}|${r.targetPersonaId}`));
+  const unified = [
+    ...personaLinked.map((r: typeof personaRelationships.$inferSelect) => ({
+      observerId: r.personaId,
+      targetId: r.targetPersonaId as number,
+      targetName: r.targetName,
+      hasAggregate: true,
+    })),
+    ...[...pairSeen.values()]
+      .filter((pr) => !covered.has(`${pr.observerId}|${pr.targetId}`))
+      .map((pr) => ({
+        ...pr,
+        targetName: personaName.get(pr.targetId) ?? String(pr.targetId),
+        hasAggregate: false,
+      })),
+  ];
+  let workList = unified;
+  // 分片执行（清单索引取模）：单次运行时长可控，幂等跳过保证可分次续跑
   if (opts?.shards && opts.shards > 1) {
     const shard = opts.shard ?? 0;
-    personaLinked = personaLinked.filter((_: unknown, i: number) => i % opts.shards! === shard);
+    workList = unified.filter((_: unknown, i: number) => i % opts.shards! === shard);
     log.push(`分片 ${shard + 1}/${opts.shards}`);
   }
-  log.push(`人格锚点关系 ${personaLinked.length} 条`);
+  log.push(`人格锚点关系 ${workList.length} 条（含 ${workList.filter((w) => !w.hasAggregate).length} 条待补方向）`);
 
   const clampTrust = (v: number) => clampSum(v, 0, 100);
   const clampAff = (v: number) => clampSum(v, -100, 100);
@@ -200,15 +231,16 @@ export async function runHistoryBackfill(
   const CONCURRENCY = 4;
   let cursor = 0;
   const worker = async () => {
-  while (cursor < personaLinked.length) {
-    const rel = personaLinked[cursor++]!;
-    const observerId = rel.personaId;
-    const targetId = rel.targetPersonaId!;
+  while (cursor < workList.length) {
+    const rel = workList[cursor++]!;
+    const observerId = rel.observerId;
+    const targetId = rel.targetId;
     const observerName = personaName.get(observerId) ?? rel.targetName;
     const targetName = personaName.get(targetId) ?? rel.targetName;
     // 双方同场的对局（按时间正序）；迷雾局跳过（观察者不知对方人格，不产生人格锚点沿革）
     const shared = [...gameMap.values()]
       .filter((g) => {
+        if (!g.winner) return false; // 未分胜负的对局不补史（赛后回写会正式留痕，防双写）
         const ob = g.bindings.find((b) => b.personaId === observerId);
         const tg = g.bindings.find((b) => b.personaId === targetId);
         if (!ob || !tg) return false;
@@ -218,8 +250,15 @@ export async function runHistoryBackfill(
       })
       .sort((a, b) => a.createdAt - b.createdAt);
 
-    let affinity = 0;
-    let trust = 50; // 信任基线（与新关系一致）
+    // 断链续接：该对已有历史行时，累计快照从最后一行继续（而非从基线重起）——
+    // 否则补跑后期对局会得到与前期脱节的累计值（孤儿双写事故的次生伤害）
+    const existing = histRows
+      .filter((h: typeof personaRelationshipHistory.$inferSelect) => h.personaId === observerId && h.targetPersonaId === targetId)
+      .sort((a: typeof personaRelationshipHistory.$inferSelect, b: typeof personaRelationshipHistory.$inferSelect) =>
+        String(a.titleNo).localeCompare(String(b.titleNo)));
+    let affinity = existing.length > 0 ? existing.at(-1)!.affinity : 0;
+    let trust = existing.length > 0 ? existing.at(-1)!.trust : 50; // 信任基线（与新关系一致）
+    let lastWritten: { relation: string; note: string; gameId: string } | null = null;
     for (const g of shared) {
       if (hasHist.has(`${observerId}|${targetId}|${g.id}`)) continue;
       const ob = g.bindings.find((b) => b.personaId === observerId)!;
@@ -257,6 +296,7 @@ export async function runHistoryBackfill(
       }
       affinity = clampAff(affinity + parsed.affinityDelta);
       trust = clampTrust(trust + parsed.trustDelta);
+      lastWritten = { relation: parsed.relation, note: parsed.note, gameId: g.id };
       await insertPersonaRelationshipHistory({
         personaId: observerId,
         targetPersonaId: targetId,
@@ -274,8 +314,23 @@ export async function runHistoryBackfill(
       hasHist.add(`${observerId}|${targetId}|${g.id}`);
       log.push(`已回填：${plan}（${parsed.relation} 亲疏${parsed.affinityDelta >= 0 ? "+" : ""}${parsed.affinityDelta} 信任${parsed.trustDelta >= 0 ? "+" : ""}${parsed.trustDelta}）`);
     }
+    // 新方向（无汇总行）：回填产生了沿革则补写汇总行——圈层羁绊与详情页以此为准
+    if (!rel.hasAggregate && !opts?.dryRun && lastWritten) {
+      const { upsertPersonaRelationship } = await import("../queries/personas");
+      await upsertPersonaRelationship({
+        personaId: observerId,
+        targetPersonaId: targetId,
+        targetName,
+        relation: lastWritten.relation,
+        affinityDelta: affinity,
+        trustDelta: trust - 50,
+        note: lastWritten.note,
+        gameId: lastWritten.gameId,
+      });
+      log.push(`补写汇总：${observerName} → ${targetName}（${lastWritten.relation}）`);
+    }
   }
   };
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, personaLinked.length) }, () => worker()));
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, workList.length) }, () => worker()));
   return log;
 }

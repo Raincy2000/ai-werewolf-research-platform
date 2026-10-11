@@ -16,6 +16,7 @@ import {
   listPersonaMemories,
   listPersonaRelationships,
   listPersonaRelationshipHistory,
+  listIncomingPersonaRelationships,
   listPersonas,
   updatePersona,
 } from "./queries/personas";
@@ -99,11 +100,12 @@ const personaRouter = createRouter({
     .query(async ({ input, ctx }) => {
       const card = await getPersona(input.id, ctx.user.id);
       if (!card) return null;
-      const [memories, relationships, drift, relationshipHistory] = await Promise.all([
+      const [memories, relationships, drift, relationshipHistory, incomingRelationships] = await Promise.all([
         listPersonaMemories(input.id, ctx.user.id),
         listPersonaRelationships(input.id, ctx.user.id),
         listPersonaDrift(input.id, ctx.user.id),
         listPersonaRelationshipHistory(input.id, ctx.user.id),
+        listIncomingPersonaRelationships(input.id, ctx.user.id),
       ]);
       return {
         card,
@@ -111,6 +113,7 @@ const personaRouter = createRouter({
         relationships: relationships ?? [],
         drift: drift ?? [],
         relationshipHistory: relationshipHistory ?? [],
+        incomingRelationships: incomingRelationships ?? [],
       };
     }),
   create: authedProcedure

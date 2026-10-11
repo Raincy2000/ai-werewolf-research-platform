@@ -142,6 +142,8 @@ export interface PlayerSnapshot {
 }
 
 export interface GameSnapshot {
+  /** 暂停原因（AI 额度耗尽等需用户知情的暂停；无则为 null）——「继续」按钮旁的提示文本 */
+  pauseReason?: string | null;
   gameId: string;
   boardId: string;
   boardName: string;

@@ -925,6 +925,7 @@ const PARAM_CONTRACT = `{
   "originName": "原型人物名",
   "originSource": "出处（作品名或「现实人物」）",
   "profile": {
+    "gender": "性别（男/女/其他）",
     "summary": "基本概要（一段）",
     "persona": "人设与性格画像（含内在矛盾）",
     "experiences": "关键经历（塑造人格的事件）",
@@ -1052,6 +1053,7 @@ export function sanitizeCastedDraft(
     originName: asStr(raw.originName, 128) || null,
     originSource: asStr(raw.originSource, 128) || null,
     profile: {
+      gender: ["男", "女", "其他"].includes(String(prof.gender ?? "")) ? String(prof.gender) : "",
       summary: asStr(prof.summary, 4000),
       persona: asStr(prof.persona, 4000),
       experiences: asStr(prof.experiences, 8000),

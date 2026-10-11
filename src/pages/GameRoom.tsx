@@ -948,6 +948,15 @@ export default function GameRoom() {
   // 比赛结果出现（分出胜负或对局结束）后：继续/暂停与终止按钮消失
   const resultShown = snapshot.winner !== null || status === 'finished'
 
+  // 暂停原因提示（「继续」按钮旁）：快照透出优先；进程重启后回落到事件流的最后一条
+  // 「AI 额度耗尽」事件（pauseReason 是内存态，重启后由落库事件兜底）
+  const pauseHint = (() => {
+    if (status !== 'paused') return null
+    if (snapshot.pauseReason) return snapshot.pauseReason
+    const lastQuotaEvent = events.filter((e) => e.title === 'AI 额度耗尽' || e.title === 'AI 服务中断').at(-1)
+    return lastQuotaEvent ? lastQuotaEvent.content : null
+  })()
+
   const controlButton =
     resultShown ? null : status === 'running' ? (
       <Button
@@ -1195,11 +1204,19 @@ export default function GameRoom() {
                   {actionError}
                 </span>
               ) : null}
+              {pauseHint ? (
+                <span
+                  className="max-w-96 truncate rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-600 dark:text-amber-400"
+                  title={pauseHint}
+                >
+                  {pauseHint}
+                </span>
+              ) : null}
               {controlButton}
               {terminateButton}
               {analysisButton}
-              {personaButton}
               {postGameButton}
+              {personaButton}
               <Button
                 size="sm"
                 variant="outline"
@@ -1353,6 +1370,14 @@ export default function GameRoom() {
           ) : null}
 
           {/* 三栏布局：左座位+玩家详情 / 中事件流 / 右技能权衡 */}
+          {/* 暂停原因横幅（额度不足等需用户处理的暂停）：整宽醒目展示，
+              与「继续」按钮旁的短提示同源——杜绝用户没注意到提示就误操作（20261011002 实锤） */}
+          {pauseHint ? (
+            <div className="mb-4 flex items-start gap-2.5 rounded-xl border border-amber-500/50 bg-amber-500/10 px-4 py-3">
+              <CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
+              <div className="text-sm leading-6 text-amber-700 dark:text-amber-300">{pauseHint}</div>
+            </div>
+          ) : null}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
             {/* 左栏：圆桌座位区 + 玩家详情（座位框下方） */}
             <section className="lg:col-span-4">

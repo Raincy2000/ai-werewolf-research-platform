@@ -21,7 +21,13 @@ export interface AiChatResult {
   text: string | null;
   latencyMs: number;
   error: string | null;
+  /** true = 账户余额/token 耗尽（重试无意义，服务层据此立即暂停对局而非托管吞掉） */
+  quota?: boolean;
 }
+
+// 额度耗尽识别已独立到 ./quota（纯函数，避开 providers 被整体 mock 的风险）；此处透传兼容
+export { isQuotaErrorText } from "./quota";
+import { isQuotaErrorText } from "./quota";
 
 export interface CallAiOptions {
   jsonMode?: boolean; // 默认 true（OpenAI 兼容端点带 response_format）；false = 纯文本输出
@@ -250,5 +256,6 @@ export async function callAi(
     text: null,
     latencyMs: Date.now() - startedAt,
     error: lastError.slice(0, 300),
+    quota: isQuotaErrorText(lastError),
   };
 }

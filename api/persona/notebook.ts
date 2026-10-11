@@ -28,6 +28,7 @@ import {
   reinforcePersonaMemories,
   upsertPersonaRelationship,
   insertPersonaRelationshipHistory,
+  hasPersonaRelationshipHistory,
 } from "../queries/personas";
 
 const NOTEBOOK_TIMEOUT_MS = 240_000;
@@ -363,8 +364,10 @@ export async function runNotebookWriteback(opts: {
       note: r.note,
       gameId,
     });
-    // 关系沿革留痕：人格锚点的逐局变迁追加进历史表（汇总行看现状，历史行看沿革）
-    await insertPersonaRelationshipHistory({
+    // 关系沿革留痕：人格锚点的逐局变迁追加进历史表（汇总行看现状，历史行看沿革）；
+    // 无人格锚点（targetPersonaId=null）不入此表——它们的锚点本身已是「标题号·代号」逐局独立的；
+    // 幂等守卫：该局该对已有沿革（追溯回填补过/重复回写）则不追加
+    if (targetPersonaId != null && !(await hasPersonaRelationshipHistory(card.id, targetPersonaId, gameId))) await insertPersonaRelationshipHistory({
       personaId: card.id,
       targetPersonaId,
       targetName,

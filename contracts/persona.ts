@@ -122,6 +122,7 @@ export interface PersonaParams {
 
 // ---------- 人物档案（自由文本区，供铸魂师蒸馏与涌现层约束） ----------
 export interface PersonaProfile {
+  gender?: string; // 性别（「男」/「女」/「其他」）：圈层可见时决定他人的人称代词（他/她/TA）
   summary: string; // 基本信息：是谁、出处、时代背景（一段）
   persona: string; // 人设与性格画像
   experiences: string; // 关键经历（塑造人格的事件）
@@ -318,6 +319,7 @@ export const personaParamsSchema = z.object({
 });
 
 export const personaProfileSchema = z.object({
+  gender: z.string().max(8).optional(),
   summary: z.string().max(4000),
   persona: z.string().max(4000),
   experiences: z.string().max(8000),
@@ -369,6 +371,7 @@ export function defaultPersonaParams(): PersonaParams {
 
 export function emptyPersonaProfile(): PersonaProfile {
   return {
+    gender: "",
     summary: "",
     persona: "",
     experiences: "",

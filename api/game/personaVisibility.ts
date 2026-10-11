@@ -11,6 +11,7 @@ export interface PersonaCircleBinding {
   appearance?: string | null; // 外貌与气质（人格公开档案；圈层可见时随姓名一并共享）
   summary?: string | null; // 基本印象（profile.summary 首句；防性别/身份误读——如「他」/「她」）
   originSource?: string | null; // 出处（作品名/「现实人物」）
+  gender?: string | null; // 性别（男/女/其他）：决定人称代词——夜神月是女巫角色但被叫「她」的事故防线
 }
 
 /** 观察者人格与在场另一人格的羁绊（记事簿跨局关系 + 档案互提的原作渊源） */
@@ -55,6 +56,10 @@ export function buildPersonaCircleText(
   if (known.length > 0) {
     const fmt = (b: PersonaCircleBinding) => {
       let head = `${b.seat}号=${b.name}`;
+      // 性别代词明示（20261011001 实锤：夜神月因女巫角色被叫「她」——人格性别优先于角色字面）
+      if (b.gender === "男") head += "（男性，人称用「他」）";
+      else if (b.gender === "女") head += "（女性，人称用「她」）";
+      else if (b.gender) head += "（人称用「TA」）";
       if (b.originSource?.trim()) head += `（${clip(b.originSource, 32)}）`;
       const parts = [head];
       const summary = b.summary?.trim();

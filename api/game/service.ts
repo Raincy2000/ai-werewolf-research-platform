@@ -68,6 +68,7 @@ import type {
 } from "./engine/api";
 import { SPEECH_REQUIRED_KINDS } from "./engine/api";
 import { callAi } from "./ai/providers";
+import { isQuotaErrorText, isOutageErrorText } from "./ai/quota";
 import { defaultCallTimeoutMs, isThinkingModel } from "./ai/modelCaps";
 import { buildPrompt, modelContextTokens } from "./ai/prompts";
 import { parseDecision } from "./ai/parse";
@@ -214,6 +215,10 @@ export interface GameRuntime {
   // 心理检查（手动开启环节）运行时状态：在飞座位 / 已完成座位（poll 透出进度）
   psyCheckRunning?: Set<number>;
   psyCheckDone?: Set<number>;
+  // 暂停原因（AI 额度耗尽等需要用户知情的暂停）：poll 透出到「继续」按钮旁；恢复时清空
+  pauseReason?: string | null;
+  // AI 调用层连续失效计数（熔断依据；成功决策清零；输出非法不计——那是模型行为而非服务中断）
+  aiOutageStreak?: number;
   // ---------- 犯规裁判（分析师担任，实时审查公开发言的内容级犯规） ----------
   // 赛后讨论与狼人频道豁免；判罚经 settleExternal 落定对立阵营获胜（与拍刀驳回同一外部结算路径）
   foulQueue?: EngineEvent[]; // 待审公开发言事件（事件落盘即入队，逐个审查）
@@ -749,6 +754,7 @@ async function askAiOnce(
             appearance: card?.profile.appearance ?? null,
             summary: card?.profile.summary?.trim() ?? null,
             originSource: card?.originSource ?? null,
+            gender: card?.profile.gender || null,
           };
         }),
         rt.options.personaVisibility,
@@ -842,6 +848,40 @@ function pauseSignal(rt: GameRuntime): { promise: Promise<null>; cancel: () => v
 
 // 决策挂起信号：对局暂停时抛出——当前 pending 不结算、保留在 rt.pending，
 // 待恢复后由 AI 重新思考（暂停前未完成的思考量存入 rt.suspendDraft 供参考）
+/** AI 账户额度耗尽（余额/token 不足）：立即暂停对局的专用错误——
+ * 此类故障重试与托管兜底都只会批量产出低质量发言（20261011001 实锤：DeepSeek 额度耗尽后
+ * 全场托管「我这边没什么头绪」，对局质量崩塌），正确做法是当即暂停、提示用户充值/换配置。 */
+/** AI 服务连续失效（调用层故障连续超限）：熔断暂停——断电/休眠后的连接假死、
+ *  服务商宕机等会让每个决策点都烧满预算再托管，对局被垃圾发言淹没还照跑（20261011003 实锤）。
+ *  正确做法：连续失效即暂停，把处置权交还用户。 */
+export class AiOutageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AiOutageError";
+  }
+}
+
+export class AiQuotaExhaustedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AiQuotaExhaustedError";
+  }
+}
+
+/** 连续失效熔断阈值：连续 3 个决策点调用层落空即暂停（误判代价=一次暂停；放任代价=整局报废） */
+const AI_OUTAGE_STREAK_LIMIT = 3;
+
+/** 熔断计数与判定：调用层故障累加并在超限时抛出；任何成功决策由调用方清零 */
+function trackOutageOrThrow(rt: GameRuntime, errorText: string | null): void {
+  if (!isOutageErrorText(errorText)) return;
+  rt.aiOutageStreak = (rt.aiOutageStreak ?? 0) + 1;
+  if (rt.aiOutageStreak >= AI_OUTAGE_STREAK_LIMIT) {
+    throw new AiOutageError(
+      `AI 服务连续无响应，对局已自动暂停：已连续 ${rt.aiOutageStreak} 个决策点得不到任何回应（网络中断、API 服务故障，或断电/休眠后的连接假死）。请检查网络与 API 配置后点击「继续」——当前进度不会丢失。`,
+    );
+  }
+}
+
 class SuspendDecision extends Error {
   constructor() {
     super("对局已暂停，决策挂起待恢复");
@@ -1016,6 +1056,12 @@ async function decideBatchWithAi(
     let res = await askAiOnce(cfg, sub, null, rt, null, deadlineAt);
     if (!res.decision) res = await askAiOnce(cfg, sub, res.error, rt, null, deadlineAt);
     if (!res.decision) {
+      // 额度耗尽：同池换人无用（共享账户额度），立即暂停整局（抛出经 Promise.all 上传播）
+      if (isQuotaErrorText(res.error)) {
+        throw new AiQuotaExhaustedError(
+          `AI 额度不足，对局已自动暂停：${sub.seat}号座位的 ${cfg.model} 账户余额/token 已耗尽。请先给该账户充值（或更换该座位的 AI 配置），然后点击「继续」恢复对局——当前进度不会丢失。`,
+        );
+      }
       failReasons.set(sub.seat, (res.error ?? "AI 调用失败").slice(0, 120));
       return heuristicDecision(sub, "[AI连续无响应，系统托管]");
     }
@@ -1047,6 +1093,14 @@ async function decideBatchWithAi(
   await Promise.all(
     Array.from({ length: Math.min(AI_BATCH_CONCURRENCY, subs.length) }, () => worker()),
   );
+  // 批量熔断：整批全员落空且至少一个是调用层故障 → 计一次连续失效；有任何人成功 → 清零
+  if (failReasons.size >= subs.length && subs.length > 0) {
+    const hasOutage = [...failReasons.values()].some((r) => isOutageErrorText(r));
+    if (hasOutage) trackOutageOrThrow(rt, "批量全灭：调用失败");
+    else rt.aiOutageStreak = 0;
+  } else if (failReasons.size < subs.length) {
+    rt.aiOutageStreak = 0;
+  }
   // 竞速期间被暂停：丢弃本批结果，挂起保留 pending，恢复后重新整批权衡
   if (rt.status !== "running") {
     rt.suspendDraft = { thought: null, error: null };
@@ -1232,12 +1286,20 @@ async function decideWithAi(
       if (res === null) break; // 暂停信号竞速胜出（防御路径；正常已被上面 status 检查拦截）
       const { decision, error } = res;
       if (!decision) {
+        // 额度耗尽：重试/托管只会批量产出垃圾发言——立即暂停对局并告知用户（20261011001 实锤）
+        if (isQuotaErrorText(error)) {
+          throw new AiQuotaExhaustedError(
+            `AI 额度不足，对局已自动暂停：${pending.seat}号座位的 ${cfg.model} 账户余额/token 已耗尽。请先给该账户充值（或更换该座位的 AI 配置），然后点击「继续」恢复对局——当前进度不会丢失。`,
+          );
+        }
+        trackOutageOrThrow(rt, error); // 调用层故障计入熔断（超限价即暂停）
         lastAiError = error;
         break; // AI 无响应/输出损坏：直接启发式兜底
       }
       // 意图保留式修正后再交引擎校验（修正说明写入事件 meta.repaired，可观测）
       const repaired = repairDecision(pending, decision);
       try {
+        rt.aiOutageStreak = 0; // 成功决策：熔断计数清零
         const result = { events: rt.engine.decide(repaired.input), input: repaired.input };
         if (repaired.notes.length) {
           const tag = `AI输出修正：${repaired.notes.join("；")}`.slice(0, 200);
@@ -2185,7 +2247,11 @@ async function startPsyCheck(
 
 
 async function handleTickError(gameId: string, rt: GameRuntime, err: unknown): Promise<void> {
+  const quotaExhausted = err instanceof AiQuotaExhaustedError;
+  const outage = err instanceof AiOutageError;
   const message = err instanceof Error ? err.message : String(err);
+  // 额度耗尽/服务中断：暂停原因透出到「继续」按钮旁（用户需要知道为什么停、怎么办）
+  rt.pauseReason = quotaExhausted || outage ? message : null;
   rt.status = "paused";
   rt.pending = null;
   if (rt.timer) {
@@ -2214,8 +2280,8 @@ async function handleTickError(gameId: string, rt: GameRuntime, err: unknown): P
           type: "system",
           actor: null,
           actorLabel: null,
-          title: "系统错误",
-          content: `对局循环异常，已自动暂停：${message.slice(0, 500)}`,
+          title: quotaExhausted ? "AI 额度耗尽" : outage ? "AI 服务中断" : "系统错误",
+          content: quotaExhausted ? message.slice(0, 500) : `对局循环异常，已自动暂停：${message.slice(0, 500)}`,
           thought: null,
           meta: null,
         },
@@ -2394,6 +2460,7 @@ function snapshotFromRuntime(gameId: string, row: GameRow, rt: GameRuntime): Gam
   // 显式标注 GameSnapshot：避免对象字面量属性拓宽（如 phaseBreaking 拓宽成 string）
   const result: GameSnapshot = {
     gameId,
+    pauseReason: rt.pauseReason ?? null,
     boardId: row.boardId,
     boardName: row.boardName,
     titleNo: row.titleNo ?? "",
@@ -2737,6 +2804,7 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
     if (!rt) rt = (await recoverGame(gameId)) ?? undefined;
     if (!rt) return { ok: false };
     if (rt.status !== "created" && rt.status !== "paused") return { ok: false };
+    rt.pauseReason = null; // 恢复即清空暂停原因（额度耗尽提示等）
     // 图书馆赛前学习：开启开关且未完成学习时，「开始对局」先触发学习——学习全程在对局页
     // 可见（祖母绿状态环+进度+点击座位看详情），全部学完自动开赛进入黑夜
     // （学习期间 status 保持 created 白天态，poll.study 透出进度）
