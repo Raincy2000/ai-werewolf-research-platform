@@ -23,11 +23,68 @@ import { gatherEvidence, formatEvidence, type EvidencePool } from "./websearch";
 import { callResponsesApi } from "./responses";
 import { longFetch, netErrorMessage } from "../lib/longFetch";
 import { accumulateAnthropicStream, accumulateChatStream, synthesizeChatResponse } from "../lib/sse";
-import { makeCharsReporter, note, stage, withLane, castCheckpoint } from "./progress";
+import { makeCharsReporter, note, stage, withLane, castCheckpoint, saveCastCheckpoint } from "./progress";
 
 // 铸魂师不设任何客户端时限：铸造是重质量的长文档任务，思考型模型（DeepSeek v4-pro / kimi-k3 等）
 // 允许想多久想多久（用户决策：质量优先，超时限制与思考禁用一律不要）
 const MAX_TOOL_ROUNDS = 12; // 联网检索最大工具往返轮数（实测铸造①搜集大任务常需 4-6 轮；6 曾卡死临界任务）
+
+// ============================================================
+// 任务级中止 + 输出截断（2026-10-22 审计 P0-7/P0-8）
+// 编织/canon 补完等后台任务通过 opts.signal 传入 AbortController，
+// 取消/30 分钟硬上限/25 分钟 deadline 可以在 AI 调用层真正中止，而不是只 reject 外层。
+// 同时把底层 finish_reason/stop_reason 带出（length/max_tokens = 输出被截断）。
+// ============================================================
+
+/** signal 已触发 → 抛 AbortError（上层据此写 cancelled/failed 且不再落数据） */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    const err = new Error("任务已终止");
+    err.name = "AbortError";
+    throw err;
+  }
+}
+
+/** 给不可中止的 Promise 包一层：signal 触发时立即 reject（底层调用结果被丢弃） */
+function withAbort<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      const err = new Error("任务已终止");
+      err.name = "AbortError";
+      reject(err);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => { signal.removeEventListener("abort", onAbort); resolve(v); },
+      (e) => { signal.removeEventListener("abort", onAbort); reject(e); },
+    );
+  });
+}
+
+/** 内部追踪：把底层 finish_reason 带出到 callWithWebSearch 返回值 */
+interface StageTrace {
+  finishReason: string | null;
+}
+
+/** 输出截断判定：chat finish_reason=length / Anthropic stop_reason=max_tokens / Responses 同类 */
+function isTruncatedFinish(reason: string | null | undefined): boolean {
+  if (!reason) return false;
+  return (
+    reason === "length" ||
+    reason === "max_tokens" ||
+    reason === "max_output_tokens" ||
+    reason === "token_limit"
+  );
+}
+
+/** 从 chat/completions 响应中取 finish_reason（流式/非流式同形） */
+function chatFinishReason(data: unknown): string | null {
+  const choices = (data as { choices?: { finish_reason?: unknown }[] | undefined })?.choices;
+  const r = Array.isArray(choices) ? choices[0]?.finish_reason : undefined;
+  return typeof r === "string" && r ? r : null;
+}
 // 收敛兜底：最后一轮为「强制产出轮」——去掉 tools 并指示模型基于已有检索结果直接作答，
 // 前期搜索成果（fiber 加密结果服务端可解密，前文可见）不再因差一轮而整体丢弃降级。
 
@@ -44,6 +101,7 @@ async function fetchWithRetry(
   init: RequestInit,
 ): Promise<Response> {
   const MAX_ATTEMPTS = 4;
+  const signal = init.signal ?? undefined;
   let lastErr: unknown = null;
   let lastWasNetErr = false;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
@@ -51,6 +109,7 @@ async function fetchWithRetry(
       await new Promise((r) => setTimeout(r, 1000 * 2 ** (attempt - 1)));
     }
     try {
+      throwIfAborted(signal ?? undefined); // 任务已取消/超时：不再重试
       const res = await longFetch(url, init);
       lastWasNetErr = false;
       if ((res.status === 429 || res.status >= 500) && attempt < MAX_ATTEMPTS - 1) {
@@ -62,6 +121,7 @@ async function fetchWithRetry(
       }
       return res;
     } catch (err) {
+      if (signal?.aborted) throw err; // 中止不是网络瞬断，立即上抛
       lastErr = err;
       lastWasNetErr = true;
     }
@@ -97,9 +157,10 @@ function httpErrorMessage(status: number, msg: string): string {
 export async function postChat(
   cfg: AiTestInput,
   body: Record<string, unknown>,
-  opts?: { progressPrefix?: string },
+  opts?: { progressPrefix?: string; signal?: AbortSignal },
 ): Promise<unknown> {
   await castCheckpoint(); // 暂停/终止控制点：每次 AI 调用前检查
+  throwIfAborted(opts?.signal); // 任务级取消/超时控制点
   const url = `${cfg.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   // 流式（SSE）优先：响应头先行到达、内容持续吐字——长生成不再考验任何空闲超时，
   // 且顺带产出真实生成进度；端点不支持流式（400）时去掉 stream 自动回退非流式。
@@ -110,6 +171,7 @@ export async function postChat(
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${cfg.apiKey}` },
       body: JSON.stringify(body),
+      signal: opts?.signal,
     });
     const ct = res.headers.get("content-type") ?? "";
     if (res.status >= 200 && res.status < 300 && body.stream === true && ct.includes("text/event-stream")) {
@@ -180,10 +242,11 @@ interface FormulaTool {
 }
 
 /** 取官方工具声明（formula tools 端点） */
-async function kimiFormulaTools(cfg: AiTestInput): Promise<FormulaTool[]> {
+async function kimiFormulaTools(cfg: AiTestInput, signal?: AbortSignal): Promise<FormulaTool[]> {
   const url = `${cfg.baseUrl.replace(/\/+$/, "")}/formulas/${KIMI_FORMULA_WEB_SEARCH}/tools`;
   const res = await fetchWithRetry(url, {
     headers: { authorization: `Bearer ${cfg.apiKey}` },
+    signal,
   });
   const raw = await res.text();
   if (res.status < 200 || res.status >= 300) {
@@ -197,12 +260,13 @@ async function kimiFormulaTools(cfg: AiTestInput): Promise<FormulaTool[]> {
 }
 
 /** 执行官方工具（fibers 端点；arguments 为模型输出的 JSON 字符串，原样透传不二次编码） */
-async function kimiFormulaExec(cfg: AiTestInput, name: string, argumentsStr: string): Promise<string> {
+async function kimiFormulaExec(cfg: AiTestInput, name: string, argumentsStr: string, signal?: AbortSignal): Promise<string> {
   const url = `${cfg.baseUrl.replace(/\/+$/, "")}/formulas/${KIMI_FORMULA_WEB_SEARCH}/fibers`;
   const res = await fetchWithRetry(url, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${cfg.apiKey}` },
     body: JSON.stringify({ name, arguments: argumentsStr }),
+    signal,
   });
   const raw = await res.text();
   if (res.status < 200 || res.status >= 300) {
@@ -229,14 +293,17 @@ export async function callKimiFormulaWebSearch(
   cfg: AiTestInput,
   system: string,
   user: string,
+  opts?: { signal?: AbortSignal; trace?: StageTrace },
 ): Promise<string> {
-  const tools = await kimiFormulaTools(cfg);
+  throwIfAborted(opts?.signal);
+  const tools = await kimiFormulaTools(cfg, opts?.signal);
   const messages: ChatMessage[] = [
     { role: "system", content: system },
     { role: "user", content: user },
   ];
   let retriedEmpty = false; // 瞬态空内容重试标记（每次铸造最多重试一轮）
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    throwIfAborted(opts?.signal); // 任务级取消控制点（每轮 AI 调用前）
     const isLastChance = round === MAX_TOOL_ROUNDS - 1;
     const roundMessages: ChatMessage[] = isLastChance
       ? [...messages, { role: "user", content: "【系统提示】检索轮次已达上限。请基于以上已完成的检索结果直接输出最终内容，禁止再调用任何工具。" }]
@@ -245,7 +312,7 @@ export async function callKimiFormulaWebSearch(
     const data = (await postChat(
       cfg,
       { model: cfg.model, messages: roundMessages, ...(isLastChance ? {} : { tools }) },
-      { progressPrefix: `联网检索 第 ${round + 1} 轮` },
+      { progressPrefix: `联网检索 第 ${round + 1} 轮`, signal: opts?.signal },
     )) as {
       choices?: { finish_reason?: string; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: unknown } }[];
     };
@@ -264,11 +331,12 @@ export async function callKimiFormulaWebSearch(
         tool_calls: toolCalls,
       });
       for (const tc of toolCalls) {
+        throwIfAborted(opts?.signal);
         const fn = tc.function as { name?: unknown; arguments?: unknown };
         const fnName = String(fn?.name ?? "");
         const argsStr = typeof fn?.arguments === "string" ? fn.arguments : JSON.stringify(fn?.arguments ?? {});
         // fiber 失败（含 status≠succeeded）直接抛出降级：失败结果回填只会让模型重复空搜
-        const result = await kimiFormulaExec(cfg, fnName, argsStr);
+        const result = await kimiFormulaExec(cfg, fnName, argsStr, opts?.signal);
         messages.push({
           role: "tool",
           tool_call_id: String(tc.id ?? ""),
@@ -287,6 +355,7 @@ export async function callKimiFormulaWebSearch(
       }
       throw new Error("检索 AI 返回内容为空");
     }
+    if (opts?.trace) opts.trace.finishReason = choice?.finish_reason ?? opts.trace.finishReason;
     return text;
   }
   throw new Error("联网检索轮数超限（Formula 工具循环未收敛）"); // 理论不可达（末轮强制产出）
@@ -299,17 +368,18 @@ async function callKimiWebSearch(
   cfg: AiTestInput,
   system: string,
   user: string,
+  opts?: { signal?: AbortSignal; trace?: StageTrace },
 ): Promise<string> {
   if (/k3/i.test(cfg.model)) {
-    return callKimiFormulaWebSearch(cfg, system, user);
+    return callKimiFormulaWebSearch(cfg, system, user, opts);
   }
   try {
-    return await callKimiBuiltinWebSearch(cfg, system, user);
+    return await callKimiBuiltinWebSearch(cfg, system, user, opts);
   } catch (err) {
     // builtin 回声故障（tokenization failed）：改走 Formula 官方工具通道
     if (err instanceof Error && /tokenization failed/i.test(err.message)) {
       console.warn(`[铸魂师] 内置 $web_search 回声故障，改走 Formula 官方工具通道`);
-      return callKimiFormulaWebSearch(cfg, system, user);
+      return callKimiFormulaWebSearch(cfg, system, user, opts);
     }
     throw err;
   }
@@ -321,7 +391,9 @@ async function callKimiBuiltinWebSearch(
   cfg: AiTestInput,
   system: string,
   user: string,
+  opts?: { signal?: AbortSignal; trace?: StageTrace },
 ): Promise<string> {
+  throwIfAborted(opts?.signal);
   const messages: ChatMessage[] = [
     { role: "system", content: system },
     { role: "user", content: user },
@@ -329,6 +401,7 @@ async function callKimiBuiltinWebSearch(
   const tools = [{ type: "builtin_function", function: { name: "$web_search" } }];
   let retriedEmpty = false; // 瞬态空内容重试标记（每次铸造最多重试一轮）
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    throwIfAborted(opts?.signal); // 任务级取消控制点（每轮 AI 调用前）
     const isLastChance = round === MAX_TOOL_ROUNDS - 1;
     const roundMessages: ChatMessage[] = isLastChance
       ? [...messages, { role: "user", content: "【系统提示】检索轮次已达上限。请基于以上已完成的检索结果直接输出最终内容，禁止再调用任何工具。" }]
@@ -337,7 +410,7 @@ async function callKimiBuiltinWebSearch(
     const data = (await postChat(
       cfg,
       { model: cfg.model, messages: roundMessages, ...(isLastChance ? {} : { tools }) },
-      { progressPrefix: `联网检索 第 ${round + 1} 轮` },
+      { progressPrefix: `联网检索 第 ${round + 1} 轮`, signal: opts?.signal },
     )) as {
       choices?: { finish_reason?: string; message?: { content?: string | null; reasoning_content?: string | null; tool_calls?: unknown } }[];
     };
@@ -379,6 +452,7 @@ async function callKimiBuiltinWebSearch(
       }
       throw new Error("检索 AI 返回内容为空");
     }
+    if (opts?.trace) opts.trace.finishReason = choice?.finish_reason ?? opts.trace.finishReason;
     return text;
   }
   throw new Error("联网检索轮数超限（工具循环未收敛）"); // 理论不可达（末轮强制产出）
@@ -390,12 +464,52 @@ async function callKimiBuiltinWebSearch(
  *  - DeepSeek/OpenAI：Responses API 原生 web_search（失败降级纯文本）
  *  - 自定义/其他：纯文本调用
  *  evidence（服务端证据池）随 user 注入——任何模型都能用上真实网页资料 */
+/** 联网调用选项：signal 用于任务级取消/超时（编织/canon 补完） */
+export interface CallWithWebSearchOpts {
+  web?: boolean;
+  evidence?: string;
+  signal?: AbortSignal;
+}
+
+/** 联网调用结果：finishReason/truncated 供后台任务检测输出截断（P0-8） */
+export interface CallWithWebSearchResult {
+  text: string;
+  webSearched: boolean;
+  offlineReason?: string;
+  /** 底层 finish_reason / stop_reason（无则 null） */
+  finishReason?: string | null;
+  /** 输出是否被截断（length / max_tokens 等） */
+  truncated?: boolean;
+}
+
+/**
+ * 对外导出的联网调用（供编织/canon 补完等模块复用）。
+ * 内部走 callStageAi：Kimi 内置 $web_search / Anthropic 服务端 / Responses API，
+ * 失败自动降级纯文本并回报 webSearched=false。
+ * opts.signal：任务级取消（cancel/30 分钟硬上限/25 分钟 deadline 真正中止调用链）。
+ */
+export async function callWithWebSearch(
+  cfg: AiTestInput,
+  system: string,
+  user: string,
+  opts?: CallWithWebSearchOpts,
+): Promise<CallWithWebSearchResult> {
+  const trace: StageTrace = { finishReason: null };
+  const r = await callStageAi(cfg, system, user, { ...opts, trace });
+  return { ...r, finishReason: trace.finishReason, truncated: isTruncatedFinish(trace.finishReason) };
+}
+
+/** 服务端证据池（维基/搜索引擎实搜），供编织复用 */
+export { gatherEvidence, formatEvidence };
+
 async function callStageAi(
   cfg: AiTestInput,
   system: string,
   user: string,
-  opts?: { web?: boolean; evidence?: string },
-): Promise<{ text: string; webSearched: boolean; offlineReason?: string }> {
+  opts?: CallWithWebSearchOpts & { trace?: StageTrace },
+): Promise<CallWithWebSearchResult> {
+  throwIfAborted(opts?.signal);
+  const trace = opts?.trace;
   const wantWeb = opts?.web !== false;
   const userFull = opts?.evidence?.trim()
     ? `${user}\n\n【服务端检索补充材料】（应用后端实搜的真实网页资料，可信度高，请优先采信）\n${opts.evidence.trim()}`
@@ -406,12 +520,14 @@ async function callStageAi(
   if (cfg.provider === "kimi") {
     if (wantWeb) {
       try {
-        const text = await callKimiWebSearch(cfg, system, userFull);
-        return { text, webSearched: true };
+        const text = await callKimiWebSearch(cfg, system, userFull, { signal: opts?.signal, trace });
+        return { text, webSearched: true, finishReason: trace?.finishReason ?? null, truncated: isTruncatedFinish(trace?.finishReason) };
       } catch (err) {
+        // 任务级中止：不降级（降级重试会继续消耗配额），直接上抛
+        if (opts?.signal?.aborted) throw err;
         const reason = err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120);
         console.warn(`[铸魂师] Kimi 联网检索失败，降级：${reason}`);
-        const r = await callStageAi(cfg, offlineSystem, user, { web: false, evidence: opts?.evidence });
+        const r = await callStageAi(cfg, offlineSystem, user, { web: false, evidence: opts?.evidence, signal: opts?.signal, trace });
         return { ...r, offlineReason: reason };
       }
     }
@@ -421,27 +537,50 @@ async function callStageAi(
           { role: "system", content: offlineSystem },
           { role: "user", content: userFull },
         ] },
-    )) as { choices?: { message?: { content?: string | null } }[] };
+      { signal: opts?.signal },
+    )) as { choices?: { finish_reason?: string; message?: { content?: string | null } }[] };
     const text = typeof data.choices?.[0]?.message?.content === "string" ? data.choices[0].message.content.trim() : "";
     if (!text) throw new Error("AI 返回内容为空");
-    return { text, webSearched: false };
+    const finish = chatFinishReason(data);
+    if (trace) trace.finishReason = finish;
+    return { text, webSearched: false, finishReason: finish, truncated: isTruncatedFinish(finish) };
   }
 
-  // Anthropic：服务端 web_search 工具
+  // Anthropic：服务端 web_search 工具（stop_reason=max_tokens → 截断）
   if (cfg.provider === "anthropic") {
-    const text = await callPlainAi(cfg, wantWeb ? system : offlineSystem, userFull, { webSearch: wantWeb });
-    return { text, webSearched: wantWeb };
+    const text = await callPlainAi(cfg, wantWeb ? system : offlineSystem, userFull, {
+      webSearch: wantWeb,
+      signal: opts?.signal,
+      trace,
+    });
+    return {
+      text,
+      webSearched: wantWeb,
+      finishReason: trace?.finishReason ?? null,
+      truncated: isTruncatedFinish(trace?.finishReason),
+    };
   }
 
   // DeepSeek/OpenAI：Responses API 原生 web_search
   if ((cfg.provider === "deepseek" || cfg.provider === "openai") && wantWeb) {
     try {
-      const text = await callResponsesApi(cfg, system, userFull, { webSearch: true });
-      return { text, webSearched: true };
+      // 注：Responses API 的 incomplete/max_output_tokens 状态未在本轮暴露（responses.ts 不在本批改动范围），
+      // 截断检测以 chat/anthropic 通道为准；此处 signal 确保取消能立即返回。
+      const r = await withAbort(callResponsesApi(cfg, system, userFull, { webSearch: true }), opts?.signal);
+      // ★ 用 API 实证的 searched，而不是「调用成功就当搜了」
+      if (!r.searched) {
+        if (opts?.signal?.aborted) throwIfAborted(opts?.signal);
+        const reason = "模型未调用联网工具（web_search_call 事件缺失）";
+        console.warn("[铸魂师] " + cfg.provider + " " + reason + "，降级");
+        const plain = await callStageAi(cfg, offlineSystem, user, { web: false, evidence: opts?.evidence, signal: opts?.signal, trace });
+        return { ...plain, offlineReason: reason };
+      }
+      return { text: r.text, webSearched: true, finishReason: trace?.finishReason ?? null, truncated: isTruncatedFinish(trace?.finishReason) };
     } catch (err) {
+      if (opts?.signal?.aborted) throw err;
       const reason = err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120);
-      console.warn(`[铸魂师] ${cfg.provider} Responses 联网失败，降级：${reason}`);
-      const r = await callStageAi(cfg, offlineSystem, user, { web: false, evidence: opts?.evidence });
+      console.warn("[铸魂师] " + cfg.provider + " Responses 联网失败，降级：" + reason);
+      const r = await callStageAi(cfg, offlineSystem, user, { web: false, evidence: opts?.evidence, signal: opts?.signal, trace });
       return { ...r, offlineReason: reason };
     }
   }
@@ -452,15 +591,18 @@ async function callStageAi(
     {
       model: cfg.model,
       messages: [
-        { role: "system", content: wantWeb ? `${system}\n【注意】联网能力不可用，请基于随附的补充材料与内部知识回答。` : offlineSystem },
+        { role: "system", content: wantWeb ? system + "\n【注意】联网能力不可用，请基于随附的补充材料与内部知识回答。" : offlineSystem },
         { role: "user", content: userFull },
       ],
       temperature: 0.6,
     },
-  )) as { choices?: { message?: { content?: string | null } }[] };
+    { signal: opts?.signal },
+  )) as { choices?: { finish_reason?: string; message?: { content?: string | null } }[] };
   const text = typeof data.choices?.[0]?.message?.content === "string" ? data.choices[0].message.content.trim() : "";
   if (!text) throw new Error("AI 返回内容为空");
-  return { text, webSearched: false };
+  const finish = chatFinishReason(data);
+  if (trace) trace.finishReason = finish;
+  return { text, webSearched: false, finishReason: finish, truncated: isTruncatedFinish(finish) };
 }
 
 /** 整合 AI 调用（JSON 模式；Anthropic 端点在 system 里强制 JSON） */
@@ -568,9 +710,10 @@ async function callPlainAi(
   cfg: AiTestInput,
   system: string,
   user: string,
-  opts?: { webSearch?: boolean },
+  opts?: { webSearch?: boolean; signal?: AbortSignal; trace?: StageTrace },
 ): Promise<string> {
   await castCheckpoint(); // 暂停/终止控制点
+  throwIfAborted(opts?.signal);
   const isAnthropic = cfg.provider === "anthropic";
   const url = isAnthropic
     ? `${cfg.baseUrl.replace(/\/+$/, "")}/v1/messages`
@@ -610,12 +753,15 @@ async function callPlainAi(
       method: "POST",
       headers,
       body: JSON.stringify(body),
+      signal: opts?.signal,
     });
     const ct = r.headers.get("content-type") ?? "";
     if (r.status >= 200 && r.status < 300 && body.stream === true && ct.includes("text/event-stream")) {
       // 流式：按家协议累加后合成非流式同形结构（extractText 零改动）
       if (isAnthropic) {
         const acc = await accumulateAnthropicStream(r, chars);
+        // Anthropic 流式收尾事件 message_delta 带回 stop_reason（max_tokens = 输出被截断）
+        if (opts?.trace) opts.trace.finishReason = acc.stopReason ?? opts.trace.finishReason;
         return { status: r.status, data: { content: [{ type: "text", text: acc.text }] }, raw: "" };
       }
       return { status: r.status, data: synthesizeChatResponse(await accumulateChatStream(r, chars)), raw: "" };
@@ -646,6 +792,11 @@ async function callPlainAi(
   }
   if (status < 200 || status >= 300) {
     throw new Error(status === 429 ? httpErrorMessage(status, snippet(data, raw)) : `HTTP ${status}: ${snippet(data, raw).slice(0, 200)}`);
+  }
+  // Anthropic 非流式：stop_reason 在顶层（max_tokens = 输出被截断）
+  if (isAnthropic && opts?.trace) {
+    const stop = (data as { stop_reason?: unknown })?.stop_reason;
+    if (typeof stop === "string" && stop) opts.trace.finishReason = stop;
   }
   return extractText(data, isAnthropic);
 }
@@ -742,6 +893,8 @@ export async function runCastChain(
   if (!cand) {
     throw new Error(`查无此人：「${name}」未找到候选对象（可补充提示后单独铸造）`);
   }
+  // 消歧选定即落检查点（续铸时不必重检索）
+  saveCastCheckpoint("research", { name: cand.name, source: cand.source ?? null, hint: hint ?? null });
   const result = await castPersona(searchCfg, understandCfg, synthCfg, cand.name, cand.source, hint, opts);
   if (r.candidates.length > 1) {
     const auto = `重名消歧：共 ${r.candidates.length} 个候选，已自动选定首候选「${cand.name}」（不合适可删除后单独铸造）。`;
@@ -754,7 +907,7 @@ export async function runCastChain(
 // 三步铸造（三个可分别配置的 AI）：
 //   ① 搜集 AI（默认 Kimi 联网）：全网搜集人物资料，保证真实可靠（研究档案 + 参考页面 URL）
 //   ② 深读 AI：透过表象把握人物核心（深度人格解读：核心结构/内在矛盾/创伤防御/动机/关系/心智）
-//   ③ 整合 AI：整合①②成果 → 完整人物档案（含对局注入专用「人格精粹」）+ 七组量化参数卡
+//   ③ 整合 AI：整合①②成果 → 完整人物档案 + 七组量化参数卡
 // ============================================================
 
 function buildDossierPrompts(name: string, source: string | undefined, hint: string | undefined) {
@@ -930,6 +1083,10 @@ const PARAM_CONTRACT = `{
     "persona": "人设与性格画像（含内在矛盾）",
     "experiences": "关键经历（塑造人格的事件）",
     "relationships": "重要关系",
+    "selfAliases": ["我的其他称呼：译名差异/称号/昵称，如「米卡萨」「耶格尔」「进击的巨人」"],
+    "canonRelations": [
+      {"name":"对方标准名（与人格卡同名）","aliases":["对方其他译名"],"kind":"beloved|kin|sworn_friend|comrade|mentor|sovereign|peer|rival|nemesis|creditor|kin_slayer|unspecified","kindSource":"CS|AR|EM|MP","positivity":0,"negativity":0,"trust":50,"closeness":0,"addressTerm":"我称呼TA用什么","addressKind":"neutral|intimate|honorific|derogatory","basis":"原作依据一句"}
+    ]
     "quotes": ["标志性原话语录，≤5 条"],
     "speechStyle": "语言风格",
     "appearance": "外貌与气质（一段）",
@@ -939,7 +1096,6 @@ const PARAM_CONTRACT = `{
     "socialMask": "社交面具与对外形象",
     "innerWorld": "内心世界与隐秘面",
     "quirks": "习惯与癖好",
-    "essence": "人格精粹（≤500字，给对局注入用的行为指导：核心冲突如何表现为言行/什么会点燃TA/TA怎样说话与隐藏——这是完整档案的实战蒸馏，必须信息密度极高、可直接指导扮演；人物状态同样以当下时间为准：在世取最新状态/已故取终态）",
     "aliveStatus": "alive 或 deceased（判断其在当下时间点的在世状态：在世 alive；已故（含虚构作品中已死亡/结局离世）deceased）",
     "specialAbilities": "特殊能力概述（原作/设定中有超自然/超常能力时写，没有则空串）"
   },
@@ -966,14 +1122,14 @@ function buildQuantifyPrompts(
   const today = new Date().toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" });
   const system = [
     "你是「铸魂师」的人格量化分析师（第三步：整合量化），精通大五人格、依恋理论、黑暗四人格、认知偏差、防御机制、情绪调节（Gross）与自我决定论（SDT）。",
-    "把「研究档案 + 深度人格解读」整合为一张完整的人格参数卡（完整人物档案 + 七组量化参数 + 对局注入专用的人格精粹 + 在世状态 + 特殊能力封印 + 肖像挑选）。",
+    "把「研究档案 + 深度人格解读」整合为一张完整的人格参数卡（完整人物档案 + 七组量化参数 + 在世状态 + 特殊能力封印 + 肖像挑选）。",
     `【时间锚】今天是 ${today}：档案与参数所反映的人物状态必须以当下时间为准（在世取最新状态/已故取终态），不得反映其早年过时形象与经历。`,
     "量化铁律：",
     "1. 全部参数为 0-100 整数；",
     "2. 真情生于撕裂——禁止扁平化：相互冲突的参数必须同时给足强度（如宜人性 25 与马基雅维利 85 并存；神经质 80 与表达抑制 75 并存），内在矛盾是人格的核心，不得调和取舍；",
     "3. 每条参数都要有档案/解读依据；资料不足的字段按心理学原型给出最合理推断，并把参数路径写入 inferred 数组（推断项）；",
     "4. 认知偏差 2-7 条、防御机制 2-7 条（maturity 仅限 primitive/neurotic/mature）；语录必须是人物原话或公认台词；",
-    "5. profile.essence（人格精粹）是整卡最重要的字段：≤500 字、行为指导级——它将被直接注入对局扮演该人格，必须写出 TA 的核心冲突如何变成具体言行、什么情境会点燃 TA、TA 如何说话与隐藏；",
+    "5. **canonRelations（结构化原作关系）是整卡的骨架**：把 profile.relationships 里提到的、对 TA 重要的对象**全部结构化**——name 用对方标准名，aliases 把你知道的其他译名一并列出（如「米卡萨」之于「三笠·阿克曼」），addressTerm 写 TA 平时怎么称呼对方。kind 用受控词表；kindSource 标 RMT 四型；positivity/negativity 是**可并存的**两个维度（爱恨交织即两者都高）；basis 一句原作依据。宁可多列，不要漏掉重要关系；",
     "6. portraitChoice：从【候选肖像】列表里选出最符合人物当下状态（最新形象/终态形象）的一张，输出其原 URL，禁止编造列表之外的 URL；",
     "7. 严格只输出 JSON 本体，禁止任何解释文字与 markdown 围栏。",
   ].join("\n");
@@ -1003,6 +1159,24 @@ const clamp01 = (v: unknown, dflt = 50): number => {
 };
 const asStr = (v: unknown, max: number): string => String(v ?? "").trim().slice(0, max);
 const VALID_MATURITY = new Set(["primitive", "neurotic", "mature"]);
+
+/** 空心草稿判定（2026-10-14 实锤：宿傩草稿参数全 50、语录/偏差/防御全 0——
+ * ③整合输出被截断后档案字段救回、参数段全丢，只查 summary/persona 的空壳校验拦不住）。
+ * 全线默认值（大五全 50 + 依恋双 50 + 黑暗四全 50）且语录/偏差/防御全空 = 参数段丢失。 */
+export function isHollowDraft(draft: PersonaCardInput): boolean {
+  const p = draft.params;
+  const allDefault =
+    Object.values(p.bigFive).every((v) => v === 50) &&
+    p.attachment.anxiety === 50 &&
+    p.attachment.avoidance === 50 &&
+    Object.values(p.darkTetrad).every((v) => v === 50);
+  return (
+    allDefault &&
+    draft.profile.quotes.length === 0 &&
+    p.cognitiveBiases.length === 0 &&
+    p.defenseMechanisms.length === 0
+  );
+}
 
 export function sanitizeCastedDraft(
   raw: Record<string, unknown>,
@@ -1067,7 +1241,30 @@ export function sanitizeCastedDraft(
       socialMask: asStr(prof.socialMask, 2000),
       innerWorld: asStr(prof.innerWorld, 3000),
       quirks: asStr(prof.quirks, 2000),
-      essence: asStr(prof.essence, 1200),
+      // 认知笔记机制已下线（2026-10）：铸造不再生成该字段，恒为空串（字段保留仅为契约兼容）
+      essence: "",
+      selfAliases: Array.isArray(prof.selfAliases)
+        ? (prof.selfAliases as unknown[]).map((x) => asStr(x, 64)).filter(Boolean)
+        : [],
+      canonRelations: Array.isArray(prof.canonRelations)
+        ? (prof.canonRelations as unknown[])
+            .filter((x): x is Record<string, unknown> => typeof x === 'object' && x !== null)
+            .map((r) => ({
+              name: asStr(r.name, 128),
+              aliases: Array.isArray(r.aliases) ? (r.aliases as unknown[]).map((a) => asStr(a, 64)).filter(Boolean) : [],
+              kind: asStr(r.kind, 32) || 'unspecified',
+              kindSource: asStr(r.kindSource, 8) || undefined,
+              positivity: typeof r.positivity === 'number' ? r.positivity : 0,
+              negativity: typeof r.negativity === 'number' ? r.negativity : 0,
+              trust: typeof r.trust === 'number' ? r.trust : 50,
+              closeness: typeof r.closeness === 'number' ? r.closeness : 0,
+              addressTerm: asStr(r.addressTerm, 64) || undefined,
+              addressKind: (['neutral','intimate','honorific','derogatory'] as const).includes(r.addressKind as never)
+                ? (r.addressKind as 'neutral'|'intimate'|'honorific'|'derogatory') : undefined,
+              basis: asStr(r.basis, 300) || undefined,
+            }))
+            .filter((r) => r.name)
+        : [],
       aliveStatus:
         prof.aliveStatus === "alive" || prof.aliveStatus === "deceased" ? prof.aliveStatus : null,
       specialAbilities: asStr(prof.specialAbilities, 1000),
@@ -1122,10 +1319,18 @@ function markAllInferred(draft: PersonaCardInput): PersonaCardInput {
 
 /** 铸造编排选项（向导「分阶段联网开关 + 深读深度」） */
 export interface CastOptions {
-  /** 三阶段各自的联网检索开关（默认全开；模型原生联网 + 服务端证据池双轨） */
   web?: { stage1?: boolean; stage2?: boolean; stage3?: boolean };
   /** 深读深度：segmented=四段分段深挖；selfCritique=自我批判复读（默认双开；快速模式双关） */
   deepRead?: { segmented?: boolean; selfCritique?: boolean };
+  /** 断点续铸（进程中断后从检查点恢复）：有值的阶段直接跳过（产物复用落盘检查点） */
+  resume?: {
+    pool?: EvidencePool;
+    dossier?: string;
+    webSearched?: boolean;
+    offlineReason?: string;
+    reading?: string;
+    downloaded?: (PortraitCandidate & { dataUrl: string })[];
+  };
 }
 
 export async function castPersona(
@@ -1147,27 +1352,48 @@ export async function castPersona(
     selfCritique: opts?.deepRead?.selfCritique !== false,
   };
 
-  // 服务端证据池（模型无关的联网底座；任一阶段开联网即采集；全链 best-effort）
+  const resume = opts?.resume ?? {};
+  // 服务端证据池（模型无关的联网底座；任一阶段开联网即采集；全链 best-effort；续铸时复用落盘检查点）
   await castCheckpoint();
-  stage("搜集公开资料证据池（维基/搜索引擎实搜）");
-  const pool: EvidencePool =
-    web.stage1 || web.stage2 || web.stage3
-      ? await gatherEvidence(name, hint).catch(() => ({ snippets: [], portraitUrls: [] }))
-      : { snippets: [], portraitUrls: [] };
+  let pool: EvidencePool;
+  let dossier: string;
+  let webSearched: boolean;
+  let offlineReason: string | undefined;
+  if (resume.dossier) {
+    // 断点续铸：①已有落盘档案，证据池同复用（无则空池）
+    pool = resume.pool ?? { snippets: [], portraitUrls: [] };
+    dossier = resume.dossier;
+    webSearched = resume.webSearched ?? true;
+    offlineReason = resume.offlineReason;
+  } else {
+    stage("搜集公开资料证据池（维基/搜索引擎实搜）");
+    pool =
+      web.stage1 || web.stage2 || web.stage3
+        ? await gatherEvidence(name, hint).catch(() => ({ snippets: [], portraitUrls: [] }))
+        : { snippets: [], portraitUrls: [] };
+    saveCastCheckpoint("pool", pool);
 
-  // ① 搜集 AI：研究档案（含候选肖像与参考页面 URL；证据池全量注入）
-  await castCheckpoint();
-  stage("① 搜集人物研究档案");
-  const dp = buildDossierPrompts(name, source, hint);
-  const { text: dossier, webSearched, offlineReason } = await callStageAi(searchCfg, dp.system, dp.user, {
-    web: web.stage1,
-    evidence: web.stage1 ? formatEvidence(pool, "full") || undefined : undefined,
-  });
+    // ① 搜集 AI：研究档案（含候选肖像与参考页面 URL；证据池全量注入）
+    await castCheckpoint();
+    stage("① 搜集人物研究档案");
+    const dp = buildDossierPrompts(name, source, hint);
+    const r1 = await callStageAi(searchCfg, dp.system, dp.user, {
+      web: web.stage1,
+      evidence: web.stage1 ? formatEvidence(pool, "full") || undefined : undefined,
+    });
+    dossier = r1.text;
+    webSearched = r1.webSearched;
+    offlineReason = r1.offlineReason;
+    saveCastCheckpoint("dossier", { dossier, webSearched, offlineReason });
+  }
 
   // ② 深读 AI：快速模式=单段式；深度模式=四段分段深挖（并行）→ 合并 → 自我批判复读
+  // 断点续铸：已有落盘成稿则整段跳过
   const reviewEvidence = web.stage2 ? formatEvidence(pool, "review") || undefined : undefined;
   let reading: string;
-  if (deepRead.segmented) {
+  if (resume.reading) {
+    reading = resume.reading;
+  } else if (deepRead.segmented) {
     await castCheckpoint();
     stage("② 分段深读人格（4 专题并行）");
     const parts = await Promise.all(
@@ -1194,12 +1420,13 @@ export async function castPersona(
       await callStageAi(understandCfg, rp.system, rp.user, { web: web.stage2, evidence: reviewEvidence })
     ).text.trim();
   }
-  if (deepRead.selfCritique) {
+  if (!resume.reading && deepRead.selfCritique) { // 续铸成稿已含复读成果，不重跑
     await castCheckpoint();
     stage("② 自我批判复读（揪出无据推测、恢复被调和的冲突）");
     const cp = buildReadingCritiquePrompts(name, dossier, reading);
     reading = (await callStageAi(understandCfg, cp.system, cp.user, { web: false })).text.trim();
   }
+  saveCastCheckpoint("reading", { reading });
 
   // 候选肖像下载（①联网搜取 + 证据池维基代表图合并；③只需挑选，无需上网）
   await castCheckpoint();
@@ -1210,16 +1437,18 @@ export async function castPersona(
     seen.add(c.url);
     return true;
   });
-  const downloaded = (
-    await Promise.all(
-      candidates.slice(0, 4).map(async (c) => ({
-        ...c,
-        dataUrl: await fetchImageAsDataUrl(c.url),
-      })),
-    )
-  ).filter((c): c is PortraitCandidate & { dataUrl: string } => c.dataUrl !== null);
+  const downloaded = resume.downloaded ??
+    ((
+      await Promise.all(
+        candidates.slice(0, 4).map(async (c) => ({
+          ...c,
+          dataUrl: await fetchImageAsDataUrl(c.url),
+        })),
+      )
+    ).filter((c): c is PortraitCandidate & { dataUrl: string } => c.dataUrl !== null));
+  if (!resume.downloaded) saveCastCheckpoint("portraits", downloaded);
 
-  // ③ 整合 AI：①+②+证据锚点 → 完整档案（含人格精粹）+ 七组量化 + 肖像挑选（校验失败重修一次）
+  // ③ 整合 AI：①+②+证据锚点 → 完整档案 + 七组量化 + 肖像挑选（校验失败重修一次）
   await castCheckpoint();
   stage("③ 整合量化人格参数卡");
   const qp = buildQuantifyPrompts(name, dossier, reading, webSearched, downloaded);
@@ -1246,10 +1475,16 @@ export async function castPersona(
       let draft = sanitizeCastedDraft(obj, name);
       if (!webSearched) draft = markAllInferred(draft);
       const check = personaInputSchema.safeParse(draft);
-      // 空壳拦截（实锤：张雪峰一轮合成产出全空 profile 却通过 schema——各字段只有 max 无 min）。
-      // 档案正文两段为空 = 合成失败，按校验未过走重修/重试，绝不让空壳入库
+      // 空壳拦截（实锤：张雪峰一轮合成产出全空 profile 却通过 schema——各字段只有 max 无 min；
+      // 宿傩草稿参数全 50/语录偏差全 0——截断救回档案但丢参数段）。
+      // 档案正文两段为空或参数全线默认 = 合成失败，按校验未过走重修/重试，绝不让空壳入库
       if (check.success && (!draft.profile.summary.trim() || !draft.profile.persona.trim())) {
         lastIssues = "合成产出为空壳（summary/persona 均空）——请基于①档案与②深读真实撰写完整档案";
+        continue;
+      }
+      if (check.success && isHollowDraft(draft)) {
+        lastIssues =
+          "合成产出为空壳（参数全线默认值、语录/偏差/防御全空——参数段疑似丢失）——请真实量化七组参数并写出语录/偏差/防御，禁止全 50 摆烂";
         continue;
       }
       if (check.success) {

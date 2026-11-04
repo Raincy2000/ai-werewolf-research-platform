@@ -32,15 +32,20 @@ import type {
   GameEvent,
   GameSnapshot,
   GameStatus,
+  RoleId,
   WinRateEntry,
 } from '@contracts/game'
+import { BOARDS } from '@contracts/game'
 import type { PersonaReport } from '@contracts/persona'
 import { resolveAnalystAiConfig, useGameApi } from '@/lib/gameApi'
 import { MarkdownBoard } from '@/components/MarkdownBoard'
 import { MvpSvpPanels } from '@/components/game/MvpSvp'
 import { ReportCharts } from '@/components/game/ReportCharts'
 import { ReplayBar } from '@/components/game/ReplayBar'
+import { PersonaThought } from '@/components/game/PersonaThought'
 import { useReplay } from '@/lib/useReplay'
+import { resultViewOf } from '@/lib/replayPresentation'
+import { playersWithEventDeaths } from '@/lib/playerEventState'
 import { downloadGameLogs } from '@/lib/exportLog'
 import { groupEventsIntoSessions, withCurrentSession } from '@/lib/eventSessions'
 import { usePanelFollow } from '@/lib/usePanelFollow'
@@ -73,6 +78,13 @@ import {
 import { EventStream } from '@/components/game/EventStream'
 import { PlayerPanel } from '@/components/game/PlayerPanel'
 import { SeatGrid } from '@/components/game/SeatGrid'
+import { RoleAssignBoard } from '@/components/game/RoleAssignBoard'
+import {
+  assignRole,
+  seatRolesForPlayers,
+  unassignRole,
+  type RoleAssignments,
+} from '@/lib/roleAssignment'
 
 /** 轮询间隔（design/game.md：约 1500ms） */
 const POLL_INTERVAL_MS = 1500
@@ -105,6 +117,105 @@ function isNotFoundError(err: unknown): boolean {
   return /not[- ]?found|不存在|未找到/i.test(message)
 }
 
+/** 权衡条目（独立组件：每行一个折叠状态——hooks 不能进 map 回调）。
+ * 心理活动与对局记录同款慕斯粉卡片（#e0568a）；人格座位的模板心理=涌现正文常显 +
+ * 心镜分析层折叠（默认跟随高级设置 thoughtCollapsed）；技能发动条目=事实层红字不参与折叠 */
+export function SkillThinkRow({
+  e,
+  t0,
+  roleNameOf,
+  thoughtCollapsed,
+}: {
+  e: GameEvent
+  t0?: number | null
+  roleNameOf: (seat: number) => string | null
+  thoughtCollapsed?: boolean
+}) {
+  // 技能发动条目（自爆/决斗/带人）：引擎显式标记 channel=skillFired，加粗红字定位
+  const fired = e.meta?.channel === 'skillFired'
+  // 三标签：身份（如「骑士」「狼人」）+ 思考对象 + 权衡选择（按兵/发动）
+  const skillObject = typeof e.meta?.skillObject === 'string' ? e.meta.skillObject : undefined
+  const roleName = e.actor != null ? roleNameOf(e.actor) : null
+  const personaMeta = (e.meta?.persona ?? null) as import('@contracts/persona').PersonaEventMeta | null
+  const [detailOpen, setDetailOpen] = useState(!thoughtCollapsed)
+  return (
+    <div>
+      <p className="flex flex-wrap items-center gap-1.5 text-xs">
+        {elapsedLabel(t0, e.createdAt) ? (
+          <span className="font-mono text-[10px] text-muted-foreground/70" title="距对局开始的经过时间">
+            {elapsedLabel(t0, e.createdAt)}
+          </span>
+        ) : null}
+        <span className={fired ? 'font-bold text-wolf' : 'font-medium text-foreground'}>
+          {e.actorLabel ?? `${e.actor}号玩家`}
+        </span>
+        {roleName ? (
+          <span
+            className={cn(
+              'rounded border px-1 py-0.5 text-[10px] leading-none',
+              fired
+                ? 'border-wolf/50 bg-wolf/10 font-bold text-wolf'
+                : 'border-border bg-secondary text-secondary-foreground',
+            )}
+          >
+            {roleName}
+          </span>
+        ) : null}
+        {skillObject ? (
+          <span
+            className={cn(
+              'rounded border px-1 py-0.5 text-[10px] leading-none',
+              fired
+                ? 'border-wolf/50 bg-wolf/10 font-bold text-wolf'
+                : 'border-border bg-muted text-muted-foreground',
+            )}
+          >
+            {skillObject}
+          </span>
+        ) : null}
+        {fired ? (
+          <span className="rounded border border-wolf/50 bg-wolf/10 px-1 py-0.5 text-[10px] font-bold leading-none text-wolf">
+            发动
+          </span>
+        ) : (
+          <span className="rounded border border-border px-1 py-0.5 text-[10px] leading-none text-muted-foreground">
+            按兵
+          </span>
+        )}
+        {fired ? <span className="break-words font-bold text-wolf">{e.content}</span> : null}
+      </p>
+      {e.thought ? (
+        personaMeta ? (
+          <div className="mt-1 rounded-md border border-[#e0568a]/30 bg-[#e0568a]/[0.06] px-2 py-1.5">
+            <button
+              type="button"
+              onClick={() => setDetailOpen((v) => !v)}
+              aria-expanded={detailOpen}
+              className="flex items-center gap-1 text-[11px] font-medium text-[#e0568a] hover:underline underline-offset-2"
+            >
+              <Brain className="h-3 w-3" aria-hidden />
+              心镜 · 权衡心理（仅观察者可见）
+              <ChevronDown className={cn('h-3 w-3 transition-transform', detailOpen && 'rotate-180')} aria-hidden />
+            </button>
+            <div className="mt-1">
+              <PersonaThought thought={e.thought} persona={personaMeta} mode="emergence" />
+              {detailOpen ? (
+                <div className="mt-1.5 border-t border-[#e0568a]/20 pt-1.5">
+                  <PersonaThought thought={e.thought} persona={personaMeta} mode="detail" />
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : (
+          <p className="mt-1 whitespace-pre-wrap break-words rounded-md border border-[#e0568a]/30 bg-[#e0568a]/[0.06] px-2 py-1.5 text-xs italic leading-5 text-[#d64d7f]">
+            {e.thought}
+          </p>
+        )
+      ) : null}
+    </div>
+  )
+}
+
 /** 白日主动技能的发动权衡记录：持有白天主动技能的角色的实时心理活动。
  * 与对局记录同款时段标签页（第N日）；吸底跟随（共享机制）；
  * 最新标签呼吸灯：有角色正在权衡思考时红色呼吸，否则灰色静止；
@@ -120,6 +231,7 @@ function SkillThinkPanel({
   shrink,
   fitBanner,
   t0,
+  thoughtCollapsed,
 }: {
   events: GameEvent[]
   live: boolean
@@ -139,6 +251,8 @@ function SkillThinkPanel({
   fitBanner?: boolean
   /** 对局总计时起点（epoch ms）：每条权衡记录旁附距开始的经过时间 */
   t0?: number | null
+  /** 心理活动默认收起（高级设置；收起时涌现正文仍常显，只收心镜分析层） */
+  thoughtCollapsed?: boolean
 }) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const getViewport = () =>
@@ -274,77 +388,15 @@ function SkillThinkPanel({
               </p>
             ) : null}
             <div className="space-y-2.5 p-2.5">
-              {activeSession?.events.map((e) => {
-                // 技能发动条目（自爆/决斗/带人）：引擎显式标记 channel=skillFired，加粗红字定位
-                const fired = e.meta?.channel === 'skillFired'
-                // 三标签：身份（如「骑士」「狼人」）+ 思考对象 + 权衡选择（按兵/发动）
-                const skillObject =
-                  typeof e.meta?.skillObject === 'string' ? e.meta.skillObject : undefined
-                const roleName = e.actor != null ? roleNameOf(e.actor) : null
-                return (
-                  <div key={e.seq}>
-                    <p className="flex flex-wrap items-center gap-1.5 text-xs">
-                      {elapsedLabel(t0, e.createdAt) ? (
-                        <span
-                          className="font-mono text-[10px] text-muted-foreground/70"
-                          title="距对局开始的经过时间"
-                        >
-                          {elapsedLabel(t0, e.createdAt)}
-                        </span>
-                      ) : null}
-                      <span
-                        className={fired ? 'font-bold text-wolf' : 'font-medium text-foreground'}
-                      >
-                        {e.actorLabel ?? `${e.actor}号玩家`}
-                      </span>
-                      {roleName ? (
-                        <span
-                          className={cn(
-                            'rounded border px-1 py-0.5 text-[10px] leading-none',
-                            fired
-                              ? 'border-wolf/50 bg-wolf/10 font-bold text-wolf'
-                              : 'border-border bg-secondary text-secondary-foreground',
-                          )}
-                        >
-                          {roleName}
-                        </span>
-                      ) : null}
-                      {skillObject ? (
-                        <span
-                          className={cn(
-                            'rounded border px-1 py-0.5 text-[10px] leading-none',
-                            fired
-                              ? 'border-wolf/50 bg-wolf/10 font-bold text-wolf'
-                              : 'border-border bg-muted text-muted-foreground',
-                          )}
-                        >
-                          {skillObject}
-                        </span>
-                      ) : null}
-                      {fired ? (
-                        <span className="rounded border border-wolf/50 bg-wolf/10 px-1 py-0.5 text-[10px] font-bold leading-none text-wolf">
-                          发动
-                        </span>
-                      ) : (
-                        <span className="rounded border border-border px-1 py-0.5 text-[10px] leading-none text-muted-foreground">
-                          按兵
-                        </span>
-                      )}
-                      {fired ? <span className="break-words font-bold text-wolf">{e.content}</span> : null}
-                    </p>
-                    {e.thought ? (
-                      <p
-                        className={cn(
-                          'mt-0.5 whitespace-pre-wrap break-words text-xs leading-5',
-                          fired ? 'font-bold text-wolf' : 'text-muted-foreground',
-                        )}
-                      >
-                        {e.thought}
-                      </p>
-                    ) : null}
-                  </div>
-                )
-              })}
+              {activeSession?.events.map((e) => (
+                <SkillThinkRow
+                  key={e.seq}
+                  e={e}
+                  t0={t0}
+                  roleNameOf={roleNameOf}
+                  thoughtCollapsed={thoughtCollapsed}
+                />
+              ))}
             </div>
           </ScrollArea>
         </Tabs>
@@ -399,20 +451,21 @@ function StatusDot({ status }: { status: GameStatus }) {  if (status === 'runnin
   )
 }
 
-/** 总计时：从点击「开始对局」起（mm:ss / h:mm:ss）；终局后冻结在最后一条事件时刻 */
-function GameElapsed({ t0, frozenAt }: { t0: number; frozenAt: number | null }) {
+/** 总计时：服务端累计值 + 当前运行区间内的本地平滑展示；暂停/终止立即冻结。 */
+function GameElapsed({ elapsedMs, running, syncedAt }: { elapsedMs: number; running: boolean; syncedAt: number }) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
-    if (frozenAt != null) return
+    if (!running) return
     const t = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(t)
-  }, [frozenAt])
+  }, [running])
+  const currentMs = elapsedMs + (running ? Math.max(0, now - syncedAt) : 0)
   return (
     <span
       className="font-mono text-xs text-muted-foreground"
-      title="从点击开始对局起的总计时"
+      title="开始、暂停、继续与终止共享的累计对局计时"
     >
-      总计时 {formatElapsed(((frozenAt ?? now) - t0) / 1000)}
+      总计时 {formatElapsed(currentMs / 1000)}
     </span>
   )
 }
@@ -433,6 +486,9 @@ export default function GameRoom() {
   const [actionError, setActionError] = useState<string | null>(null)
   const [busy, setBusy] = useState<'control' | 'export' | 'postgame' | 'psyCheck' | null>(null)
   const [selectedSeat, setSelectedSeat] = useState<number | null>(null)
+  // 手动角色分配仅保存在客户端；点击开始时一次性提交完整 seatRoles
+  const [roleAssignments, setRoleAssignments] = useState<RoleAssignments>({})
+  const [draggedRole, setDraggedRole] = useState<{ role: RoleId; fromSeat?: number } | null>(null)
   // 分析报告：任务状态 / 当前阶段 / 报告全文 / 查看弹窗 / 手动触发中的提示
   const [jobStatus, setJobStatus] = useState<AnalysisJobStatus>('idle')
   const [jobStage, setJobStage] = useState<AnalysisJobStage>(null)
@@ -440,7 +496,7 @@ export default function GameRoom() {
   const [reportOpen, setReportOpen] = useState(false)
   const [analysisMsg, setAnalysisMsg] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
-  // 人格研究库：心理检查报告（手动开启：分出胜负后顶栏「开始心理检查」启动；打开弹窗时刷新）
+  // 人格研究站：心理检查报告（手动开启：分出胜负后顶栏「开始心理检查」启动；打开弹窗时刷新）
   const [personaReports, setPersonaReports] = useState<PersonaReport[] | null>(null)
   // 心理检查进度（poll 透出）：逐座位 pending/running/done——驱动按钮文案与座位紫圈
   const [psyCheckSeats, setPsyCheckSeats] = useState<
@@ -526,6 +582,16 @@ export default function GameRoom() {
   // 历史事故：intervalMs 曾作为 state 放进轮询 effect 依赖，间隔一切换就整体重置
   // （snapshot→null→间隔再变→再重置），形成乒乓死循环，页面永远「正在连接对局…」
   const intervalMsRef = useRef(POLL_INTERVAL_MS)
+  const pollStatus = snapshot?.status
+  // pollStatus 走 ref 供轮询循环读取：绝不能把它放进轮询 effect 依赖——
+  // 首轮 poll 返回后 pollStatus 变化会重置整个 effect（snapshot→null→再变→再重置），
+  // 历史重演两次的乒乓死循环，页面永远「正在连接对局…」（2026-10-15 实锤其二）
+  const pollStatusRef = useRef(pollStatus)
+  useEffect(() => {
+    pollStatusRef.current = pollStatus
+    intervalMsRef.current =
+      pollStatus === 'running' ? POLL_INTERVAL_MS : pollStatus === 'paused' ? 4000 : 8000
+  }, [pollStatus])
   const seenSeqRef = useRef<Set<number>>(new Set())
   const inFlightRef = useRef(false)
   const inFlightSinceRef = useRef(0)
@@ -641,6 +707,8 @@ export default function GameRoom() {
     setNotFound(false)
     setUnauthorized(false)
     setSelectedSeat(null)
+    setRoleAssignments({})
+    setDraggedRole(null)
     setActionError(null)
     setJobStatus('idle')
     setJobStage(null)
@@ -657,9 +725,13 @@ export default function GameRoom() {
     let alive = true
     let timer = 0
     const loop = async () => {
-      await pollOnce()
+      // 功耗纪律（2026-10-15 优化专项）：标签页隐藏且对局非运行态时，轮询降为 15s 心跳
+      //（后台空转轮询是笔记本电量的隐性杀手；运行中对局保持原节奏——服务端在推进，
+      //  回前台由 visibilitychange 即刻补拉追平，不会错过来电）
+      const hiddenIdle = document.hidden && pollStatusRef.current !== 'running'
+      if (!hiddenIdle) await pollOnce()
       if (!alive) return
-      timer = window.setTimeout(() => void loop(), intervalMsRef.current)
+      timer = window.setTimeout(() => void loop(), hiddenIdle ? 15_000 : intervalMsRef.current)
     }
     void loop()
     return () => {
@@ -695,11 +767,7 @@ export default function GameRoom() {
 
   // 自适应轮询间隔：运行中高频、暂停降频、终局低频（减少无意义空转）
   // 只写 ref，不触发任何重渲染/ effect 重跑
-  const pollStatus = snapshot?.status
-  useEffect(() => {
-    intervalMsRef.current =
-      pollStatus === 'running' ? POLL_INTERVAL_MS : pollStatus === 'paused' ? 4000 : 8000
-  }, [pollStatus])
+
 
   // 赛后讨论：分出胜负后服务层在 postgameSpeak 待决处挂起（paused），
   // 顶栏「开启赛后讨论」按钮按下即开始生成（专用通道 startPostGame，与继续键职责分离）；
@@ -773,6 +841,20 @@ export default function GameRoom() {
   const handleSelectSeat = useCallback((seat: number) => {
     setSelectedSeat((prev) => (prev === seat ? null : seat))
   }, [])
+  const handleRoleDragStart = useCallback((role: RoleId, fromSeat?: number) => {
+    setDraggedRole({ role, fromSeat })
+  }, [])
+  const handleRoleDrop = useCallback((seat: number) => {
+    if (!draggedRole) return
+    setRoleAssignments((current) => assignRole(current, seat, draggedRole.role, draggedRole.fromSeat))
+    setDraggedRole(null)
+  }, [draggedRole])
+  const handleRoleTableDrop = useCallback(() => {
+    if (draggedRole?.fromSeat !== undefined) {
+      setRoleAssignments((current) => unassignRole(current, draggedRole.fromSeat!))
+    }
+    setDraggedRole(null)
+  }, [draggedRole])
 
   /** 手动触发分析：分析师配置取 localStorage（大厅「分析师配置」卡片写入） */
   async function handleGenerateAnalysis() {
@@ -799,7 +881,17 @@ export default function GameRoom() {
     setBusy('control')
     setActionError(null)
     try {
-      await api.controlGame(gameId, action)
+      let seatRoles: RoleId[] | undefined
+      const studyAlreadyComplete = Boolean(study && study.total > 0 && study.done >= study.total)
+      const assigningBeforeStart = snapshot?.status === 'created' && !study?.studying && !studyAlreadyComplete
+      if (action === 'start' && assigningBeforeStart && snapshot?.manualRoleAssignEnabled) {
+        const board = BOARDS.find((item) => item.id === snapshot.boardId)
+        seatRoles = board
+          ? seatRolesForPlayers(board.roles, roleAssignments, snapshot.players.map((player) => player.seat)) ?? undefined
+          : undefined
+        if (!seatRoles) throw new Error('请先把版型中的全部角色分配到对应座位')
+      }
+      await api.controlGame(gameId, action, seatRoles)
       // 总计时起点：首次点击「开始/启动对局」时记录（暂停恢复不重置）
       if (action === 'start') {
         try {
@@ -818,6 +910,7 @@ export default function GameRoom() {
   }
 
   // 开启赛后讨论（专用通道 startPostGame，不与继续键重合）：
+  // 复盘前置仅由服务端核验报告与认知指南是否就绪，无需用户查看报告。
   // 挂起待开始 → 直接恢复生成；已结束旧对局 → 决策日志重放续跑
   async function handleStartPostGame() {
     if (busy) return
@@ -907,19 +1000,8 @@ export default function GameRoom() {
   // 回放可用性（控制器本体在上方 hook 区；这里只做派生计算）
   const replayAvailable = events.length > 0 && status !== 'running'
   const visibleEvents = replay.active ? events.slice(0, replay.cursorIdx) : events
-  // 回放态座位重构：死亡信息按游标处事件流推导（角色/警长沿用快照）
-  const displayPlayers = (() => {
-    if (!replay.active) return snapshot.players
-    const deaths = new Map<number, string>()
-    for (const e of visibleEvents) {
-      if (e.type === 'death' && e.actor != null) deaths.set(e.actor, `第${e.day}天 · ${e.title}`)
-    }
-    return snapshot.players.map((p) =>
-      deaths.has(p.seat)
-        ? { ...p, alive: false, deathInfo: deaths.get(p.seat)! }
-        : { ...p, alive: true, deathInfo: null },
-    )
-  })()
+  // 座位统一按当前可见事件重建：无论是否回放，陈旧快照都不能把出局玩家复活
+  const displayPlayers = playersWithEventDeaths(snapshot.players, visibleEvents)
   const selectedPlayer = displayPlayers.find((p) => p.seat === selectedSeat) ?? null
   const alivePlayers = displayPlayers.filter((p) => p.alive)
   // 回放游标处的时段（驱动事件流标签页跟随）
@@ -945,16 +1027,25 @@ export default function GameRoom() {
   // 赛后讨论待开始：paused 且停在 postgame（分出胜负后挂起）
   const postGameHeld = status === 'paused' && snapshot.phase.startsWith('postgame')
 
-  // 比赛结果出现（分出胜负或对局结束）后：继续/暂停与终止按钮消失
-  const resultShown = snapshot.winner !== null || status === 'finished'
+  // 比赛结果与座位必须共用同一时间线：回放只显示游标已揭示的结局，不提前套最终快照
+  const replayResult = replay.active ? resultViewOf(visibleEvents) : null
+  const displayWinner = replay.active ? replayResult!.winner : snapshot.winner
+  const resultShown = replay.active ? replayResult!.showResult : snapshot.winner !== null || status === 'finished'
+  const manualSetup = status === 'created' && snapshot.manualRoleAssignEnabled === true
+  const studyComplete = Boolean(study && study.total > 0 && study.done >= study.total)
+  const showRoleAssignBoard = manualSetup && !study?.studying && !studyComplete
+  const boardRoles = BOARDS.find((board) => board.id === snapshot.boardId)?.roles ?? []
+  const completeSeatRoles = manualSetup
+    ? seatRolesForPlayers(boardRoles, roleAssignments, snapshot.players.map((player) => player.seat))
+    : null
+  const roleAssignmentComplete = !showRoleAssignBoard || completeSeatRoles !== null
 
-  // 暂停原因提示（「继续」按钮旁）：快照透出优先；进程重启后回落到事件流的最后一条
-  // 「AI 额度耗尽」事件（pauseReason 是内存态，重启后由落库事件兜底）
+  // 暂停原因提示（「继续」按钮旁的黄色小字框）：只取快照透出的真实异常原因
+  // （额度耗尽/服务中断等系统级暂停）；手动暂停与重启后的陈旧事件一律不显示
+  // （2026-10-15 用户裁定：事件流兜底曾让手动暂停也挂出「token不足」旧账——已撤）
   const pauseHint = (() => {
     if (status !== 'paused') return null
-    if (snapshot.pauseReason) return snapshot.pauseReason
-    const lastQuotaEvent = events.filter((e) => e.title === 'AI 额度耗尽' || e.title === 'AI 服务中断').at(-1)
-    return lastQuotaEvent ? lastQuotaEvent.content : null
+    return snapshot.pauseReason ?? null
   })()
 
   const controlButton =
@@ -976,14 +1067,15 @@ export default function GameRoom() {
       <Button
         size="sm"
         onClick={() => void handleControl('start')}
-        disabled={busy !== null}
+        disabled={busy !== null || !roleAssignmentComplete}
+        title={!roleAssignmentComplete ? '请先为每个座位分配角色' : undefined}
       >
         {busy === 'control' ? (
           <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
         ) : (
           <Play className="h-4 w-4" aria-hidden />
         )}
-        {status === 'created' ? '启动' : '继续'}
+        {manualSetup ? '角色分配完成，开始对局' : status === 'created' ? '启动' : '继续'}
       </Button>
     )
 
@@ -1103,22 +1195,49 @@ export default function GameRoom() {
 
   // 赛后讨论按钮（顶栏，与继续/暂停键职责完全分离）：
   // 待开始（挂起/旧对局补开）→「开启赛后讨论」（专用通道 startPostGame）；
-  // 生成中 →「终止赛后发言」（control stopPostGame，停止赛后循环，胜负结果不受影响）；
+  // 生成中 →「暂停赛后讨论」（control pause，决策挂起随时继续）+「终止赛后发言」；
+  // 暂停于讨论中 →「继续赛后讨论」（control start）；
   // 已生成 →「查看赛后发言」（对局记录切到「赛后发言」时间标签并滚动到位）
+  const postGamePausedMid = postGameHeld && postGameEvents.length > 0
   const postGameButton = !postGameAvailable ? null : postGameRunning ? (
+    <>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => void handleControl('pause')}
+        disabled={busy !== null}
+      >
+        {busy === 'control' ? (
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+        ) : (
+          <Pause className="h-4 w-4" aria-hidden />
+        )}
+        暂停赛后讨论
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        className="border-wolf/40 text-wolf hover:bg-wolf/10 hover:text-wolf"
+        onClick={() => void handleControl('stopPostGame')}
+        disabled={busy !== null}
+      >
+        <OctagonX className="h-4 w-4" aria-hidden />
+        终止赛后发言
+      </Button>
+    </>
+  ) : postGamePausedMid ? (
     <Button
       size="sm"
       variant="outline"
-      className="border-wolf/40 text-wolf hover:bg-wolf/10 hover:text-wolf"
-      onClick={() => void handleControl('stopPostGame')}
+      onClick={() => void handleControl('start')}
       disabled={busy !== null}
     >
       {busy === 'control' ? (
         <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
       ) : (
-        <OctagonX className="h-4 w-4" aria-hidden />
+        <Play className="h-4 w-4" aria-hidden />
       )}
-      终止赛后发言
+      继续赛后讨论
     </Button>
   ) : postGameEvents.length === 0 || postGameHeld ? (
     <Button
@@ -1176,17 +1295,12 @@ export default function GameRoom() {
               <StatusDot status={status} />
               {statusLabelOf(status, snapshot.winner)}
             </span>
-            {/* 总计时：从点击开始对局起；未启动（且未在赛前学习）不显示；终局冻结 */}
-            {gameT0 != null && (status !== 'created' || study?.studying) ? (
+            {/* 总计时：服务端持久化累计值；未开始不显示，暂停/终止立即冻结 */}
+            {(snapshot.elapsedMs ?? 0) > 0 || snapshot.timerRunning ? (
               <GameElapsed
-                t0={gameT0}
-                frozenAt={
-                  status === 'finished'
-                    ? events.length > 0
-                      ? Date.parse(events[events.length - 1].createdAt)
-                      : Date.now()
-                    : null
-                }
+                elapsedMs={snapshot.elapsedMs ?? 0}
+                running={snapshot.timerRunning === true}
+                syncedAt={snapshot.timingSyncedAt ?? Date.now()}
               />
             ) : null}
             {/* 对局回放入口（非运行中即可）：点击后控制条在下方独立一栏展开 */}
@@ -1261,20 +1375,20 @@ export default function GameRoom() {
             <div
               className={cn(
                 'flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border px-4 py-3',
-                snapshot.winner === 'wolf'
+                displayWinner === 'wolf'
                   ? 'border-wolf/40 bg-wolf/5'
-                  : snapshot.winner === 'good'
+                  : displayWinner === 'good'
                     ? 'border-amber-400/50 bg-amber-400/10'
                     : 'border-border bg-muted/40',
               )}
             >
-              {snapshot.winner === null ? (
+              {displayWinner === null ? (
                 <OctagonX className="h-5 w-5 text-muted-foreground" aria-hidden />
               ) : (
                 <Trophy
                   className={cn(
                     'h-5 w-5',
-                    snapshot.winner === 'wolf' ? 'text-wolf' : 'text-amber-500',
+                    displayWinner === 'wolf' ? 'text-wolf' : 'text-amber-500',
                   )}
                   aria-hidden
                 />
@@ -1282,16 +1396,16 @@ export default function GameRoom() {
               <span
                 className={cn(
                   'text-base font-semibold',
-                  snapshot.winner === 'wolf'
+                  displayWinner === 'wolf'
                     ? 'text-wolf'
-                    : snapshot.winner === 'good'
+                    : displayWinner === 'good'
                       ? 'text-amber-600 dark:text-amber-400'
                       : 'text-muted-foreground',
                 )}
               >
-                {snapshot.winner === 'wolf'
+                {displayWinner === 'wolf'
                   ? '狼人阵营胜利'
-                  : snapshot.winner === 'good'
+                  : displayWinner === 'good'
                     ? '神民阵营胜利'
                     : '对局已手动终止'}
               </span>
@@ -1310,8 +1424,8 @@ export default function GameRoom() {
             </div>
           ) : null}
 
-          {/* created：中央大按钮启动对局（开启图书馆时，启动后先进入赛前学习） */}
-          {status === 'created' ? (
+          {/* created：中央大按钮启动对局（开启赛前学习时，启动后先完成所选材料学习） */}
+          {status === 'created' && !showRoleAssignBoard ? (
             <div className="flex flex-col items-center gap-3 rounded-lg border border-border bg-card px-6 py-12 text-center">
               {study?.studying ? (
                 <>
@@ -1320,7 +1434,7 @@ export default function GameRoom() {
                   </p>
                   <p className="flex items-center gap-2 text-sm text-muted-foreground">
                     <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                    各座位正在选读图书馆资料并写下学习心得——点击座位可查看学习详情，
+                    各座位正在研读所选的历史、指南或图书馆材料并形成心得——点击座位可查看学习详情，
                     全部学完后自动开赛进入黑夜
                   </p>
                 </>
@@ -1328,7 +1442,7 @@ export default function GameRoom() {
                 <>
                   <p className="text-lg font-semibold text-foreground">赛前学习完毕</p>
                   <p className="text-sm text-muted-foreground">
-                    {study.total} 个座位均已完成图书馆学习（点击座位可回看各 AI 的学习心得）
+                    {study.total} 个座位均已完成赛前学习（点击座位可回看各 AI 的学习心得）
                   </p>
                   <Button
                     size="lg"
@@ -1349,7 +1463,7 @@ export default function GameRoom() {
                   <p className="text-lg font-semibold text-foreground">对局已创建，尚未启动</p>
                   <p className="text-sm text-muted-foreground">
                     {snapshot.boardName} · {snapshot.players.length} 个座位 · 角色已分配
-                    {study ? '；本局开启图书馆：开始后各座位先进行赛前学习，学完自动进入黑夜' : '，启动后引擎将逐步自动推演'}
+                    {study ? '；本局开启赛前学习：开始后各座位先学习所选材料，学完自动进入黑夜' : '，启动后引擎将逐步自动推演'}
                   </p>
                   <Button
                     size="lg"
@@ -1370,14 +1484,7 @@ export default function GameRoom() {
           ) : null}
 
           {/* 三栏布局：左座位+玩家详情 / 中事件流 / 右技能权衡 */}
-          {/* 暂停原因横幅（额度不足等需用户处理的暂停）：整宽醒目展示，
-              与「继续」按钮旁的短提示同源——杜绝用户没注意到提示就误操作（20261011002 实锤） */}
-          {pauseHint ? (
-            <div className="mb-4 flex items-start gap-2.5 rounded-xl border border-amber-500/50 bg-amber-500/10 px-4 py-3">
-              <CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
-              <div className="text-sm leading-6 text-amber-700 dark:text-amber-300">{pauseHint}</div>
-            </div>
-          ) : null}
+          {/*（暂停原因大横幅已按用户裁定撤除：提示只保留「继续」按钮旁的黄色小字框）*/}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
             {/* 左栏：圆桌座位区 + 玩家详情（座位框下方） */}
             <section className="lg:col-span-4">
@@ -1400,6 +1507,10 @@ export default function GameRoom() {
                   ]}
                   selectedSeat={selectedSeat}
                   onSelect={handleSelectSeat}
+                  manualRoleAssignEnabled={showRoleAssignBoard}
+                  roleAssignments={roleAssignments}
+                  onRoleDragStart={handleRoleDragStart}
+                  onRoleDrop={handleRoleDrop}
                 />
               </div>
               <div className="mt-4">
@@ -1410,6 +1521,7 @@ export default function GameRoom() {
                   studyNote={selectedSeat != null ? (studyNotes[selectedSeat] ?? null) : null}
                   studying={selectedSeat != null && (snapshot.studyingSeats ?? []).includes(selectedSeat)}
                   t0={gameT0}
+                  thoughtCollapsed={snapshot.thoughtCollapsed === true}
                 />
               </div>
               {/* 日夜交替停歇倒计时框（全场概览下方；仅在交替停歇期间出现，平时消失） */}
@@ -1424,29 +1536,67 @@ export default function GameRoom() {
               ) : null}
             </section>
 
-            {/* 中栏：对局事件流（只追加，自动吸底；赛后发言以「赛后发言」时间标签并入） */}
+            {/* 中栏：手动创建时为角色牌桌；其他阶段保持原对局事件流 */}
             <section className="lg:col-span-5" ref={recordSectionRef}>
-              <h2 className="mb-2 text-sm font-semibold text-foreground">
-                对局记录
-                <span className="ml-2 font-mono text-xs font-normal text-muted-foreground">
-                  {streamEvents.length} 条
-                </span>
-              </h2>
-              <EventStream
-                events={streamEvents}
-                className={cn(
-                  'min-h-[340px]',
-                  resultShown ? 'h-[calc(100dvh-360px)]' : 'h-[calc(100dvh-292px)]',
-                )}
-                live={status === 'running' && !replay.active}
-                currentDay={replay.active && cursorEvent ? cursorEvent.day : snapshot.day}
-                currentPhase={replay.active && cursorEvent ? cursorEvent.phase : snapshot.phase}
-                phaseBreaking={snapshot.phaseBreaking}
-                focusSessionKey={recordFocusKey}
-                onFocusHandled={() => setRecordFocusKey(null)}
-                t0={gameT0}
-                highlightSeq={highlightSeq}
-              />
+              {showRoleAssignBoard ? (
+                <>
+                  <h2 className="mb-2 text-sm font-semibold text-foreground">
+                    手动分配角色
+                    <span className="ml-2 font-mono text-xs font-normal text-muted-foreground">
+                      {Object.keys(roleAssignments).length}/{snapshot.players.length} 已分配
+                    </span>
+                  </h2>
+                  <RoleAssignBoard
+                    boardRoles={boardRoles}
+                    assignments={roleAssignments}
+                    onRoleDragStart={handleRoleDragStart}
+                    onRoleDrop={handleRoleTableDrop}
+                  />
+                  <div className="mt-4 flex flex-col items-center gap-2">
+                    <Button
+                      size="lg"
+                      className="px-8 text-base"
+                      onClick={() => void handleControl('start')}
+                      disabled={busy !== null || !roleAssignmentComplete}
+                    >
+                      {busy === 'control' ? (
+                        <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
+                      ) : (
+                        <Play className="h-5 w-5" aria-hidden />
+                      )}
+                      角色分配完成，开始对局
+                    </Button>
+                    {!roleAssignmentComplete ? (
+                      <p className="text-xs text-muted-foreground">全部分配完成后才能开始对局</p>
+                    ) : null}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <h2 className="mb-2 text-sm font-semibold text-foreground">
+                    对局记录
+                    <span className="ml-2 font-mono text-xs font-normal text-muted-foreground">
+                      {streamEvents.length} 条
+                    </span>
+                  </h2>
+                  <EventStream
+                    events={streamEvents}
+                    className={cn(
+                      'min-h-[340px]',
+                      resultShown ? 'h-[calc(100dvh-360px)]' : 'h-[calc(100dvh-292px)]',
+                    )}
+                    live={status === 'running' && !replay.active}
+                    currentDay={replay.active && cursorEvent ? cursorEvent.day : snapshot.day}
+                    currentPhase={replay.active && cursorEvent ? cursorEvent.phase : snapshot.phase}
+                    phaseBreaking={snapshot.phaseBreaking}
+                    focusSessionKey={recordFocusKey}
+                    onFocusHandled={() => setRecordFocusKey(null)}
+                    t0={gameT0}
+                    highlightSeq={highlightSeq}
+                    thoughtCollapsed={snapshot.thoughtCollapsed === true}
+                  />
+                </>
+              )}
 
               {/* 胜率推测面板（仅本局开启时显示）：默认折叠（胜率条 + 阵营-胜率文本），
                   点击「变动理由」展开/收起；点击下方阵营文本筛选该方胜率上升理由（选中文本加粗，
@@ -1592,6 +1742,7 @@ export default function GameRoom() {
                 phaseBreaking={snapshot.phaseBreaking}
                 fitBanner={resultShown}
                 t0={gameT0}
+                thoughtCollapsed={snapshot.thoughtCollapsed === true}
               />
             </section>
           </div>

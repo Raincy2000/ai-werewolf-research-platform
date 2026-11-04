@@ -24,8 +24,9 @@ describe("accumulateResponsesStream（Responses API 流）", () => {
       "data: [DONE]\n\n",
     ]);
     const seen: string[] = [];
-    const text = await accumulateResponsesStream(res, (t) => seen.push(t));
-    expect(text).toBe("你好");
+    const out = await accumulateResponsesStream(res, (t) => seen.push(t));
+    expect(out.text).toBe("你好");
+    expect(out.searched).toBe(false);
     expect(seen).toEqual(["你", "你好"]);
   });
 
@@ -35,7 +36,7 @@ describe("accumulateResponsesStream（Responses API 流）", () => {
       'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"完整文本"}]}]}}\n\n',
       "data: [DONE]\n\n",
     ]);
-    expect(await accumulateResponsesStream(res)).toBe("完整文本");
+    expect((await accumulateResponsesStream(res)).text).toBe("完整文本");
   });
 
   it("response.failed / error 事件抛错", async () => {
@@ -47,13 +48,29 @@ describe("accumulateResponsesStream（Responses API 流）", () => {
     await expect(accumulateResponsesStream(err)).rejects.toThrow("流中断");
   });
 
-  it("联网检索中的 web_search_call 等非文本事件被忽略", async () => {
+  it("联网检索中的 web_search_call 事件被实证捕获（不再假装搜过）", async () => {
     const res = sseResponse([
       'data: {"type":"response.output_item.added","item":{"type":"web_search_call"}}\n\n',
       'data: {"type":"response.web_search_call.searching"}\n\n',
+      'data: {"type":"response.web_search_call.completed"}\n\n',
       'data: {"type":"response.output_text.delta","delta":"答"}\n\n',
       "data: [DONE]\n\n",
     ]);
-    expect(await accumulateResponsesStream(res)).toBe("答");
+    const out = await accumulateResponsesStream(res);
+    expect(out.text).toBe("答");
+    // ★ 关键：searched 必须为 true——这正是之前被漏掉的判据
+    expect(out.searched).toBe(true);
+    expect(out.searchCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it("未发生 search 的流：searched 必须为 false", async () => {
+    const res = sseResponse([
+      'data: {"type":"response.output_text.delta","delta":"没搜也能答"}\n\n',
+      "data: [DONE]\n\n",
+    ]);
+    const out = await accumulateResponsesStream(res);
+    expect(out.text).toBe("没搜也能答");
+    expect(out.searched).toBe(false);
+    expect(out.searchCount).toBe(0);
   });
 });

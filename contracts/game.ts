@@ -25,10 +25,15 @@ export interface AdvancedOptions {
   speechRoundsLimit: number;  // 白天发言轮数上限（默认 2）
   postGameDiscuss?: boolean;  // 赛后讨论环节开关（引擎默认关：不传=关闭；前端 UI 默认开）
   postGameAutoStart?: boolean; // 赛后自动开始讨论（默认 false=分出胜负后挂起，等用户手动开启；true=径直生成）
+  postGameReviewFirst?: boolean; // 附属赛后讨论：报告与认知指南均就绪后才允许进入，无需用户查看报告
   postGameSpeechLimit?: number; // 每玩家赛后最多发言机会（默认 5，1-10；skip 弃权不消耗）
   aiTimeLimitSec?: number;    // AI 单决策总时限（秒，下限 120；0/缺省=不限制——单次调用 90s 超时仍生效；DeepSeek 思考模式自动放宽至 260s 下限，思考链耗时长，过紧只会批量超时托管）
-  libraryEnabled?: boolean;   // 赛前图书馆学习（开局前各座位 AI 先自主学习图书馆资料形成心得，学完才开赛）
+  libraryEnabled?: boolean;   // 赛前学习总开关（开局前各座位 AI 先学习所选材料形成心得，学完才开赛）
+  studyHistoryEnabled?: boolean; // 学习来源：历史对局（缺省 false）
+  studyGuideEnabled?: boolean;   // 学习来源：经验指南（缺省 false）
+  studyLibraryEnabled?: boolean; // 学习来源：图书馆（缺省 true，保持旧配置行为）
   libraryMaxSec?: number;     // 单个座位最长学习时间（秒，默认 120，不设下限；超时该座位按未学习开赛）
+  manualRoleAssignEnabled?: boolean; // 手动分配角色（默认 false=创建时随机分配；开启后开始时提交 seatRoles）
   // 玩家人格可见度（人格圈层的信息壁垒；仅有人格卡座位的玩家可获得圈层知晓，普通 AI 不受影响）：
   //   full=完全可见：有人格的玩家知道所有其他有人格玩家的人格姓名（仅姓名，详细人格不透露），
   //        无人格玩家对其而言是迷雾；
@@ -37,6 +42,30 @@ export interface AdvancedOptions {
   //   none=不可见：所有玩家对有人格的玩家而言都是迷雾（可观察言行自行推测）。
   personaVisibility?: "full" | "partial" | "none"; // 默认 full
   personaFogSeats?: number[]; // partial 档：被上迷雾的座位号（仅对已绑人格卡的座位生效）
+  thoughtCollapsed?: boolean; // 心理活动默认收起（默认 false=展开；收起时涌现/正文文字仍展示，只收心镜分析层）
+  autoPsyCheck?: boolean;     // 自动心理检查（默认 false=手动）：赛后讨论关闭=复盘报告生成完后自动开始；赛后讨论开启=赛后讨论结束后自动开始
+}
+
+/** 赛前学习来源的唯一缺省映射：旧配置仅开总开关时仍只学习图书馆。 */
+export function studySourcesOf(options: Partial<AdvancedOptions>): {
+  history: boolean;
+  guide: boolean;
+  library: boolean;
+} {
+  return {
+    history: options.studyHistoryEnabled === true,
+    guide: options.studyGuideEnabled === true,
+    library: options.studyLibraryEnabled !== false,
+  };
+}
+
+/** 总开关开启时至少选择一个来源；关闭时不限制来源字段（兼容旧配置）。 */
+export function assertStudyOptions(options: Partial<AdvancedOptions>): void {
+  if (!options.libraryEnabled) return;
+  const sources = studySourcesOf(options);
+  if (!sources.history && !sources.guide && !sources.library) {
+    throw new Error("赛前学习至少需要选择一个学习来源：对局历史、经验指南或图书馆");
+  }
 }
 
 export const PROVIDER_PRESETS: Record<AiProvider, { label: string; baseUrl: string; model: string }> = {
@@ -58,8 +87,8 @@ export type Camp = "wolf" | "god" | "villager";
 export const ROLE_META: Record<RoleId, { name: string; camp: Camp; description: string }> = {
   villager:      { name: "平民",     camp: "villager", description: "无技能，白天参与发言与投票" },
   werewolf:      { name: "狼人",     camp: "wolf",     description: "每晚与狼队共刀一人，白天可自爆" },
-  wolfKing:      { name: "狼王",     camp: "wolf",     description: "死亡时可开枪带走一人（被毒/被摄梦死不能开枪）" },
-  whiteWolfKing: { name: "白狼王",   camp: "wolf",     description: "白天自爆时可带走一人（被毒后自爆不能带人）" },
+  wolfKing:      { name: "狼王",     camp: "wolf",     description: "死亡时可开枪带走一人（被毒/被摄梦死不能开枪；作为场上最后一狼出局时不能开枪——狼全灭即终局）" },
+  whiteWolfKing: { name: "白狼王",   camp: "wolf",     description: "白天自爆时可带走一人（被毒后自爆不能带人；作为场上最后一狼自爆时不能带人——自爆即终局）" },
   gargoyle:      { name: "石像鬼",   camp: "wolf",     description: "不与狼队见面，每晚验一人具体身份；其余狼死完后带刀" },
   nightmare:     { name: "噩梦之影", camp: "wolf",     description: "每晚最先恐惧一人：神则当夜技能封锁，狼则狼队当夜不能刀" },
   bloodMoon:     { name: "血月使徒", camp: "wolf",     description: "自爆后次夜封印所有神职技能；最后一狼被放逐则放逐无效，次夜结束时死亡" },
@@ -125,6 +154,54 @@ export const BOARDS: BoardDef[] = [
     witchSelfSave: "never", summary: "隐狼被验为好人且与狼队不见面；乌鸦夜间诅咒扰乱白天票型" },
 ];
 
+/** 启动前校验手动分配：座位数、角色 ID 与每种角色数量必须与版型完全一致。 */
+export function assertBoardSeatRoles(board: BoardDef, seatRoles: readonly RoleId[]): void {
+  if (seatRoles.length !== board.playerCount) {
+    throw new Error(`座位数不符合版型要求：需要 ${board.playerCount} 个角色，收到 ${seatRoles.length} 个`);
+  }
+  const allowed = new Set(board.roles);
+  for (const role of seatRoles) {
+    if (!allowed.has(role)) throw new Error(`角色 ${ROLE_META[role]?.name ?? role} 不属于该版型`);
+  }
+  const counts = new Map<RoleId, number>();
+  for (const role of seatRoles) counts.set(role, (counts.get(role) ?? 0) + 1);
+  for (const role of allowed) {
+    const expected = board.roles.filter((r) => r === role).length;
+    if ((counts.get(role) ?? 0) !== expected) {
+      throw new Error(`角色 ${ROLE_META[role].name} 数量不符合版型要求：需要 ${expected} 个，实际 ${counts.get(role) ?? 0} 个`);
+    }
+  }
+}
+
+/** 版型官方规则文本（开局即全员公开告知：角色池+胜负+关键机制——2026-10-14 用户裁定，
+ *  杜绝「猎魔人被当成猎人」这类版型误读；角色要点直接取 ROLE_META 引擎同源描述，保证与裁决一致） */
+export function boardRulesText(board: BoardDef, sheriffEnabled: boolean): string {
+  // 角色池统计（保持 ROLE_META 声明顺序，神→狼→民阅读顺）
+  const counts = new Map<RoleId, number>();
+  for (const r of board.roles) counts.set(r, (counts.get(r) ?? 0) + 1);
+  const comp = [...counts.entries()]
+    .map(([r, n]) => `${ROLE_META[r].name}${n > 1 ? `×${n}` : ""}`)
+    .join("、");
+  const specials = [...counts.keys()]
+    .filter((r) => r !== "villager" && r !== "werewolf")
+    .map((r) => `${ROLE_META[r].name}：${ROLE_META[r].description}`);
+  return [
+    `版型【${board.name}】：${board.playerCount} 名玩家，角色池为 ${comp}。所有人开局即知道这个角色池——不存在的角色（如本池没有猎人就没有猎人）不要幻想。`,
+    `胜负判定（屠边）：狼人杀光全部神职或全部平民→狼胜；好人放逐全部狼人→好人胜。`,
+    `狼刀规则：见面狼夜间讨论后各投一刀口票，多数决定最终落刀；平票则狼刀空悬（当夜无人被刀）。你自己的票不等于最终结果，以狼队台账为准。`,
+    `终局规则：夜晚结算狼刀在先——狼刀达成屠边的同夜，即使女巫随后毒死最后一狼也判狼胜；最后一狼出局（被放逐/死亡/自爆）时其带走类技能不发动（狼全灭即终局，神民胜）；骑士决斗只能在白天放逐发言阶段（含平票PK发言）发起，被放逐时无权发动。`,
+    sheriffEnabled
+      ? `警长规则：开局竞选产生警长（归票位 + 1.5 票票权）；警长阵亡时进行警徽流抉择——移交存活玩家接任，或撕毁警徽（本局再无警长），两者都是合法选择。`
+      : "本局无警长。",
+    board.witchSelfSave === "firstNight"
+      ? "女巫规则：解药毒药各一瓶、同一晚只能用一瓶；仅首夜可以自救。"
+      : "女巫规则：解药毒药各一瓶、同一晚只能用一瓶；全程不可自救。",
+    specials.length > 0 ? `特殊角色要点：${specials.join("；")}。` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 // ---------- 对局状态快照（上帝视角） ----------
 export type GameStatus = "created" | "running" | "paused" | "finished";
 
@@ -138,10 +215,13 @@ export interface PlayerSnapshot {
   sheriffCandidate?: boolean; // 上警竞选中（灰色警徽标识；警长落地/警徽流失后消失）
   deathInfo: string | null;   // 死因描述，如 "第2夜被刀"
   aiModel: string;            // 该座位的模型名（研究展示用）
-  personaName?: string | null; // 人格研究库：该座位绑定的人格名（未绑定为 null/缺省）
+  personaName?: string | null; // 人格研究站：该座位绑定的人格名（未绑定为 null/缺省）
+  personaImageData?: string | null; // 人格头像（仅运行时从人格卡读取，不重复写入对局 setup）
 }
 
 export interface GameSnapshot {
+  /** 手动分配角色是否开启（创建页据此显示角色牌桌；缺省 false=随机分配） */
+  manualRoleAssignEnabled?: boolean;
   /** 暂停原因（AI 额度耗尽等需用户知情的暂停；无则为 null）——「继续」按钮旁的提示文本 */
   pauseReason?: string | null;
   gameId: string;
@@ -149,6 +229,16 @@ export interface GameSnapshot {
   boardName: string;
   titleNo: string;            // 对局标题号（如 20260811001；旧数据可能为 ""）
   status: GameStatus;
+  /** 已开始区间累计毫秒；暂停/终止后冻结，刷新恢复不重置。 */
+  elapsedMs?: number;
+  /** 当前是否处于计时运行区间。 */
+  timerRunning?: boolean;
+  /** 本快照计时值对应的服务端 epoch ms，供前端平滑显示。 */
+  timingSyncedAt?: number;
+  /** 赛后讨论：报告与认知指南均就绪后再讨论（附属开关，无需用户查看）。 */
+  postGameReviewFirst?: boolean;
+  /** 满足开始条件后自动进入讨论。 */
+  postGameAutoStart?: boolean;
   day: number;
   phase: string;              // 引擎内部阶段 id
   phaseLabel: string;         // 中文阶段名，如 "第2夜 · 狼人行动"
@@ -165,6 +255,8 @@ export interface GameSnapshot {
   phaseBreakTotalMs: number;      // 当前停歇总时长（毫秒，无停歇为 0）
   phaseBreakStartedAt: number;    // 当前停歇起始时刻（epoch ms，无停歇为 0；倒计时文字框据此计算）
   speechRoundsLimit: number;
+  /** 心理活动默认收起（高级设置；收起时涌现/正文文字仍展示，只收心镜分析层） */
+  thoughtCollapsed?: boolean;
   /** 赛前学习中的座位（祖母绿「学习中」状态环；仅图书馆对局的学习阶段非空） */
   studyingSeats?: number[];
   createdAt: string;
@@ -258,7 +350,7 @@ export interface CreateGameInput {
   options: AdvancedOptions;
   analystAi?: AnalystAiConfig | null;  // autoGenerate!==false 时终局自动生成分析报告并蒸馏入指南；false 时仅观察室手动生成
   winRateEnabled?: boolean;            // 胜率推测：对局中实时评估神民/狼人胜率并记录理由（随 setup 落库，重启恢复后仍生效）
-  seatPersonas?: PersonaSeatBinding[]; // 人格研究库：座位人格绑定（绑定的座位以该人格参赛；随 setup 落库供断点恢复）
+  seatPersonas?: PersonaSeatBinding[]; // 人格研究站：座位人格绑定（绑定的座位以该人格参赛；随 setup 落库供断点恢复）
 }
 
 export interface PollResult {

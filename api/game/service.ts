@@ -25,19 +25,17 @@ import type {
   AnalysisJobStage,
   AnalystAiConfig,
 } from "../../contracts/game";
-import { BOARDS, ROLE_META, formatGameTitleNo } from "../../contracts/game";
+import { assertBoardSeatRoles, assertStudyOptions, BOARDS, ROLE_META, formatGameTitleNo, studySourcesOf } from "../../contracts/game";
 import type { GameRow } from "../../db/schema";
 import { TRPCError } from "@trpc/server";
-import { encryptSecret, decryptSecret } from "../lib/authCrypto";
+import { encryptSecret } from "../lib/authCrypto";
 import {
   appendEvents,
   countGamesOnDate,
+  deathSeatsFromEvents,
   getAllEvents,
   getEventsAfter,
   getGame,
-  getLatestEvents,
-  getLatestPhaseEvent,
-  getMaxEventSeq,
   hasPostGameEvents,
   insertGame,
   listGames,
@@ -51,12 +49,11 @@ import {
   insertGuideVersion,
   listGuideScopes,
   listGuideVersions,
-  upsertAnalysis,
 } from "../queries/guide";
-import { appendDecision, getDecisions } from "../queries/decisions";
+import { appendDecision } from "../queries/decisions";
 import { getAllLibraryContents, upsertStudyNote, getStudyNotes } from "../queries/library";
-import { getLatestWinRate, getWinRatesAfter, insertWinRate } from "../queries/winrates";
-import { buildBoardRulesText, runAnalysis, runDistillBoard, runDistillCommon, buildStudyPrompt, buildStudyPickPrompt, buildChapterPickPrompt, buildHistoryPickPrompt, buildHistoryRefPrompt, splitDocChapters } from "./analyst";
+import { getLatestWinRate, getWinRatesAfter } from "../queries/winrates";
+import { buildStudyPrompt, buildStudyPickPrompt, buildChapterPickPrompt, buildHistoryPickPrompt, buildHistoryRefPrompt, splitDocChapters } from "./analyst";
 import { buildLogDigest } from "./logDigest";
 import { createEngine, MEETING_WOLVES } from "./engine/index";
 import type {
@@ -68,31 +65,39 @@ import type {
 } from "./engine/api";
 import { SPEECH_REQUIRED_KINDS } from "./engine/api";
 import { callAi } from "./ai/providers";
-import { isQuotaErrorText, isOutageErrorText } from "./ai/quota";
+import { isQuotaErrorText, isOutageErrorText, isBudgetErrorText } from "./ai/quota";
 import { defaultCallTimeoutMs, isThinkingModel } from "./ai/modelCaps";
 import { buildPrompt, modelContextTokens } from "./ai/prompts";
 import { parseDecision } from "./ai/parse";
-import { buildPersonaCircleText, injectCircleText, type PersonaBondInfo } from "./personaVisibility";
+import { buildPersonaCircleText, buildPostgamePersonaFactText, injectCircleText } from "./personaVisibility";
+import { deathInfoBySeatFromEvents, deathSeatsFromEvent, finalSurvivorsFromEvents } from "../../src/lib/playerEventState";
 import type { PersonaCard, PersonaEventMeta, PersonaSeatInfo } from "../../contracts/persona";
 import {
   getPersona,
   getPersonaCardsInternal,
   getPersonaReportsForGame,
   incrementPersonaGameCount,
-  listRelationshipsAmong,
-  loadMemoryContext,
-  upsertPersonaReport,
+  loadMemoryPool,
+  renderMemoryText,
+  type MemoryPool,
 } from "../queries/personas";
-import { runPersonaPipeline } from "../persona/pipeline";
-import { runNotebookWriteback } from "../persona/notebook";
-import { runPsyCheck } from "../persona/anatomist";
+import { runPersonaPipeline, shouldUseDualPipeline } from "../persona/pipeline";
+import { createPersonaSnapshot, type PersonaSnapshot } from "../persona/context";
 import { withTimeout, DB_TIMEOUT_MS } from "./runtime/timing";
+import {
+  elapsedAt,
+  finishTiming,
+  initialGameTiming,
+  pauseTiming,
+  startTiming,
+  type GameTiming,
+} from "./timing";
 import { initJudgeRecorder, maybeFoulCheck } from "./judge/foulReferee";
 
 export interface GameService {
   // userId 由路由层强制传入（归属校验）；测试/内部路径可省略（省略时不做归属拦截）
   createGame(input: CreateGameInput, userId?: string): Promise<{ gameId: string }>;
-  control(gameId: string, action: "start" | "pause" | "terminate" | "stopPostGame", userId?: string): Promise<{ ok: boolean }>;
+  control(gameId: string, action: "start" | "pause" | "terminate" | "stopPostGame", userId?: string, seatRoles?: RoleId[]): Promise<{ ok: boolean }>;
   // 已结束对局补开赛后讨论（started=false 时 reason 给出原因；幂等）
   startPostGame(gameId: string, userId?: string): Promise<{ started: boolean; reason?: string }>;
   // 开始心理检查（手动开启的终局收尾，分出胜负即可；可续跑：已完成座位跳过；幂等）
@@ -114,7 +119,7 @@ export interface GameService {
   updateGuide(userId: string, scope: string, content: string): Promise<import("../../contracts/game").GuideInfo>;
   getAnalysis(gameId: string, userId: string): Promise<{ report: import("../../contracts/game").AnalysisReport | null; jobStatus: import("../../contracts/game").AnalysisJobStatus; jobStage: import("../../contracts/game").AnalysisJobStage; jobError: string | null }>;
   generateAnalysis(gameId: string, userId: string, analyst?: import("../../contracts/game").AnalystAiConfig): Promise<{ started: boolean }>;
-  /** 人格研究库：本局人格座位的《心理检查报告》列表（对局页查看入口） */
+  /** 人格研究站：本局人格座位的《心理检查报告》列表（对局页查看入口） */
   personaReports(gameId: string, userId: string): Promise<import("../../contracts/persona").PersonaReport[]>;
 }
 
@@ -136,14 +141,20 @@ export interface GameRuntime {
   boardId: string; // 版型 id：经验指南按版型注入的依据
   userId: string | null; // 对局归属用户：指南注入/蒸馏按用户隔离的依据（旧内存运行时可为 null）
   status: GameStatus;
+  /** 开始/暂停/继续/终止共用的累计计时，随 setup 持久化。 */
+  timing: GameTiming;
   seq: number;
   timer: ReturnType<typeof setTimeout> | null;
   pending: PendingDecision | null;
   options: AdvancedOptions;
+  /** 手动角色是否已提交并持久化；后续赛前学习/暂停续跑复用，不重复要求 seatRoles */
+  manualRolesAssigned?: boolean;
   ticking: boolean; // tick 执行锁，防止重入
   lastTickAt: number; // 最近一次 tick 开始/结束的时间戳（断链检测依据）
   noProgressTicks: number; // 连续「无事件且无待决且未结束」的 tick 数（引擎停滞看门狗）
   pauseWaiters: Array<() => void>; // 在飞决策的暂停等待者：暂停时唤醒，挂起当前决策（resume 时重新思考）
+  // 控制代次：暂停/终止递增。即使暂停后立即继续，旧 tick 也不能消费旧代次的 AI 结果。
+  decisionEpoch: number;
   decisionIdx: number; // 已落盘决策数（决策日志 idx 计数器，断点重放恢复时从 DB 重建）
   // 挂起时保存的「未完成思考量」：该决策点暂停前最近一次校验失败尝试的思考内容与失败原因，
   // 恢复重新思考时注入 prompt 供参考（可采纳/修正/抛弃），避免灵感流失；注入后即清空
@@ -194,24 +205,26 @@ export interface GameRuntime {
   postgameAutoHeld: boolean;
   // 玩家对局笔记：座位 → 最近 N 条「行动+想法」紧凑记录（对局笔记知识库，注入该座位 prompt）
   seatNotes?: Map<number, string[]>;
+  // 带真实对局编号（#seq）的公开记录缓存：maxSeq 与 rt.seq 一致即命中，新事件落盘后失效重建
+  pubLogCache?: { maxSeq: number; lines: string[] } | null;
   // 赛前图书馆学习：座位 → 学习心得；studyDoneSeats 完成计数；studying/studyDone 状态
   studyNotes?: Map<number, string>;
   studyDoneSeats?: Set<number>;
   studyInFlight?: Set<number>; // 正在学习的座位（快照透出 → 祖母绿「学习中」状态环）
   studying?: boolean;
   studyDone?: boolean;
-  // ---------- 人格研究库（铁律2/4/6 对局执行） ----------
+  // ---------- 人格研究站（铁律2/4/6 对局执行） ----------
   // 人格卡按座位注册：绑定人格的座位决策走「心镜→涌现」管线而非普通 buildPrompt
   personaCards?: Map<number, PersonaCard>;
+  /** 开局冻结的人格与记忆版本：恢复优先于研究站现卡。 */
+  personaSnapshots?: Map<number, PersonaSnapshot<MemoryPool>>;
   // 座位人格绑定快照（seat/personaId/name）：人格圈层可见度的全场绑定表（创建/恢复时写入）
   seatPersonas?: PersonaSeatInfo[];
   // 记事簿注入文本（跨对局记忆与关系图谱）：创建/恢复时加载，随记忆回写跨局演进
-  personaMemory?: Map<number, string>;
+  /** 「记性」记忆池缓存（结构化）；注入文本每回合按当前情境现算 */
+  personaMemory?: Map<number, MemoryPool>;
   // 涌现事件注解暂存（座位 → 本决策点的人格注解）：事件落盘前富化到 meta.persona 后清空
   personaEventMeta?: Map<number, PersonaEventMeta>;
-  // 圈层羁绊缓存（观察者 personaId → 与在场人格的关系行）：首个人格决策点惰性加载，
-  // 局内不变（关系只在终局回写时更新），避免每决策点重复查库
-  personaBondRows?: Map<number, RelationshipRowLite[]>;
   // 心理检查（手动开启环节）运行时状态：在飞座位 / 已完成座位（poll 透出进度）
   psyCheckRunning?: Set<number>;
   psyCheckDone?: Set<number>;
@@ -226,97 +239,50 @@ export interface GameRuntime {
   foulSettled?: boolean;     // 本局已判罚（一局至多一次判罚结算，防止重复落定）
 }
 
-/** 圈层羁绊的关系行最简形态（查询层 RelationshipRow 的字段子集，service 内自洽） */
-interface RelationshipRowLite {
-  personaId: number;
-  targetPersonaId: number | null;
-  targetName: string;
-  relation: string;
-  affinity: number;
-  trust: number;
-  note: string;
-}
+  /** 当前处境签名（编码特异性检索键，§4.10.4）：game:<阵营>。
+   *  依据 Tulving & Thomson 1973：提取线索须与编码情境重合。
+   *  ⚠️ 情境是**加权**而非硬过滤（memory.ts），故历史无签名的记忆仍会参与排序。 */
+  function memorySignatureOf(rt: GameRuntime, seat: number): string {
+    // 角色阵营由引擎快照给出（权威事实，恢复后同样可得）
+    const camp = rt.engine.getSnapshot().players.find((p) => p.seat === seat)?.camp ?? "good";
+    return `game:${camp}`;
+  }
 
-/** 取观察者座位的在场羁绊：记事簿跨局关系（双方都在本局）+ 档案互提的原作渊源。
- *  返回 null 表示本局无人格绑定（连圈层都不需要装配）。 */
-async function getSeatBonds(rt: GameRuntime, seat: number): Promise<PersonaBondInfo[] | null> {
-  if (!rt.seatPersonas || rt.seatPersonas.length === 0) return null;
-  const me = rt.seatPersonas.find((b) => b.seat === seat);
-  if (!me) return []; // 观察者本人无人格卡：无圈层视角（不会走到这里，防御）
-  if (!rt.personaBondRows) {
-    const ids = rt.seatPersonas.map((b) => b.personaId);
-    const rows = await listRelationshipsAmong(ids).catch(() => []);
-    rt.personaBondRows = new Map();
-    for (const r of rows) {
-      const list = rt.personaBondRows.get(r.personaId) ?? [];
-      list.push(r);
-      rt.personaBondRows.set(r.personaId, list);
-    }
-  }
-  const seatOf = new Map(rt.seatPersonas.map((b) => [b.personaId, b.seat] as const));
-  const out: PersonaBondInfo[] = [];
-  for (const r of rt.personaBondRows.get(me.personaId) ?? []) {
-    const tSeat = r.targetPersonaId != null ? seatOf.get(r.targetPersonaId) : undefined;
-    if (tSeat == null) continue;
-    out.push({
-      seat: tSeat,
-      name: r.targetName,
-      relation: r.relation,
-      affinity: r.affinity,
-      trust: r.trust,
-      note: r.note,
+  /** 每回合现算注入文本：记忆池 × 当前情境 → 文本（无内容返回 null） */
+  function memorySignatureText(rt: GameRuntime, seat: number): string | null {
+    const text = renderMemoryText(rt.personaMemory?.get(seat), {
+      signature: memorySignatureOf(rt, seat),
     });
+    return text.trim() ? text : null;
   }
-  // 原作渊源：观察者自己的档案（重要关系栏）提到在场人格的人格名/原型名
-  //（如五条悟档案记载夏油杰）——曾有羁绊的角色同场时，这是最直接的认知依据
-  const relText = rt.personaCards?.get(seat)?.profile.relationships?.trim() ?? "";
-  if (relText) {
-    for (const b of rt.seatPersonas) {
-      if (b.seat === seat || out.some((o) => o.seat === b.seat)) continue;
-      const card = rt.personaCards?.get(b.seat);
-      const hit = [b.name, card?.originName ?? ""].filter(Boolean).find((n) => relText.includes(n));
-      if (hit) {
-        // 截取档案中记载对方的那一句（按句切分）
-        const sentence =
-          relText.split(/[。！？!?\n；;]/).find((s) => s.includes(hit))?.trim() ?? "";
-        out.push({
-          seat: b.seat,
-          name: b.name,
-          relation: "",
-          affinity: 0,
-          trust: 0,
-          note: "",
-          origin: `你的档案记载着你们的渊源${sentence ? `（「${sentence.slice(0, 60)}」）` : ""}`,
-        });
-      }
-    }
-  }
-  return out;
-}
 
 export const registry = new Map<string, GameRuntime>();
 
+// 断点重放恢复模块（书记员层，api/game/recovery.ts）：依赖注入杜绝环引用——
+// registry/scheduleTick/maybeWinRateTick/persistWithPhaseBreak 属主仍在本文件
+import { createWinRate } from "./winrate";
+import { createPsyCheck, psyCheckPayload } from "./psy-check";
+import { analysisJobs, createAnalysisPipeline } from "./analysis";
+export { analysisJobs };
+export type { AnalysisJob } from "./analysis";
+export { parseWinRateOutput } from "./winrate";
+import { createRecovery, seatAIsOfSetup, partOfPhase } from "./recovery";
+import { describeActionForNote, SEAT_NOTE_CHARS, SEAT_NOTE_MAX } from "./seat-notes";
+// 胜率集群已迁入 api/game/winrate.ts（与 recovery 同法：依赖注入杜绝环引用）
+const { maybeWinRateTick, startWinRateLoop, runWinRateAnalysis } = createWinRate({ getCachedGuideText });
+const { recoverGame, buildRuntimeFromStore } = createRecovery({
+  registry,
+  scheduleTick,
+  maybeWinRateTick,
+  persistWithPhaseBreak,
+});
+
 // 恢复中的对局（并发 poll/control 去重共享同一 Promise，避免惊群重复重放）
-const recoveringGames = new Map<string, Promise<GameRuntime | null>>();
 
 // ---------- 超时/看门狗常量 ----------
 // 计时工具已迁入书记员层（runtime/timing.ts）：withTimeout / DB_TIMEOUT_MS
 const STALE_TICK_MS = 15_000; // running 状态下超过该时长没有任何 tick 推进 → 判定 tick 链断裂
 const MAX_NO_PROGRESS_TICKS = 30; // 连续无进展 tick 上限，超过判定为引擎停滞
-
-// ---------- 分析任务状态（内存跟踪；含阶段检查点与自愈心跳） ----------
-// 导出仅供测试/诊断使用（构造停滞任务、观察阶段流转），运行时不应外部修改
-export interface AnalysisJob {
-  status: "running" | "done" | "failed";
-  stage: AnalysisJobStage; // 当前阶段：analyze=撰写报告 / distill=沉淀指南；done 后归 null
-  error: string | null;
-  updatedAt: number; // 最近一次阶段推进/检查点写入时间（自愈心跳依据）
-  report: string | null; // analyze 阶段产物的内存检查点：distill 失败/中断可跳过 analyze 直接续跑
-  commonDone: boolean; // distill 阶段内检查点：共通指南已蒸馏落库 → 自愈重跑时跳过共通段，只续跑版型段
-  cfg: AnalystAiConfig; // 复活所需配置（仅存内存，与座位 apiKey 一样绝不落盘）
-  snapshot: GameSnapshot | null; // 指南版本 note 所需（版型/胜负），免去复活时重新导出
-}
-export const analysisJobs = new Map<string, AnalysisJob>();
 
 // running 任务超过该时长无任何心跳 → 判定任务已死（进程波动/调用悬挂），getAnalysis 触发复活
 const ANALYSIS_STALE_MS = 60_000;
@@ -337,6 +303,26 @@ function combineGuideText(boardId: string, common: string, boardGuide: string): 
     parts.push(`【本版型经验·${boardName}】\n${boardGuide.trim()}`);
   }
   return parts.join("\n\n");
+}
+
+/** 复盘前置的唯一就绪门槛：报告已落库，且本局两类经验指南已写入玩家认知库。
+ *  与用户是否打开报告无关；自动讨论也只等待这项客观条件。 */
+async function postGameReviewReady(gameId: string, row: GameRow): Promise<boolean> {
+  if (!row.userId) return false;
+  const report = await getAnalysisRow(gameId).catch(() => null);
+  if (!report?.report?.trim()) return false;
+  const job = analysisJobs.get(gameId);
+  if (job && job.status !== "done") return false;
+  const [common, board] = await Promise.all([
+    getLatestGuide(row.userId, "common"),
+    getLatestGuide(row.userId, row.boardId),
+  ]).catch(() => [null, null]);
+  if (!common?.content || !board?.content || common.gameId !== gameId || board.gameId !== gameId) return false;
+  guideCache.set(`${row.userId}:${row.boardId}`, {
+    at: Date.now(),
+    text: combineGuideText(row.boardId, common.content, board.content),
+  });
+  return true;
 }
 
 // 导出仅供测试（验证拼接逻辑与缓存行为）
@@ -363,6 +349,16 @@ export async function getCachedGuideText(userId: string | null, boardId: string)
   }
 }
 
+// 心理检查集群已迁入 api/game/psy-check.ts（与 recovery/winrate 同法：依赖注入杜绝环引用）
+const { maybeAutoPsyCheck, startPsyCheck } = createPsyCheck({
+  errMessage, snapshotFromRuntime, requireOwnedGame, recoverGame, registry,
+});
+
+// 分析流水线已迁入 api/game/analysis.ts（analysisJobs 状态随迁，上方再导出供测试/诊断）
+const { runAnalysisJob, triggerAutoAnalysis } = createAnalysisPipeline({
+  exportGame, maybeAutoPsyCheck, resumePostGameAfterReview, combineGuideText, errMessage, registry, guideCache,
+});
+
 // ---------- 工具 ----------
 function shuffle<T>(arr: T[]): T[] {
   for (let i = arr.length - 1; i > 0; i--) {
@@ -376,8 +372,23 @@ function toIso(d: Date | string): string {
   return d instanceof Date ? d.toISOString() : new Date(d).toISOString();
 }
 
-interface StoredSetup {
+async function persistGameTiming(
+  gameId: string,
+  timing: GameTiming,
+  patch: Parameters<typeof updateGame>[1] = {},
+): Promise<void> {
+  const row = await getGame(gameId);
+  if (!row) return;
+  await updateGame(gameId, {
+    ...patch,
+    setup: { ...(row.setup as StoredSetup), timing },
+  });
+}
+
+export interface StoredSetup {
   seatRoles: RoleId[];
+  /** 手动分配已确认；创建时的版型占位角色不得被误当作用户分配结果 */
+  manualRolesAssigned?: boolean;
   seatModels: string[];
   options: AdvancedOptions;
   // 断点恢复需要完整 AI 配置（含 key）：账户体系后以 AES-GCM 密文存 seatAIsEnc；
@@ -386,28 +397,19 @@ interface StoredSetup {
   seatAIsEnc?: string;
   // 胜率推测开关（重启恢复后功能仍在的依据）
   winRateEnabled?: boolean;
-  // 人格研究库：座位人格绑定快照（含人格名冗余——断点恢复与快照展示不再查库）
+  /** 分析师配置与自动复盘开关（AES-GCM 密文，恢复后自动生成不再丢配置） */
+  analystAiEnc?: string;
+  analystAutoGenerate?: boolean;
+  // 人格研究站：座位人格绑定快照（含人格名冗余——断点恢复与快照展示不再查库）
   seatPersonas?: PersonaSeatInfo[];
+  /** 座位号 → 开局人格及记忆快照；旧对局缺省时回退现卡。 */
+  personaSnapshots?: Record<string, PersonaSnapshot<MemoryPool>>;
+  /** 对局累计计时；旧对局缺省时按事件时间回退。 */
+  timing?: GameTiming;
 }
 
 /** 从 StoredSetup 解出座位 AI 配置：优先密文，兼容明文存量 */
-function seatAIsOfSetup(setup: StoredSetup): SeatAiConfig[] | undefined {
-  if (setup.seatAIsEnc) {
-    try {
-      return JSON.parse(decryptSecret(setup.seatAIsEnc)) as SeatAiConfig[];
-    } catch {
-      return undefined;
-    }
-  }
-  return setup.seatAIs;
-}
-
 // ---------- 事件持久化（每条赋递增 seq） ----------
-/** 事件所属时段（夜/日/ null=不涉及时段的系统类阶段） */
-function partOfPhase(phase: string): "night" | "day" | null {
-  return phase.startsWith("night.") ? "night" : phase.startsWith("day.") ? "day" : null;
-}
-
 /**
  * 带日夜交界停歇的持久化（关键机制）：
  * 引擎的 decide()/advance() 会把「上时段结算 + 新时段开始 + 新时段首个待决」在同一批
@@ -521,35 +523,6 @@ async function persistEvents(
 // ---------- 玩家对局笔记（每座位「所知所思所为」实时留存的知识库） ----------
 // 每次决策落槌后按座位追加一条紧凑笔记（行动+内心想法），随下次决策注入该座位 prompt——
 // 玩家对自身历史始终保真（不再只靠公开记录推断自己说过/做过什么），注意力得以聚焦新变局。
-const SEAT_NOTE_MAX = 15;   // 每座位最多保留最近 N 条（早期笔记自然淡出）
-const SEAT_NOTE_CHARS = 110; // 单条上限
-
-function describeActionForNote(kind: string, d: DecisionInput): string {
-  const tgt = d.targets?.length ? `${d.targets[0]}号` : "";
-  if (d.selfDestruct) return "自爆";
-  if (d.duel != null) return `决斗${d.duel}号`;
-  if (d.surrender || d.declareVictory) return "白日交刀";
-  if (d.speech?.trim()) return `发言说「${d.speech.trim().slice(0, 50)}${d.speech.trim().length > 50 ? "…" : ""}」`;
-  switch (kind) {
-    case "wolfKill": return `夜刀投票给${tgt}`;
-    case "seerCheck": case "psychicCheck": case "gargoyleCheck": return `查验${tgt}`;
-    case "witchAction": return d.witchSave ? "用解药救人" : tgt ? `毒杀${tgt}` : "未用药";
-    case "guardProtect": return tgt ? `守护${tgt}` : "空守";
-    case "dreamerDream": return `摄梦${tgt}`;
-    case "mechWolfMimic": return tgt ? `模仿${tgt}` : "未模仿";
-    case "demonHunterHunt": return tgt ? `狩猎${tgt}` : "未狩猎";
-    case "crowCurse": return tgt ? `诽谤${tgt}` : "未诽谤";
-    case "dayVote": case "sheriffVote": return `投票给${tgt}`;
-    case "sheriffRun": return d.targets?.[0] === 1 ? "报名上警" : "留在警下";
-    case "sheriffWithdraw": return d.targets?.[0] === 1 ? "退水放弃竞选" : "继续竞选";
-    case "sheriffOrder": return `定序${d.targets?.[0] === 1 ? "升序" : "降序"}发言`;
-    case "badgePass": return tgt ? `警徽移交给${tgt}` : "撕掉警徽";
-    case "hunterShoot": case "whiteWolfTake": return tgt ? `开枪/带走${tgt}` : "不开枪";
-    case "exileSkill": return tgt ? `发动技能指向${tgt}` : "沉默出局";
-    default: return d.skip ? "弃权" : tgt ? `行动→${tgt}` : "行动";
-  }
-}
-
 function recordSeatNotes(rt: GameRuntime, pending: PendingDecision, input: DecisionInput): void {
   if (!rt.seatNotes) rt.seatNotes = new Map();
   const notes = rt.seatNotes;
@@ -575,22 +548,6 @@ function recordSeatNotes(rt: GameRuntime, pending: PendingDecision, input: Decis
 }
 
 // 恢复重放后重建笔记：以决策日志为准（与引擎状态同源）
-function rebuildSeatNotesFromLog(rows: { kind: string; seat: number; decision: unknown }[]): Map<number, string[]> {
-  const notes = new Map<number, string[]>();
-  for (const r of rows) {
-    const d = r.decision as DecisionInput;
-    if (!d || typeof d !== "object") continue;
-    const thought = (d.thought ?? "").trim().slice(0, 60);
-    const line = `[重放] 我${describeActionForNote(r.kind, d)}${thought ? `（想法：${thought}）` : ""}`
-      .slice(0, SEAT_NOTE_CHARS);
-    const arr = notes.get(r.seat) ?? [];
-    arr.push(line);
-    if (arr.length > SEAT_NOTE_MAX) arr.splice(0, arr.length - SEAT_NOTE_MAX);
-    notes.set(r.seat, arr);
-  }
-  return notes;
-}
-
 /** 人格事件富化：把本决策点涌现管线产出的人格注解合并进该座位的发言/行动/投票事件
  * （event.meta.persona：双视角解释 + 撕裂组摘要，观察者双栏展示；富化后即清空防串用） */
 function enrichPersonaEvents(rt: GameRuntime, events: EngineEvent[]): void {
@@ -623,7 +580,8 @@ const SKIP_PREFERRED_KINDS: ReadonlySet<DecisionKind> = new Set([
   "postgameSpeak", // 赛后讨论托管=本轮弃权（skip 不消耗机会），绝不由系统代发言
 ]);
 
-// 导出供测试：兜底决策必须被真实引擎接受（任何决策类型都不得让对局崩溃）
+// 输出非法的「标记生成器」（2026-10-15 托管抹消后）：只用于清洗层给非法输出打标记，
+// 调用方凭标记即停——该函数产出的内容绝不进入引擎、绝不落事件流（历史用途=兜底决策，已废止）
 export function heuristicDecision(
   pending: PendingDecision,
   thought: string = "[AI连续无响应，系统托管]",
@@ -699,16 +657,35 @@ export function heuristicDecision(
 // kimi-k3 限时 120s 时 90s 超时 ×8、批量托管 38 次）——思考模型预算下限自动放宽至 260s
 // （含一次完整思考调用 + 一次重试的余地）。
 const THINKING_MIN_BUDGET_MS = 260_000;
+// 人格双程管线（心镜+涌现=两次完整思考调用）预算下限翻倍：520s。
+// 2026-10-14 实锤（20261014001 第5天夜神月发言托管）：260s 单程预算下，大上下文对局后期
+// 心镜烧掉 35%、涌现首发 150s 超时、涌现重试只剩 43s 必败——双程必须用双程的预算。
+// 非思考型双程（两次 90s 常规调用+重试余量）：240s。
+const THINKING_DUAL_MIN_BUDGET_MS = 520_000;
+const DUAL_MIN_BUDGET_MS = 240_000;
 
-function decisionDeadlineMs(rt: GameRuntime, cfg?: SeatAiConfig): number {
+export function decisionDeadlineMs(rt: GameRuntime, cfg?: SeatAiConfig, seat?: number): number {
   const envOverride = Number(process.env.AI_DECISION_DEADLINE_MS);
   if (envOverride) return envOverride;
   const sec = rt.options.aiTimeLimitSec;
   const base =
     typeof sec === "number" && sec > 0 ? Math.max(120, sec) * 1000 : Number.POSITIVE_INFINITY;
+  if (!cfg) return base;
+  // 人格双程管线判定：座位绑了人格且模型上下文够走双程（单程合并不翻倍）
+  const dual =
+    seat != null &&
+    (rt.personaCards?.has(seat) ?? false) &&
+    shouldUseDualPipeline(modelContextTokens(cfg.model));
+  const thinking = isThinkingModel(cfg);
   // 思考型模型：预算下限放宽（思考链耗时长，过紧预算只会批量超时转托管）
-  if (cfg && isThinkingModel(cfg)) return Math.max(base, THINKING_MIN_BUDGET_MS);
-  return base;
+  const floor = dual
+    ? thinking
+      ? THINKING_DUAL_MIN_BUDGET_MS
+      : DUAL_MIN_BUDGET_MS
+    : thinking
+      ? THINKING_MIN_BUDGET_MS
+      : 0;
+  return Math.max(base, floor);
 }
 
 async function askAiOnce(
@@ -718,14 +695,23 @@ async function askAiOnce(
   rt: GameRuntime,
   resumeNote: string | null = null,
   deadlineAt?: number,
+  gameId?: string,
 ): Promise<{ decision: DecisionInput | null; error: string | null }> {
   try {
+    // 公开记录换用带真实对局编号（#seq）的事件流重建（行号与公屏对不上的事故根治，
+    // 2026-10-15 实锤：玩家引用「第136条」而公屏已是 [358]）——失败保持引擎 pub 口径
+    if (gameId) {
+      const seqLog = await seqPublicLog(gameId, rt);
+      if (seqLog) {
+        pending = { ...pending, view: { ...pending.view, publicLog: seqLog } };
+      }
+    }
     // 总预算守卫：剩余预算不足一次最短调用时直接判失败（调用方走兜底）
     const remaining = deadlineAt != null ? deadlineAt - Date.now() : Number.POSITIVE_INFINITY;
     if (remaining <= 3_000) {
       return { decision: null, error: "AI响应总预算耗尽，转入托管" };
     }
-    // 人格研究库：绑定人格的座位改走「心镜→涌现」管线（铁律2参数溢出/铁律4双视角/铁律6撕裂），
+    // 人格研究站：绑定人格的座位改走「心镜→涌现」管线（铁律2参数溢出/铁律4双视角/铁律6撕裂），
     // 基础博弈情境仍由 buildPrompt 单一事实源生成（信息壁垒铁律不破）
     const personaCard = rt.personaCards?.get(pending.seat);
     if (personaCard) {
@@ -743,37 +729,49 @@ async function askAiOnce(
       // 人格圈层可见度：仅人格座位注入（普通 AI 不受影响）——
       // 三档（full 全见/partial 勾选迷雾/none 全员迷雾），不破身份壁垒；
       // 含人格名互称指引与羁绊注入（记事簿跨局关系 + 档案互提原作渊源）
+      const bindings = (rt.seatPersonas ?? []).map((b) => {
+        const card = rt.personaCards?.get(b.seat);
+        return {
+          seat: b.seat,
+          name: b.name,
+          // 外貌气质与基本印象取自完整人格卡（断点恢复时卡已删的座位自动退化为仅姓名）
+          appearance: card?.profile.appearance ?? null,
+          summary: card?.profile.summary?.trim() ?? null,
+          originSource: card?.originSource ?? null,
+          gender: card?.profile.gender || null,
+        };
+      });
       const circleText = buildPersonaCircleText(
         pending.seat,
-        (rt.seatPersonas ?? []).map((b) => {
-          const card = rt.personaCards?.get(b.seat);
-          return {
-            seat: b.seat,
-            name: b.name,
-            // 外貌气质与基本印象取自完整人格卡（断点恢复时卡已删的座位自动退化为仅姓名）
-            appearance: card?.profile.appearance ?? null,
-            summary: card?.profile.summary?.trim() ?? null,
-            originSource: card?.originSource ?? null,
-            gender: card?.profile.gender || null,
-          };
-        }),
+        bindings,
         rt.options.personaVisibility,
         rt.options.personaFogSeats,
-        (await getSeatBonds(rt, pending.seat)) ?? undefined,
+        undefined,
       );
       if (circleText) {
         // 注入位铁律：必须落在【输出契约】之前——人格管线会截断契约后的部分
         //（对局 20260930001 实锤：尾部追加被静默切断，人格玩家全程互不认识）
         base.user = injectCircleText(base.user, circleText);
       }
+      if (pending.kind === "postgameSpeak") {
+        const factText = buildPostgamePersonaFactText(
+          pending.seat,
+          bindings,
+          pending.view.deathTimeline,
+          rt.options.personaVisibility,
+          rt.options.personaFogSeats,
+        );
+        if (factText) base.user = injectCircleText(base.user, factText);
+      }
       const personaRes = await runPersonaPipeline({
         cfg,
         card: personaCard,
-        memoryText: rt.personaMemory?.get(pending.seat) ?? null,
+        memoryText: memorySignatureText(rt, pending.seat),
         pending,
         base,
         modelContext: personaModelContext,
         deadlineAt,
+        relationDigest: null,
         retryNote,
         resumeNote,
       });
@@ -1038,23 +1036,24 @@ async function decideBatchWithAi(
   rt: GameRuntime,
   pending: PendingDecision,
   gameId: string,
+  decisionEpoch: number,
 ): Promise<{ events: EngineEvent[]; input: DecisionInput }> {
   const subs = pending.batch!;
-  // 批量子决策托管的真实原因（seat → 最后一次失败原因）：结算后透出到本批事件 meta——
-  // 历史教训：批量兜底只留「系统托管」标记、真实原因被吞（一局 38 次托管 25 次无从定位）
+  // 批量子决策失败原因（seat → 失败原因）：2026-10-15 用户裁定——托管机制彻底抹消，
+  // 任何阻碍对局流程完成的失败一律即停（不再有兜底发言/兜底动作），仅用于暂停消息的诊断
   const failReasons = new Map<number, string>();
   // 每个子待决各自的决策点总预算（思考型模型自动放宽下限）：
-  // AI 故障时单座位最长静默有上限，预算耗尽即本人托管
-  // 单点失败带错误原因重试一次，仍失败才本人兜底（批量结算不做整批重试）
+  // 单点失败带错误原因重试一次，仍失败即暂停（托管已抹消）
   const askWithRetry = async (sub: PendingDecision): Promise<DecisionInput> => {
     const cfg = rt.seatAIs.find((s) => s.seat === sub.seat);
     if (!cfg) {
-      failReasons.set(sub.seat, "座位缺少 AI 配置");
-      return heuristicDecision(sub, "[AI连续无响应，系统托管]");
+      throw new AiOutageError(
+        `对局已自动暂停：${sub.seat}号座位缺少 AI 配置，决策无法进行。请为该座位补齐配置后点击「继续」恢复——当前进度不会丢失。`,
+      );
     }
-    const deadlineAt = Date.now() + decisionDeadlineMs(rt, cfg);
-    let res = await askAiOnce(cfg, sub, null, rt, null, deadlineAt);
-    if (!res.decision) res = await askAiOnce(cfg, sub, res.error, rt, null, deadlineAt);
+    const deadlineAt = Date.now() + decisionDeadlineMs(rt, cfg, sub.seat);
+    let res = await askAiOnce(cfg, sub, null, rt, null, deadlineAt, gameId);
+    if (!res.decision) res = await askAiOnce(cfg, sub, res.error, rt, null, deadlineAt, gameId);
     if (!res.decision) {
       // 额度耗尽：同池换人无用（共享账户额度），立即暂停整局（抛出经 Promise.all 上传播）
       if (isQuotaErrorText(res.error)) {
@@ -1062,21 +1061,25 @@ async function decideBatchWithAi(
           `AI 额度不足，对局已自动暂停：${sub.seat}号座位的 ${cfg.model} 账户余额/token 已耗尽。请先给该账户充值（或更换该座位的 AI 配置），然后点击「继续」恢复对局——当前进度不会丢失。`,
         );
       }
-      failReasons.set(sub.seat, (res.error ?? "AI 调用失败").slice(0, 120));
-      return heuristicDecision(sub, "[AI连续无响应，系统托管]");
+      // 预算耗尽：该模型此刻实质无响应——立即暂停等用户处置（20261014001 实锤）
+      if (isBudgetErrorText(res.error)) {
+        throw new AiOutageError(
+          `AI 服务连续无响应，对局已自动暂停：${sub.seat}号座位的 ${cfg.model} 在决策预算内多次调用均超时落空（网络波动或服务端拥塞）。请检查网络与该模型服务状态，然后点击「继续」恢复对局——当前进度不会丢失。`,
+        );
+      }
+      // 托管抹消（2026-10-15 用户裁定）：任何调用层失败一律即停，不再兜底替 AI 发言
+      throw new AiOutageError(
+        `AI 服务连续无响应，对局已自动暂停：${sub.seat}号座位的 ${cfg.model} 两次调用均未成功（${(res.error ?? "AI 调用失败").slice(0, 80)}）。请检查网络与该模型服务状态，然后点击「继续」恢复对局——当前进度不会丢失，该座位的决策将重新提问。`,
+      );
     }
-    // 清洗落托管（「AI输出非法，系统托管」）时透出真实原因与原始输出截断——
-    // 历史缺口：sanitizeBatchInput 兜底只换标记，事件 meta 无原因、原始输出丢失，
-    // 线上排查无法复盘 AI 到底输出了什么（对局 20261009001 的 2 处托管即此类）
+    // 输出非法（清洗兜底已抹消）：AI 产出了但不合法——同样属阻碍流程，即停并附原始输出截断
     const sanitized = sanitizeBatchInput(sub, res.decision);
     if (
       typeof sanitized.thought === "string" &&
-      sanitized.thought.startsWith("[AI输出非法") &&
-      res.decision.thought !== sanitized.thought
+      sanitized.thought.startsWith("[AI输出非法")
     ) {
-      failReasons.set(
-        sub.seat,
-        `AI输出非法已兜底（原始输出：${JSON.stringify(res.decision).replace(/\s+/g, " ").slice(0, 120)}）`,
+      throw new AiOutageError(
+        `AI 连续输出非法，对局已自动暂停：${sub.seat}号座位的 ${cfg.model} 输出的内容无法通过规则校验（原始输出：${JSON.stringify(res.decision).replace(/\s+/g, " ").slice(0, 120)}）。请检查该模型状态或更换其配置，然后点击「继续」恢复对局——当前进度不会丢失，该座位的决策将重新提问。`,
       );
     }
     return sanitized;
@@ -1090,9 +1093,13 @@ async function decideBatchWithAi(
       inputs[i] = await askWithRetry(subs[i]);
     }
   };
-  await Promise.all(
-    Array.from({ length: Math.min(AI_BATCH_CONCURRENCY, subs.length) }, () => worker()),
-  );
+  // 批量决策也要响应立即暂停；后台 AI 请求可自然结束，但其结果不得越过暂停代次。
+  const pause = pauseSignal(rt);
+  await Promise.race([
+    Promise.all(Array.from({ length: Math.min(AI_BATCH_CONCURRENCY, subs.length) }, () => worker())),
+    pause.promise,
+  ]);
+  pause.cancel();
   // 批量熔断：整批全员落空且至少一个是调用层故障 → 计一次连续失效；有任何人成功 → 清零
   if (failReasons.size >= subs.length && subs.length > 0) {
     const hasOutage = [...failReasons.values()].some((r) => isOutageErrorText(r));
@@ -1101,8 +1108,9 @@ async function decideBatchWithAi(
   } else if (failReasons.size < subs.length) {
     rt.aiOutageStreak = 0;
   }
-  // 竞速期间被暂停：丢弃本批结果，挂起保留 pending，恢复后重新整批权衡
-  if (rt.status !== "running") {
+  // 竞速期间被暂停：丢弃本批结果，挂起保留 pending，恢复后重新整批权衡。
+  // 即使已经立即继续，只要代次不同，旧批次同样不得消费。
+  if (rt.status !== "running" || rt.decisionEpoch !== decisionEpoch) {
     rt.suspendDraft = { thought: null, error: null };
     throw new SuspendDecision();
   }
@@ -1119,8 +1127,7 @@ async function decideBatchWithAi(
   const combined: DecisionInput = { thought: "", batchInputs: inputs };
   try {
     const events = rt.engine.decide(combined);
-    // 批量托管原因透出：按座位汇总挂到本批全部事件（前端「托管原因」行直接可见，
-    // 观察者不再只能看到「系统托管」标记却不知为何）
+    // 批量故障透出（仅诊断辅助）：无失败时为空集，不附加任何信息
     if (failReasons.size > 0) {
       const reason = [...failReasons.entries()]
         .map(([seat, r]) => `${seat}号：${r}`)
@@ -1130,19 +1137,10 @@ async function decideBatchWithAi(
     }
     return { events, input: combined };
   } catch (err) {
-    // 清洗后仍被拒（防御路径）：全员按兵不动必合法，绝不因此暂停对局
-    const fb: DecisionInput = {
-      thought: "",
-      batchInputs: subs.map((s) => heuristicDecision(s, "[AI输出非法，系统托管]")),
-    };
-    try {
-      const events = rt.engine.decide(fb);
-      const reason = `AI输出非法：${errMessage(err).slice(0, 200)}`;
-      for (const ev of events) ev.meta = { ...(ev.meta ?? {}), fallbackReason: reason };
-      return { events, input: fb };
-    } catch (err2) {
-      throw new Error(`引擎拒绝保证合法的兜底决策，判定为引擎内部异常: ${errMessage(err2)}`);
-    }
+    // 引擎拒绝经清洗的批量决策：对局流程受阻——即停（托管抹消后不再有兜底批次）
+    throw new AiOutageError(
+      `AI 输出未通过引擎校验，对局已自动暂停：${errMessage(err).slice(0, 160)}。请检查对局状态后点击「继续」恢复——当前进度不会丢失，本批决策将重新提问。`,
+    );
   }
 }
 
@@ -1218,9 +1216,10 @@ async function decideWithAi(
   rt: GameRuntime,
   pending: PendingDecision,
   gameId: string,
+  decisionEpoch: number,
 ): Promise<{ events: EngineEvent[]; input: DecisionInput }> {
   // 并行权衡批次：走并发专线，不进入单人串行流程
-  if (pending.batch && pending.batch.length > 1) return decideBatchWithAi(rt, pending, gameId);
+  if (pending.batch && pending.batch.length > 1) return decideBatchWithAi(rt, pending, gameId, decisionEpoch);
   const cfg = rt.seatAIs.find((s) => s.seat === pending.seat);
   let validationError: string | null = null;
   let lastFailedThought: string | null = null; // 最近一次校验失败尝试的思考内容（挂起时保存用）
@@ -1238,33 +1237,23 @@ async function decideWithAi(
 
   // 托管兜底结算：AI 失败兜底用；兜底决策保证合法，被拒即引擎内部异常。
   // 兜底事件 meta 附真实失败原因（fallbackReason）：观察者可直接在事件流定位托管根因
+  // 托管抹消（2026-10-15 用户裁定）：AI 输出经修正仍被引擎拒绝 = 对局流程受阻——
+  // 即停并附校验原因，不再有兜底决策替 AI 完成动作（settleByFallback 已删）
   const settleByFallback = (note: string): { events: EngineEvent[]; input: DecisionInput } => {
-    const fallback = heuristicDecision(pending, note);
-    try {
-      const events = rt.engine.decide(fallback);
-      const reason = validationError
-        ? `AI输出非法：${validationError}`
-        : lastAiError
-          ? `AI调用失败：${lastAiError}`
-          : null;
-      if (reason) {
-        for (const ev of events) {
-          ev.meta = { ...(ev.meta ?? {}), fallbackReason: reason.slice(0, 200) };
-        }
-      }
-      return { events, input: fallback };
-    } catch (err) {
-      throw new Error(`引擎拒绝保证合法的兜底决策，判定为引擎内部异常: ${errMessage(err)}`);
-    }
+    void note;
+    throw new AiOutageError(
+      `AI 连续输出非法，对局已自动暂停：${pending.seat}号座位的 ${cfg?.model ?? "未知模型"} 输出未通过规则校验（${(validationError ?? "输出非法").slice(0, 120)}）。请检查该模型状态或更换其配置，然后点击「继续」恢复对局——当前进度不会丢失，该座位的决策将重新提问。`,
+    );
   };
 
   if (cfg) {
     // 决策点总预算：两次尝试共享同一截止线（AI 故障时最长静默预算，超时即托管；
-    // 思考模式提供方自动放宽下限——过紧预算只会批量超时转托管）
-    const deadlineAt = Date.now() + decisionDeadlineMs(rt, cfg);
+    // 思考模式提供方自动放宽下限——过紧预算只会批量超时转托管；人格双程管线翻倍）
+    const deadlineAt = Date.now() + decisionDeadlineMs(rt, cfg, pending.seat);
     for (let attempt = 0; attempt < 2; attempt++) {
-      // 已暂停：挂起而非接管——保留 pending 与已完成思考量，待恢复后重新思考
-      if (rt.status !== "running") {
+      // 已暂停或控制代次已变：挂起而非接管——保留 pending 与已完成思考量，待恢复后重新思考。
+      // 代次检查可识别「暂停后立即继续」，防止旧 tick 在新一轮运行中消费旧结果。
+      if (rt.status !== "running" || rt.decisionEpoch !== decisionEpoch) {
         rt.suspendDraft = { thought: lastFailedThought, error: validationError };
         throw new SuspendDecision();
       }
@@ -1274,12 +1263,12 @@ async function decideWithAi(
       }
       const sig = pauseSignal(rt);
       const res = await Promise.race([
-        askAiOnce(cfg, pending, validationError, rt, resumeNote, deadlineAt),
+        askAiOnce(cfg, pending, validationError, rt, resumeNote, deadlineAt, gameId),
         sig.promise,
       ]);
       sig.cancel();
       // 暂停先到（或竞速期间被暂停）：丢弃本次 AI 结果，保存未完成思考量后挂起停链
-      if (rt.status !== "running") {
+      if (rt.status !== "running" || rt.decisionEpoch !== decisionEpoch) {
         rt.suspendDraft = { thought: lastFailedThought, error: validationError };
         throw new SuspendDecision();
       }
@@ -1290,6 +1279,13 @@ async function decideWithAi(
         if (isQuotaErrorText(error)) {
           throw new AiQuotaExhaustedError(
             `AI 额度不足，对局已自动暂停：${pending.seat}号座位的 ${cfg.model} 账户余额/token 已耗尽。请先给该账户充值（或更换该座位的 AI 配置），然后点击「继续」恢复对局——当前进度不会丢失。`,
+          );
+        }
+        // 预算耗尽：该模型此刻实质无响应——立即暂停等用户处置（20261014001 第5天 10号发言托管实锤：
+        // 单点预算耗尽硬塞「没什么头绪」兜底发言，直接污染人格对局的研究价值）
+        if (isBudgetErrorText(error)) {
+          throw new AiOutageError(
+            `AI 服务连续无响应，对局已自动暂停：${pending.seat}号座位的 ${cfg.model} 在决策预算内多次调用均超时落空（网络波动或服务端拥塞）。请检查网络与该模型服务状态，然后点击「继续」恢复对局——当前进度不会丢失。`,
           );
         }
         trackOutageOrThrow(rt, error); // 调用层故障计入熔断（超限价即暂停）
@@ -1314,8 +1310,28 @@ async function decideWithAi(
     }
   }
 
-  return settleByFallback(
-    validationError ? "[AI输出非法，系统托管]" : "[AI连续无响应，系统托管]",
+  // 预算耗尽（含循环前预检直接 break 的路径）：该模型此刻实质无响应，单点即暂停不托管
+  if (isBudgetErrorText(lastAiError)) {
+    throw new AiOutageError(
+      `AI 服务连续无响应，对局已自动暂停：${pending.seat}号座位的 ${cfg?.model ?? "未知模型"} 在决策预算内多次调用均超时落空（网络波动或服务端拥塞）。请检查网络与该模型服务状态，然后点击「继续」恢复对局——当前进度不会丢失。`,
+    );
+  }
+
+  // 赛后讨论发言的调用层故障（超时/断网/拥塞类实质无响应）：暂停等用户处置，
+  // 绝不托管吞掉人格的赛后之声（2026-10-15 实锤：3号赛后第二轮被托管成 skip，人格失声）；
+  // 输出非法/解析失败属模型行为，仍走兜底弃权（模型产出了但格式坏，不构成服务中断）
+  if (pending.kind === "postgameSpeak" && isOutageErrorText(lastAiError)) {
+    throw new AiOutageError(
+      `AI 服务连续无响应，对局已自动暂停：${pending.seat}号座位的赛后讨论发言多次调用均无回应（网络波动或服务端拥塞）。请检查网络与该模型服务状态，然后点击「继续」恢复——当前进度不会丢失，TA 的发言机会原样保留。`,
+    );
+  }
+
+  // 循环耗尽仍无合法决策（托管抹消，2026-10-15 用户裁定）：
+  // 调用层故障 → 「连续无响应」暂停；输出非法（修正后仍被引擎拒绝）→ 「连续输出非法」暂停；
+  // 不再有任何兜底发言/兜底动作——阻碍对局流程完成的情况一律即停
+  if (validationError) return settleByFallback("[AI输出非法，系统托管]");
+  throw new AiOutageError(
+    `AI 服务连续无响应，对局已自动暂停：${pending.seat}号座位的 ${cfg?.model ?? "未知模型"} 多次调用均未成功（${(lastAiError ?? "AI 调用失败").slice(0, 80)}）。请检查网络与该模型服务状态，然后点击「继续」恢复对局——当前进度不会丢失，该座位的决策将重新提问。`,
   );
 }
 
@@ -1328,288 +1344,33 @@ function scheduleTick(gameId: string, rt: GameRuntime, delayMs: number): void {
   }, delayMs);
 }
 
-// ---------- 分析任务流水线：analyze（复盘报告→落库→内存检查点）→ distill（蒸馏进经验指南） ----------
-// 分段 + 检查点：每段开始都刷新 updatedAt 心跳；analyze 产物落库的同时写入 job.report，
-// 任务中途死亡（进程波动/调用悬挂）时可从检查点复活——有 report 则跳过 analyze 直接续跑 distill。
-// 负责维护 analysisJobs 状态；异常向上抛出（调用方决定记日志还是仅置 failed）
-async function runAnalysisJob(gameId: string, cfg: AnalystAiConfig): Promise<void> {
-  // 检查点恢复：既有任务停在 distill 阶段且持有 report → 复用任务对象续跑，否则从头开始
-  const existing = analysisJobs.get(gameId);
-  const job: AnalysisJob =
-    existing && existing.report && existing.stage === "distill"
-      ? existing
-      : { status: "running", stage: null, error: null, updatedAt: 0, report: null, commonDone: false, cfg, snapshot: null };
-  job.status = "running";
-  job.error = null;
-  job.cfg = cfg;
-  job.updatedAt = Date.now();
-  analysisJobs.set(gameId, job);
-  // 指南蒸馏归属：对局属主（账户隔离）；读取失败不放行他人经验（蒸馏跳过指南段较安全？——
-  // 实际选择：无法确认归属则抛错终止任务，绝不让经验写入错误账户）
-  const ownerRow = await getGame(gameId);
-  const ownerId = ownerRow?.userId;
-  if (!ownerId) throw new Error(`无法确认对局 ${gameId} 的归属用户，分析任务终止`);
-
-  try {
-    // ---------- 阶段 1：analyze（导出对局 → AI 复盘 → 报告落库 + 内存检查点） ----------
-    if (!job.report) {
-      job.stage = "analyze";
-      job.updatedAt = Date.now();
-      const { snapshot, events } = await exportGame(gameId);
-      job.snapshot = snapshot;
-      const report = await runAnalysis(cfg, snapshot, events as GameEvent[]);
-      await upsertAnalysis(gameId, report, cfg.model);
-      job.report = report; // 内存检查点：此后任务死亡可跳过 analyze 直接续跑 distill
-      job.updatedAt = Date.now();
-    }
-
-    // ---------- 阶段 2：distill 两段式（共通指南 → 版型指南，各自独立 scope 落库） ----------
-    job.stage = "distill";
-    job.updatedAt = Date.now();
-    // 复活路径上快照可能不在内存（如外部构造的检查点任务）：回退到重新导出
-    const snapshot = job.snapshot ?? (await exportGame(gameId)).snapshot;
-    const boardId = snapshot.boardId;
-    const winnerLabel =
-      snapshot.winner === "wolf" ? "狼人胜" : snapshot.winner === "good" ? "好人胜" : "胜负未知";
-
-    // 段 1：共通经验（scope="common"）；commonDone 检查点命中则跳过（自愈重跑不重复落库）
-    let commonGuide: string | null = null;
-    if (!job.commonDone) {
-      const latestCommon = await getLatestGuide(ownerId, "common");
-      commonGuide = await runDistillCommon(cfg, latestCommon?.content ?? null, job.report);
-      await insertGuideVersion({
-        scope: "common",
-        version: (latestCommon?.version ?? 0) + 1,
-        content: commonGuide,
-        gameId,
-        note: `共通｜收录对局 ${gameId.slice(0, 8)}：${snapshot.boardName} ${winnerLabel}`,
-        userId: ownerId,
-      });
-      job.commonDone = true; // 内存检查点：此后任务死亡可跳过共通段直接续跑版型段
-      job.updatedAt = Date.now();
-    } else {
-      // 跳过共通段时仍需其最新内容，用于刷新注入缓存
-      commonGuide = (await getLatestGuide(ownerId, "common"))?.content ?? null;
-    }
-
-    // 段 2：版型特定经验（scope=版型 id）
-    const boardCtx = {
-      boardName: snapshot.boardName,
-      rolesSummary: BOARDS.find((b) => b.id === boardId)?.summary ?? snapshot.boardName,
-      // 本版型规则文本：蒸馏 prompt 据此禁止与规则相悖的建议（如 12 人场女巫自救）
-      rulesText: buildBoardRulesText(boardId),
-    };
-    const latestBoard = await getLatestGuide(ownerId, boardId);
-    const boardGuide = await runDistillBoard(cfg, boardCtx, latestBoard?.content ?? null, job.report);
-    await insertGuideVersion({
-      scope: boardId,
-      version: (latestBoard?.version ?? 0) + 1,
-      content: boardGuide,
-      gameId,
-      note: `${snapshot.boardName}｜收录对局 ${gameId.slice(0, 8)}：${winnerLabel}`,
-      userId: ownerId,
-    });
-    // 指南已更新：立即刷新该版型的注入缓存，后续决策用上最新版
-    guideCache.set(`${ownerId}:${boardId}`, {
-      at: Date.now(),
-      text: combineGuideText(boardId, commonGuide ?? "", boardGuide),
-    });
-    job.stage = null;
-    job.status = "done";
-    job.updatedAt = Date.now();
-  } catch (err) {
-    job.status = "failed";
-    job.error = errMessage(err).slice(0, 500); // 保留原始 API 错误，前端「分析失败 · 重试」可见
-    job.updatedAt = Date.now();
-    throw err;
+/** 用已落盘事件流重建 AI 可见的公开记录（带真实对局编号 #seq）——
+ * 2026-10-15 实锤：引擎 pub() 的公开记录是「行号」（第136条），而公屏对局记录用的是
+ * 事件序号（[358]）——玩家引用「第136条」时观察者根本无从定位。重建后与公屏严格同源同号。
+ * 公开性过滤与引擎 pub() 同口径：狼频道/权衡思考不进公开记录；夜间行动细节不公开。 */
+function publicLogFromEvents(events: GameEvent[]): string[] {
+  const out: string[] = [];
+  for (const e of events) {
+    const ch = e.meta?.channel;
+    if (ch === "wolf" || ch === "skillThink") continue; // 狼队私密/技能权衡：不进公开记录
+    if (e.phase.startsWith("night.") && e.type === "action") continue; // 夜间行动细节不公开
+    out.push(`[#${e.seq}] ${e.actorLabel ?? "系统"}《${e.title}》${e.content}`);
   }
+  return out;
 }
 
-// ---------- 胜率推测（分析师实时评估双方胜率，非阻塞、不排队） ----------
-// 触发时机：对局启动 / 每批事件落盘后 / 断点恢复续跑 / 终局（保底再评估一次）。
-// 在飞去重：一次分析未结束时跳过新触发——只分析最新状态，绝不排队积压（保证及时性）。
-// 失败静默：AI 调用失败/输出无法解析/越界一律跳过，不污染事件流、不阻塞对局循环。
-
-/** 胜率输出解析：去围栏截取首个 { 到末个 }；good 必须落在 0-100，reasons 裁剪到 ≤6 条 ≤120 字 */
-export function parseWinRateOutput(text: string): { good: number; reasons: string[]; causeLabel: string | null } | null {
-  const cleaned = text.replace(/```(?:json)?/gi, "");
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
-  const jsonText = cleaned.slice(start, end + 1);
-  let obj: unknown;
+/** 带真实对局编号（#seq）的公开记录缓存：rt.seq 为已落盘最大事件序号——
+ * 新事件落盘后 rt.seq 自增即失效重建；DB 抖动返回 null（保持引擎 pub 口径，绝不阻断决策） */
+async function seqPublicLog(gameId: string, rt: GameRuntime): Promise<string[] | null> {
   try {
-    obj = JSON.parse(jsonText);
+    if (rt.pubLogCache && rt.pubLogCache.maxSeq === rt.seq) return rt.pubLogCache.lines;
+    const events = await getAllEvents(gameId);
+    const lines = publicLogFromEvents(events);
+    rt.pubLogCache = { maxSeq: rt.seq, lines };
+    return lines;
   } catch {
-    // 模型把原始控制字符直接写进字符串的高频失败形态：替换为空格再试一次
-    try {
-      obj = JSON.parse(jsonText.replace(/[\x00-\x1F]/g, " "));
-    } catch {
-      return null;
-    }
+    return null;
   }
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
-  const o = obj as Record<string, unknown>;
-  const good = typeof o.good === "number" ? Math.round(o.good) : NaN;
-  if (!Number.isFinite(good) || good < 0 || good > 100) return null;
-  const reasons = (Array.isArray(o.reasons) ? o.reasons : [])
-    .filter((r): r is string => typeof r === "string" && r.trim().length > 0)
-    .slice(0, 6)
-    .map((r) => r.trim().slice(0, 120));
-  // 胜率变化的直接缘由标签（格式：第N天/第N夜 · 人物（可选）· 具体事件）；缺失/非法回退 null
-  const causeLabel =
-    typeof o.causeLabel === "string" && o.causeLabel.trim().length >= 4
-      ? o.causeLabel.trim().slice(0, 80)
-      : null;
-  return { good, reasons, causeLabel };
-}
-
-/** 上帝视角 prompt：引擎快照（身份全亮）+ 座位模型表 + 版型 + 用户选项 + 最近事件 + 经验指南。
- * 快照由调用方在「prompt 构建时刻」捕获传入：标签与内容同源（杜绝 AI 思考期间对局推进
- * 导致落库的 day/phase 与 prompt 内容不匹配） */
-function buildWinRatePrompt(
-  rt: GameRuntime,
-  snap: ReturnType<Engine["getSnapshot"]>,
-  events: GameEvent[],
-  prevGood: number | null,
-  guide: string,
-  recentLabels: string[] = [],
-): { system: string; user: string } {
-  const board = BOARDS.find((b) => b.id === rt.boardId);
-  const campLabel = (camp: string) => (camp === "wolf" ? "狼人" : camp === "god" ? "神" : "民");
-  const playerLines = snap.players.map((p) => {
-    const ai = rt.seatAIs.find((a) => a.seat === p.seat);
-    const status = [p.alive ? "存活" : `已死亡（${p.deathInfo ?? "死因未知"}）`];
-    if (p.sheriff) status.push("警长");
-    // 技能存量与查验记录是引擎权威事实（女巫解药已用就是已用），分析师据此评估，杜绝编造
-    return `${p.seat}号 ${ROLE_META[p.role]?.name ?? p.role}（${campLabel(p.camp)}阵营）${status.join("·")}，模型：${ai?.model ?? "未知"}${p.stock.length ? `，技能存量：${p.stock.join("、")}` : ""}${p.checks.length ? `，查验记录：${p.checks.join("，")}` : ""}`;
-  });
-  const eventLines = events.map(
-    (e) =>
-      `#${e.seq} 第${e.day}天 ${e.phase} [${e.type}] ${e.actorLabel ?? "系统"}《${e.title}》${e.content.slice(0, 200)}`,
-  );
-  const system = [
-    "你是狼人杀对局的分析师，拥有上帝视角（知晓所有玩家真实身份与全部事件）。",
-    "你的任务：基于当前对局的一切要素，实时评估「神民阵营」的胜率（0-100 的整数）。",
-    "综合考量：人数与阵营比、轮次与游戏节奏、神职存活与技能存量（女巫解药/毒药、守卫守护等）、警徽归属、死亡链、发言与投票行为的可信度、各座位所用 AI 模型的强弱对阵营表现的影响等一切要素。",
-    '严格只输出 JSON（不要输出任何其他文字）：{"good": 0-100的整数, "causeLabel": "胜率变化的直接缘由标签", "reasons": ["理由1", "理由2", ...]}',
-    prevGood != null
-      ? `你上一次评估的神民阵营胜率是 ${prevGood}%。reasons 只写「相比上次评估、导致胜率发生变化」的新原因（新的事件、新的信息、局势转折）——不要重复此前已经给出的理由；若你的判断与上次相同，reasons 返回空数组。`
-      : "reasons 只写导致胜率判断的原因与依据（这是首次评估）。",
-    "causeLabel：从最近事件中定位「导致本次胜率变化的直接缘由」——它不是当前时刻的事件，而是造成胜率变动的那个具体事件；格式为「第N天/第N夜 · 人物（可选）· 具体事件」，例如「第1夜 · 3号女巫 · 毒杀5号狼人」「第2天 · 放逐投票 · 5号出局」（无明确人物时省略人物段）。",
-    recentLabels.length > 0
-      ? `以下缘由标签已被最近记录占用：${recentLabels.map((l) => `「${l}」`).join("")}——同一事件只允许对应一次胜率变化，不得重复引用；若你的评估与其中某条缘由相同，说明与上次判断一致：good 必须等于上次值（该次评估不落库）。`
-      : "每个胜率变化事件只能对应一次胜率变化：若与上次的直接缘由是同一事件，good 必须与上次相同。",
-    "reasons 最多 6 条，每条不超过 120 字。",
-    "数值方向必须与理由一致：若你写的理由主要利于狼人阵营，则神民胜率 good 必须比上次下降；主要利于神民则 good 必须上升——理由与数值矛盾会被视为无效评估。",
-    "每条理由必须细化到具体的行为主体与动作——写明「几号玩家（角色名）做了什么、对局势产生什么影响」（例如「3号女巫昨夜毒杀了5号狼人，狼队人数优势被抹平」），不要只写「狼队夜刀成功」「白天出了个平安夜」这类不含主体的宏观概括。",
-  ].join("\n");
-  const userLines = [
-    `版型：${board?.name ?? rt.boardId}（${rt.boardId}）`,
-    `用户配置选项：${JSON.stringify(rt.options)}`,
-    `当前进度：第${snap.day}天 · ${snap.phaseLabel}（${snap.phase}）；${snap.finished ? `对局已结束，${snap.winner === "wolf" ? "狼人阵营获胜" : snap.winner === "good" ? "神民阵营获胜" : "未分胜负"}` : "对局进行中"}`,
-    "",
-    "玩家（上帝视角，身份全亮）：",
-    ...playerLines,
-    "",
-    "最近事件（按时间顺序）：",
-    ...(eventLines.length > 0 ? eventLines : ["（暂无事件）"]),
-  ];
-  // 经验指南为空时不注入该小节；超长截断到 4000 字符，防止指南膨胀导致 prompt 爆 token
-  const guideText = guide.trim().slice(0, 4000);
-  if (guideText) {
-    userLines.push(
-      "",
-      "经验指南（通用指南 + 本版型指南，分析师经验沉淀，供你评估时参考）：",
-      guideText,
-    );
-  }
-  const user = userLines.join("\n");
-  return { system, user };
-}
-
-/** 胜率分析结果："stored"=落库 / "same"=胜率未变不落库 / "stale"=内容已过时丢弃（调用方立即重评） / "skip"=其余静默跳过 */
-export type WinRateAnalysisResult = "stored" | "same" | "stale" | "skip";
-
-/** 执行一次胜率分析：AI 评估 → 解析校验 → 新鲜度守门 → 落库（入库后无需更新 rt，前端走轮询游标拉取）。
- * 标签与内容同源：落库的 day/phase/triggerLabel 全部锚定「prompt 构建时刻」的快照与事件，
- * 不再用 AI 返回时刻的状态（AI 思考 30-90s 期间对局可能已推进数步，旧写法标签严重滞后内容） */
-async function runWinRateAnalysis(gameId: string, rt: GameRuntime): Promise<WinRateAnalysisResult> {
-  // 分析配置：优先分析师配置，缺省回落到 1 号座位的座位配置（分析师与玩家共用同一 agent）
-  const base = rt.analystAi ?? (rt.seatAIs[0] ? {
-    provider: rt.seatAIs[0].provider,
-    baseUrl: rt.seatAIs[0].baseUrl,
-    model: rt.seatAIs[0].model,
-    apiKey: rt.seatAIs[0].apiKey,
-  } : null);
-  if (!base) return "skip";
-  // 上一次评估：prompt 据此聚焦「导致胜率变化的新原因」（不重复旧理由）；
-  // 胜率判断不变时本条不予落库（理由列表只呈现胜率实际发生变化的记录）
-  const prev = await getLatestWinRate(gameId);
-  // 最近已占用缘由标签（防同一事件重复对应胜率变化——prompt 警示 + 落库前去重双保险）
-  const recentRows = prev ? await getWinRatesAfter(gameId, Math.max(0, prev.id - 3)) : [];
-  const recentLabels = recentRows
-    .map((r) => r.triggerLabel)
-    .filter((l): l is string => typeof l === "string" && l.length > 0)
-    .slice(-4);
-  // 近乎即时：事件窗口收窄到最近 15 条（prompt 更小、评估更快），胜率依据集中在近期动态
-  const events = await getLatestEvents(gameId, 15);
-  // prompt 构建时刻的快照与事件游标：落库标签与内容同源 + 新鲜度守门基准
-  const promptSnap = rt.engine.getSnapshot();
-  const promptSeq = events.length > 0 ? events[events.length - 1].seq : 0;
-  // 预演循环基准：本次评估锚定的状态游标与时刻
-  rt.winRateLastEvalAt = Date.now();
-  rt.winRateLastSeq = promptSeq;
-  // 触发事件锚点：取本次 prompt 最近一条事件（如「4号狼人独立思考」「3号警上发言」，
-  // 角色名与事件标题之间不加空格）；无事件（开局评估）为 null
-  const triggerEvent = events.length > 0 ? events[events.length - 1] : null;
-  const triggerLabel = triggerEvent
-    ? triggerEvent.actor != null
-      ? `${triggerEvent.actor}号${
-          ROLE_META[
-            promptSnap.players.find((p) => p.seat === triggerEvent.actor)?.role as RoleId
-          ]?.name ?? ""
-        }${triggerEvent.title}`
-      : triggerEvent.title
-    : null;
-  // 经验指南注入（与玩家决策同一缓存机制：60s 缓存 + 超时/失败退回空，绝不阻塞分析）
-  const guide = await getCachedGuideText(rt.userId, rt.boardId);
-  const { system, user } = buildWinRatePrompt(rt, promptSnap, events, prev?.goodPct ?? null, guide, recentLabels);
-  // 单次上限：评估是即时性辅助功能，超时就放（dirty 追逐/守门外层兜底），绝不拖长战线；
-  // 思考型模型（kimi-k3 等）思考链耗时长，60s 必然大面积超时 → 放宽到 120s
-  const res = await callAi({ ...base, seat: 0 }, system, user, {
-    maxRetries: 1,
-    timeoutMs: isThinkingModel(base) ? 120_000 : 60_000,
-  });
-  if (!res.ok || !res.text) return "skip";
-  const parsed = parseWinRateOutput(res.text);
-  if (!parsed) return "skip"; // 输出无法解析/越界：静默跳过，不污染记录
-  // 新鲜度策略（提速对局适配）：AI 思考期间对局又推进 ≠ 丢弃——该评估锚定的是
-  // 「prompt 构建时刻」的状态（day/phase/triggerLabel/causeLabel 全部同源），作为
-  // 该时刻的合法读数照常落库；新事件已由 dirty 标记驱动立即重评最新状态。
-  // （旧策略 stale 即丢弃：提速后对局每分钟都有新事件，慢分析师被永久判过期 → 记录饿死）
-  if (prev && parsed.good === prev.goodPct) return "same"; // 胜率未变：不落库、不显示
-  // 同一事件只允许对应一次胜率变化：缘由标签与上一条记录相同（归一化比对）→ 按未变化处理
-  const norm = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, "");
-  if (parsed.causeLabel && norm(parsed.causeLabel) === norm(prev?.triggerLabel)) return "same";
-  // 锚点单调性：只接受「锚定游标比已落库记录更新」的评估——乱序/同状态的评估会造成
-  // 阵营颜色与涨跌方向错乱、同一变动重复出现（提速后乱序窗口显著，必须单调落库）
-  if (promptSeq <= rt.winRateLastStoredSeq) return "skip";
-  // 开局尚未进入第1天（初始化态无任何实质进展）不落记录：面板维持 50/50 初始态，
-  // 首个事件批（第1夜降临）落盘后的触发立即补上首次评估
-  if (promptSnap.day < 1) return "skip";
-  await insertWinRate({
-    gameId,
-    day: promptSnap.day,
-    phase: promptSnap.phase,
-    goodPct: parsed.good,
-    wolfPct: 100 - parsed.good,
-    reasons: parsed.reasons,
-    // 标签=胜率变化的直接缘由（分析师从事件中定位；缺省回退系统锚定的触发事件）
-    triggerLabel: parsed.causeLabel ?? triggerLabel,
-  });
-  rt.winRateLastStoredSeq = promptSeq;
-  return "stored";
 }
 
 /** 章节选读解析：从 AI 输出中提取「书名 → 章节名」选择（JSON 优先，宽容匹配）；失败返回 null */
@@ -1646,20 +1407,17 @@ function parseChapterSelection(
   }
 }
 
-/** 赛前学习（图书馆研读 + 历史对局参考）：全部座位同时并发学习（全员一起，节省等待时间）。
- * 每个座位的学习路径：书名选读（≥3 本时）→ 章节选读（大部头按目录，书名-章节为线索）
- * → 精简实战心得（≤900 字锦囊，可完整注入决策 prompt）→ 自主选择最相关的 1-2 局
- * 历史对局复盘摘要（≤280 字/局）。心得重试直至学成——保证全员都已学习完毕才开赛；
- * 历史参考失败仅跳过该段，不影响已得心得。暂停/终止即中断学习。笔记落 game_studies。 */
+/** 赛前学习（对局历史 + 经验指南 + 图书馆，可独立或组合）：全部座位同时并发学习。
+ * 每个来源独立取数与容错；研读心得和历史参考均可单独成稿，也可合并。
+ * 全部选中来源为空时直接完成，不发起无意义 AI 调用。笔记落 game_studies。 */
 async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
   if (!rt.studyNotes) rt.studyNotes = new Map();
   if (!rt.studyDoneSeats) rt.studyDoneSeats = new Set();
-  const docs = await getAllLibraryContents(rt.userId ?? "");
-  const libText = docs
-    .map((d) => `《${d.name}》\n${d.content}`)
-    .join("\n\n")
-    .slice(0, 12_000); // 总量封顶（再按模型预算截断）
-  if (!libText.trim()) return; // 图书馆为空：直接视为学完
+  const sources = studySourcesOf(rt.options);
+  const docs = sources.library ? await getAllLibraryContents(rt.userId ?? "") : [];
+  const guideText = sources.guide
+    ? await getCachedGuideText(rt.userId, rt.boardId).catch(() => "")
+    : "";
   const board = BOARDS.find((b) => b.id === rt.boardId);
   const boardName = board?.name ?? rt.boardId;
   const perCallMs = Math.max(5, rt.options.libraryMaxSec ?? 120) * 1000;
@@ -1670,18 +1428,20 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
   };
   if (!rt.studyInFlight) rt.studyInFlight = new Set();
 
-  // 章节线索预切分（确定性，全座位共享）
+  // 章节线索预切分（确定性，全座位共享；未选图书馆时为空，不影响其他来源）
   const SMALL_DOC = 3_000; // 小文档直接通读，不做章节选读
   const chaptered = docs.map((d) => ({ ...d, chapters: splitDocChapters(d.content) }));
 
-  // 历史对局候选（全座位共享一次性查询）：已分胜负的已结束对局，最新 20 局；查询失败则跳过历史参考
+  // 历史对局候选（全座位共享一次性查询）：已分胜负的已结束对局，最新 20 局；未选择则不查询
   let historyRows: Awaited<ReturnType<typeof listGames>> = [];
-  try {
-    historyRows = (await listGames(rt.userId ?? ""))
-      .filter((r) => r.id !== gameId && r.status === "finished" && r.winner != null)
-      .slice(0, 20);
-  } catch {
-    /* 历史候选查询失败：跳过历史参考段 */
+  if (sources.history) {
+    try {
+      historyRows = (await listGames(rt.userId ?? ""))
+        .filter((r) => r.id !== gameId && r.status === "finished" && r.winner != null)
+        .slice(0, 20);
+    } catch {
+      /* 历史候选查询失败：只跳过历史参考段 */
+    }
   }
 
   const studySeat = async (seat: number) => {
@@ -1732,7 +1492,7 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
               if (!row) return null;
               const events = await getAllEvents(row.id);
               if (events.length === 0) return null;
-              const snap = snapshotFromRow(row.id, row, events[events.length - 1].seq);
+              const snap = snapshotFromRow(row.id, row, events[events.length - 1].seq, deathSeatsFromEvents(events));
               const d0 = buildLogDigest(snap, events);
               const digest = d0.length > 2_500
                 ? `${d0.slice(0, 1_700)}\n……（中段省略）……\n${d0.slice(-700)}`
@@ -1805,19 +1565,25 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
         }
         chapterText = parts.join("\n\n");
       }
-      let reading = [smallText, chapterText].filter((t) => t.trim()).join("\n\n").slice(0, 15_000);
-      if (!reading.trim()) {
+      let reading = sources.library
+        ? [smallText, chapterText].filter((t) => t.trim()).join("\n\n")
+        : "";
+      if (sources.library && !reading.trim()) {
         // 极端兜底（章节切分异常等）：退回书首通读
-        reading = chosen.map((d) => `《${d.name}》\n${d.content.slice(0, 9_000)}`).join("\n\n").slice(0, 15_000);
+        reading = chosen.map((d) => `《${d.name}》\n${d.content.slice(0, 9_000)}`).join("\n\n");
       }
+      if (guideText.trim()) {
+        reading = [reading, `【经验指南】\n${guideText.trim()}`].filter((t) => t.trim()).join("\n\n");
+      }
+      reading = reading.slice(0, 15_000);
 
-      // ---- 阶段三：撰写精简实战心得（重试直至学成）----
+      // ---- 阶段三：撰写精简实战心得（重试直至学成；无研读材料时跳过）----
       const { system, user } = buildStudyPrompt(seat, boardName, reading, roleName, rt.options.libraryMaxSec);
       let noteText = "";
       // 重试直至学成（保证全员学习完毕才开赛）：最多 8 次（约覆盖小时级瞬时故障）；
       // 持续不可用（如密钥失效）时该座位按未学习开赛，避免对局永远无法开始；
       // 暂停/终止（status 离开 created）即中断
-      for (let attempt = 0; attempt < 8; attempt++) {
+      for (let attempt = 0; reading.trim() && attempt < 8; attempt++) {
         if (rt.status !== "created") return;
         const res = await callAi(cfg, system, user, {
           jsonMode: false,
@@ -1836,12 +1602,14 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
       // ---- 阶段四：历史对局参考（并行轨汇合——轨道在书籍学习启动前已开跑）----
       const refs = await historyTrack;
 
-      // ---- 合并成稿：精简心得 + 历史参考，整体 ≤1400 字符（可完整注入决策 prompt）----
-      if (noteText) {
-        const historySection = refs.length > 0
-          ? `\n\n【历史对局参考】\n${refs.map((r) => `- ${r}`).join("\n")}`
-          : "";
-        const finalNote = `${noteText}${historySection}`.slice(0, 1_400);
+      // ---- 合并成稿：研读心得与历史参考均可独立成立，整体 ≤1400 字符 ----
+      const sections: string[] = [];
+      if (noteText) sections.push(noteText);
+      if (refs.length > 0) {
+        sections.push(`【历史对局参考】\n${refs.map((r) => `- ${r}`).join("\n")}`);
+      }
+      const finalNote = sections.join("\n\n").slice(0, 1_400);
+      if (finalNote) {
         rt.studyNotes!.set(seat, finalNote);
         void upsertStudyNote(gameId, seat, finalNote).catch(() => {
           /* 笔记落库失败不阻塞 */
@@ -1856,91 +1624,17 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
   await Promise.all(seats.map(studySeat));
 }
 
-/** 胜率预演循环（「预判断」机制）：对局 running 期间每 ~3.5s 巡检一次——
- * 有新事件（seq 推进）立即评估；无新事件的空隙每 20s 也做一次预演（利用玩家思考的
- * 时间空隙提前完成当前状态评估，事件落地即可秒出结果）；暂停/终局自动停止，
- * control("start")/startPostGame 恢复时重新拉起。定时器 unref，绝不阻碍进程退出。 */
-function startWinRateLoop(gameId: string, rt: GameRuntime): void {
-  if (!rt.winRateEnabled || rt.winRateLoopTimer) return;
-  const tick = () => {
-    rt.winRateLoopTimer = null;
-    if (!rt.winRateEnabled || rt.status !== "running") return;
-    const advanced = rt.seq !== rt.winRateLastSeq;
-    const idleMs = Date.now() - rt.winRateLastEvalAt;
-    if (!rt.winRateInFlight && (advanced || idleMs >= 20_000)) {
-      maybeWinRateTick(gameId, rt); // 事件追逐 / 空隙预演
-    }
-    const t = setTimeout(tick, 3_500);
-    (t as { unref?: () => void }).unref?.();
-    rt.winRateLoopTimer = t;
-  };
-  const t = setTimeout(tick, 3_500);
-  (t as { unref?: () => void }).unref?.();
-  rt.winRateLoopTimer = t;
-}
-
-/** 触发一次胜率分析（非阻塞）：在飞则记脏标记（完成后立即用最新状态重评，近乎即时），
- * 终局时记保底标记（在飞完成后补一次） */
-function maybeWinRateTick(gameId: string, rt: GameRuntime): void {
-  if (!rt.winRateEnabled) return;
-  if (rt.status !== "running" && rt.status !== "finished") return;
-  if (rt.winRateInFlight) {
-    if (rt.status === "finished") rt.winRateFinalPending = true; // 终局保底：在飞完成后补终局评估
-    else rt.winRateDirty = true; // 在飞期间又有新事件：完成后立即重评（追逐最新状态）
-    return;
-  }
-  rt.winRateDirty = false; // 本次评估自最新状态起步
-  rt.winRateInFlight = true;
-  void runWinRateAnalysis(gameId, rt)
-    .catch((): WinRateAnalysisResult => "skip") // 静默：AI/DB 失败绝不阻塞对局循环
-    .then((result) => {
-      rt.winRateInFlight = false;
-      // 终局保底：在飞期间对局收官，补一次终局状态分析
-      if (rt.winRateFinalPending) {
-        rt.winRateFinalPending = false;
-        maybeWinRateTick(gameId, rt);
-      } else if (rt.winRateDirty || result === "stale") {
-        // 在飞期间又有新事件（stale 为旧路径兼容，现已不判丢弃）：立即用最新状态重评
-        maybeWinRateTick(gameId, rt);
-      }
-    });
-}
-
 // ---------- 犯规裁判已迁入法官模块（judge/foulReferee.ts） ----------
 // 版图拆分第一批（2026-10-10）：法官=流程秩序唯一写者；书记员（runtime/）隐而不现；
 // 判罚落定经 JudgeRecorder 窄接口回调本文件的 persist/markDecided/finishIfDone/scheduleTick。
 
-/** 配置了分析师且选择「自动生成」的对局，分出胜负后自动复盘并蒸馏进指南
- *（「手动生成」的对局在观察室由用户点击生成；失败只落系统事件，绝不上抛阻塞对局） */
-function triggerAutoAnalysis(gameId: string, rt: GameRuntime, snap: { day: number; phase: string }): void {
-  if (!rt.analystAi || rt.analystAi.autoGenerate === false) return;
-  const cfg = rt.analystAi;
-  void runAnalysisJob(gameId, cfg).catch(async (err) => {
-    try {
-      await appendEvents([
-        {
-          gameId,
-          seq: ++rt.seq,
-          day: snap.day,
-          phase: snap.phase,
-          type: "system",
-          actor: null,
-          actorLabel: null,
-          title: "分析任务失败",
-          content: `分析师复盘失败：${errMessage(err).slice(0, 300)}`,
-          thought: null,
-          meta: null,
-        },
-      ]);
-    } catch {
-      /* 记日志失败也不再上抛 */
-    }
-  });
-}
-
 /** 分出胜负即落库 + 触发自动分析（赛后讨论期间 status 仍 running，但报告已可生成） */
 async function markDecidedIfNeeded(gameId: string, rt: GameRuntime): Promise<void> {
-  if (rt.decidedPersisted) return;
+  if (rt.decidedPersisted) {
+    const snap = rt.engine.getSnapshot();
+    if (snap.winner) triggerAutoAnalysis(gameId, rt, snap);
+    return;
+  }
   const snap = rt.engine.getSnapshot();
   if (!snap.winner) return;
   rt.decidedPersisted = true;
@@ -1958,6 +1652,7 @@ async function finishIfDone(gameId: string, rt: GameRuntime): Promise<boolean> {
   await markDecidedIfNeeded(gameId, rt);
   if (!rt.engine.isFinished()) return false;
   const snap = rt.engine.getSnapshot();
+  rt.timing = finishTiming(rt.timing, Date.now());
   rt.status = "finished";
   rt.pending = null;
   if (rt.timer) {
@@ -1966,7 +1661,7 @@ async function finishIfDone(gameId: string, rt: GameRuntime): Promise<boolean> {
   }
   // 超时保护：挂起时抛错 → runTick 捕获走 handleTickError
   await withTimeout(
-    updateGame(gameId, {
+    persistGameTiming(gameId, rt.timing, {
       status: "finished",
       winner: snap.winner,
       dayCount: snap.day,
@@ -1978,273 +1673,11 @@ async function finishIfDone(gameId: string, rt: GameRuntime): Promise<boolean> {
   // 终局保底：最后再评估一次胜率（在飞则记 winRateFinalPending，在飞完成的 finally 里补）
   maybeWinRateTick(gameId, rt);
   // 心理检查（记事簿回写+心理检查报告）为主动开启环节：分出胜负后顶栏出现「开始心理检查」按钮，
-  // 由 startPsyCheck 启动（可续跑）——不再终局自动触发（被动中断难以补齐，见对局 20261009001）
+  // 由 startPsyCheck 启动（可续跑）——不再终局自动触发（被动中断难以补齐，见对局 20261009001）；
+  // 开了「自动心理检查」的赛后讨论对局：赛后讨论在引擎收尾处结束，此处（终局落库点）自动开始
+  maybeAutoPsyCheck(gameId, rt.options, "postgameEnd");
   return true;
 }
-
-// ---------- 心理检查（手动开启的终局收尾，可续跑） ----------
-// 语义变迁（对局 20261009001 实锤）：曾是终局自动触发——被动模式一旦中断（未配分析师/
-// 进程重启丢内存配置/平台回收）就难以补齐，该局心理检查从未发生。
-// 现改为用户主动开启：分出胜负后顶栏出现「开始心理检查」，点击启动；中断后再点只补未完成座位
-//（已有报告的座位不重跑；已有回写事件的座位不重写——人格演进不重复入账）。
-
-/** 心理检查在飞座位与完成座位的运行时状态键（rt.psyCheckRunning / rt.psyCheckDone） */
-
-/** 单个人格的检查链（局部保序：记事簿回写 → 心理检查报告 → 参战计数）；
- * 续跑跳过：已有回写事件的座位不重写（防记忆重复入账），报告由调用方按 todo 控制 */
-async function runPsyCheckForSeat(
-  gameId: string,
-  rt: GameRuntime,
-  ctx: {
-    cfg: SeatAiConfig;
-    snapshot: GameSnapshot;
-    digest: string;
-    winnerText: string;
-    titleNo: string;
-    others: { seat: number; name: string; personaId: number; known: boolean }[];
-    writebackDoneSeats: Set<number>;
-  },
-  seat: number,
-  card: PersonaCard,
-): Promise<void> {
-  const { cfg, snapshot, digest, winnerText, titleNo, others, writebackDoneSeats } = ctx;
-  const player = snapshot.players.find((p) => p.seat === seat);
-  const roleName = player?.roleName ?? "未知身份";
-  const outcome = `${winnerText}${player && !player.alive ? `；出局（${player.deathInfo ?? "死亡"}）` : "；存活"}`;
-  // ---- 记事簿回写：记忆入库/强化/衰减、关系传递、人格漂移（续跑跳过已完成座位） ----
-  if (writebackDoneSeats.has(seat)) {
-    // 已回写过：漂移已生效、记忆已入账——不重复执行
-  } else {
-    try {
-      const wb = await runNotebookWriteback({
-        cfg,
-        card,
-        seat,
-        roleName,
-        outcome,
-        gameTitleNo: titleNo,
-        digest,
-        gameId,
-        otherPersonas: others.filter((o) => o.seat !== seat),
-      });
-      if (wb) {
-        await appendEvents([
-          {
-            gameId,
-            seq: ++rt.seq,
-            day: snapshot.day,
-            phase: snapshot.phase,
-            type: "system",
-            actor: null,
-            actorLabel: null,
-            title: "记事簿回写",
-            content: `「${card.name}」（${seat}号）记忆回写完成：新增记忆 ${wb.memoriesAdded} 条、强化 ${wb.memoriesReinforced} 条、关系更新 ${wb.relationshipsTouched} 项、人格漂移 ${wb.driftApplied.length} 处${wb.driftApplied.length ? `（${wb.driftApplied.map((d) => d.path).join("、")}）` : ""}。`,
-            thought: null,
-            meta: { personaNotebook: wb.text },
-          },
-        ]);
-      }
-    } catch (err) {
-      await appendEvents([
-        {
-          gameId,
-          seq: ++rt.seq,
-          day: snapshot.day,
-          phase: snapshot.phase,
-          type: "system",
-          actor: null,
-          actorLabel: null,
-          title: "记事簿回写失败",
-          content: `「${card.name}」（${seat}号）记忆回写失败：${errMessage(err).slice(0, 200)}`,
-          thought: null,
-          meta: null,
-        },
-      ]);
-    }
-  }
-  // ---- 心理检查师：《心理检查报告》 ----
-  try {
-    const report = await runPsyCheck(cfg, { card, seat, roleName, outcome, digest, gameTitleNo: titleNo });
-    await upsertPersonaReport({ gameId, personaId: card.id, seat, report, model: cfg.model });
-    await appendEvents([
-      {
-        gameId,
-        seq: ++rt.seq,
-        day: snapshot.day,
-        phase: snapshot.phase,
-        type: "system",
-        actor: null,
-        actorLabel: null,
-        title: "心理检查报告已生成",
-        content: `「${card.name}」（${seat}号）的《心理检查报告》已生成：三个转折点 + 参数撕裂还原 + 人格状态与走向，可在本页「心理检查」按钮与人格详情页查看。`,
-        thought: null,
-        meta: null,
-      },
-    ]);
-    rt.psyCheckDone?.add(seat);
-  } catch (err) {
-    await appendEvents([
-      {
-        gameId,
-        seq: ++rt.seq,
-        day: snapshot.day,
-        phase: snapshot.phase,
-        type: "system",
-        actor: null,
-        actorLabel: null,
-        title: "心理检查报告生成失败",
-        content: `「${card.name}」（${seat}号）心理检查报告生成失败：${errMessage(err).slice(0, 200)}`,
-        thought: null,
-        meta: null,
-      },
-    ]);
-  }
-  // ---- 参战计数：已迁移至 createGame「落座即计」（对局创建成功即入数）——
-  // 收尾链不再重复计数（重启续跑/补跑检查都不再触碰计数） ----
-}
-
-/** 心理检查后台任务：todo 座位并行（并发 3），完成进度写 rt.psyCheckRunning/done（poll 透出） */
-async function runPsyCheckJob(
-  gameId: string,
-  rt: GameRuntime,
-  cfg: SeatAiConfig,
-  todoSeats: number[],
-): Promise<void> {
-  const row = await getGame(gameId);
-  if (!row) return;
-  const events = await getAllEvents(gameId);
-  const snapshot = snapshotFromRuntime(gameId, row, rt);
-  const digest = buildLogDigest(snapshot, events);
-  const winnerText = snapshot.winner === "wolf" ? "狼人阵营胜利" : snapshot.winner === "good" ? "神民阵营胜利" : "未分胜负";
-  // 人格可知性名册（迷雾规则：full 全可见；partial 中 personaFogSeats 被上迷雾；none 全迷雾）——
-  // 记事簿回写的锚点双轨依据：可知的归人格名，迷雾/无人格的归「标题号·代号」
-  const visibility = rt.options.personaVisibility ?? "full";
-  const fogSeats = new Set(rt.options.personaFogSeats ?? []);
-  const others = (rt.seatPersonas ?? []).map((b) => ({
-    seat: b.seat,
-    name: rt.personaCards?.get(b.seat)?.name ?? b.name,
-    personaId: b.personaId,
-    known: visibility === "full" || (visibility === "partial" && !fogSeats.has(b.seat)),
-  }));
-  // 回写完成判定：事件流里该座位的「记事簿回写」成功事件（内容以「名字」（N号）开头）
-  const writebackDoneSeats = new Set(
-    events
-      .filter((e) => e.title === "记事簿回写")
-      .map((e) => /^「.+」（(\d+)号）/.exec(e.content)?.[1])
-      .filter((s): s is string => !!s)
-      .map(Number),
-  );
-  const ctx = {
-    cfg,
-    snapshot,
-    digest,
-    winnerText,
-    titleNo: row.titleNo ?? "",
-    others,
-    writebackDoneSeats,
-  };
-  const CONCURRENCY = 3; // 各人格链相互独立；过高并发只会撞限流转重试，不降质量
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < todoSeats.length) {
-      const seat = todoSeats[cursor++]!;
-      const card = rt.personaCards?.get(seat);
-      if (!card) {
-        rt.psyCheckRunning?.delete(seat);
-        continue;
-      }
-      await runPsyCheckForSeat(gameId, rt, ctx, seat, card);
-      rt.psyCheckRunning?.delete(seat);
-    }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(CONCURRENCY, todoSeats.length) }, () => worker()),
-  );
-}
-
-/** 心理检查任务的进度透出载荷：有人格座位且已分出胜负的对局，逐座位 pending/running/done */
-async function psyCheckPayload(
-  gameId: string,
-  row: GameRow,
-  rt: GameRuntime | null,
-): Promise<PollResult["psyCheck"]> {
-  const binds = rt?.seatPersonas ?? ((row.setup as StoredSetup)?.seatPersonas ?? []);
-  if (binds.length === 0 || row.winner == null) return null;
-  const reports = await getPersonaReportsForGame(gameId).catch(() => []);
-  const doneIds = new Set(reports.map((r) => r.personaId));
-  return {
-    seats: binds.map((b) => ({
-      seat: b.seat,
-      status: rt?.psyCheckRunning?.has(b.seat)
-        ? ("running" as const)
-        : doneIds.has(b.personaId)
-          ? ("done" as const)
-          : ("pending" as const),
-    })),
-  };
-}
-
-/** 开始心理检查（用户主动开启，可续跑）：分出胜负即可（无赛后讨论/赛后待开始同样开放）。
- *  AI 配置：前端分析师配置 → 对局分析师配置 → 1 号座位配置（逐级兜底，与胜率分析同规）。
- *  幂等：进行中的调用直接复视；已完成座位跳过；写库失败记事件不阻塞其余座位。 */
-async function startPsyCheck(
-  gameId: string,
-  analystCfg: AnalystAiConfig | null | undefined,
-  userId?: string,
-): Promise<{ started: boolean; reason?: string }> {
-  const row = await requireOwnedGame(gameId, userId);
-  if (row.winner == null) return { started: false, reason: "对局尚未分出胜负——心理检查在分出胜负后开放" };
-  const setup = row.setup as StoredSetup;
-  const binds = setup.seatPersonas ?? [];
-  if (binds.length === 0) return { started: false, reason: "本局没有人格座位" };
-  // 运行时缺失则重放重建（读人格卡/快照；paused/finished 对局不补链不续跑）
-  let rt = registry.get(gameId) ?? null;
-  if (!rt) {
-    rt = await recoverGame(gameId).catch(() => null);
-    if (!rt) return { started: false, reason: "对局恢复原料缺失，无法开始心理检查" };
-  }
-  if (!rt.personaCards || rt.personaCards.size === 0) {
-    return { started: false, reason: "人格卡已不可用（可能被删除），无法检查" };
-  }
-  if ((rt.psyCheckRunning?.size ?? 0) > 0) return { started: true }; // 幂等复视：已在进行中
-  const cfgSource = analystCfg ?? rt.analystAi ?? (rt.seatAIs[0] ?? null);
-  if (!cfgSource) return { started: false, reason: "没有可用的 AI 配置" };
-  const cfg: SeatAiConfig = { ...cfgSource, seat: 0 };
-  // 续跑核心：只补「还没有心理检查报告」的座位
-  const reports = await getPersonaReportsForGame(gameId).catch(() => []);
-  const doneIds = new Set(reports.map((r) => r.personaId));
-  const todoSeats = binds.filter((b) => !doneIds.has(b.personaId)).map((b) => b.seat);
-  if (todoSeats.length === 0) return { started: false, reason: "全部人格的心理检查已完成" };
-  rt.psyCheckRunning = new Set(todoSeats);
-  void runPsyCheckJob(gameId, rt, cfg, todoSeats)
-    .catch(async (err) => {
-      try {
-        const snap = rt.engine.getSnapshot();
-        await appendEvents([
-          {
-            gameId,
-            seq: ++rt.seq,
-            day: snap.day,
-            phase: snap.phase,
-            type: "system",
-            actor: null,
-            actorLabel: null,
-            title: "心理检查失败",
-            content: `心理检查任务异常中断：${errMessage(err).slice(0, 300)}——重新点击「开始心理检查」可从断点续跑。`,
-            thought: null,
-            meta: null,
-          },
-        ]);
-      } catch {
-        /* 记日志失败也不再上抛 */
-      }
-    })
-    .finally(() => {
-      rt.psyCheckRunning?.clear();
-    });
-  return { started: true };
-}
-
 
 async function handleTickError(gameId: string, rt: GameRuntime, err: unknown): Promise<void> {
   const quotaExhausted = err instanceof AiQuotaExhaustedError;
@@ -2252,6 +1685,7 @@ async function handleTickError(gameId: string, rt: GameRuntime, err: unknown): P
   const message = err instanceof Error ? err.message : String(err);
   // 额度耗尽/服务中断：暂停原因透出到「继续」按钮旁（用户需要知道为什么停、怎么办）
   rt.pauseReason = quotaExhausted || outage ? message : null;
+  rt.timing = pauseTiming(rt.timing, Date.now());
   rt.status = "paused";
   rt.pending = null;
   if (rt.timer) {
@@ -2294,7 +1728,7 @@ async function handleTickError(gameId: string, rt: GameRuntime, err: unknown): P
   }
   try {
     await withTimeout(
-      updateGame(gameId, { status: "paused" }),
+      persistGameTiming(gameId, rt.timing, { status: "paused" }),
       DB_TIMEOUT_MS,
       "DB操作超时: 暂停状态落库",
     );
@@ -2306,6 +1740,7 @@ async function handleTickError(gameId: string, rt: GameRuntime, err: unknown): P
 async function runTick(gameId: string): Promise<void> {
   const rt = registry.get(gameId);
   if (!rt || rt.status !== "running" || rt.ticking) return;
+  const decisionEpoch = rt.decisionEpoch;
   rt.ticking = true;
   rt.lastTickAt = Date.now(); // tick 开始：刷新心跳（断链检测依据）
   try {
@@ -2330,9 +1765,12 @@ async function runTick(gameId: string): Promise<void> {
       // 赛后讨论挂起：对局已分出胜负、引擎产出首个 postgameSpeak 待决时自动暂停——
       // 等用户点「开启赛后讨论」后开始生成；开启「赛后自动开始讨论」（postGameAutoStart）
       // 的对局不挂起，径直进入赛后讨论生成
-      if (pending.kind === "postgameSpeak" && !rt.postgameAutoHeld && !rt.options.postGameAutoStart) {
+      const reviewGate = rt.options.postGameReviewFirst === true &&
+        !(await postGameReviewReady(gameId, await requireOwnedGame(gameId, rt.userId ?? undefined)));
+      if (pending.kind === "postgameSpeak" && !rt.postgameAutoHeld && (!rt.options.postGameAutoStart || reviewGate)) {
         rt.postgameAutoHeld = true;
         rt.pending = pending;
+        rt.timing = pauseTiming(rt.timing, Date.now());
         rt.status = "paused";
         if (rt.timer) {
           clearTimeout(rt.timer);
@@ -2361,8 +1799,9 @@ async function runTick(gameId: string): Promise<void> {
                 actor: null,
                 actorLabel: null,
                 title: "赛后讨论待开始",
-                content:
-                  "赛后讨论待开始：对局已分出胜负。点击页面顶部「开启赛后讨论」按钮，即可开始生成赛后讨论。",
+                content: reviewGate
+                  ? "赛后讨论待开始：等待复盘报告生成并写入玩家认知库，无需打开或查看报告。"
+                  : "赛后讨论待开始：对局已分出胜负。点击页面顶部「开启赛后讨论」按钮，即可开始生成赛后讨论。",
                 thought: null,
                 meta: null,
               },
@@ -2375,7 +1814,7 @@ async function runTick(gameId: string): Promise<void> {
         }
         try {
           await withTimeout(
-            updateGame(gameId, { status: "paused" }),
+            persistGameTiming(gameId, rt.timing, { status: "paused" }),
             DB_TIMEOUT_MS,
             "DB操作超时: 暂停状态落库",
           );
@@ -2388,7 +1827,7 @@ async function runTick(gameId: string): Promise<void> {
       try {
         // decideWithAi 内部消化「AI 输出非法」（重试+启发式兜底，绝不暂停对局）；
         // 仅引擎内部异常（连合法兜底都被拒）才向上抛出 → 外层 catch 置 paused
-        const { events: decideEvents, input } = await decideWithAi(rt, pending, gameId);
+        const { events: decideEvents, input } = await decideWithAi(rt, pending, gameId, decisionEpoch);
         rt.pending = null;
         // 先落决策日志（断点重放的原料），再落事件：最坏情况只丢该决策的事件流水，状态不分叉
         // 外部结算（审核驳回等房规裁决）记 auditSettle 类：重放时调 settleExternal 精确重建，
@@ -2443,6 +1882,9 @@ async function runTick(gameId: string): Promise<void> {
   } finally {
     rt.lastTickAt = Date.now(); // tick 结束（含异常路径）：刷新心跳
     rt.ticking = false;
+    // 暂停挂起时若用户已立即继续，旧 tick 退出必须补上下一次调度；
+    // 否则会出现 status=running 但没有 timer、没有后续 AI 调用的「假运行」。
+    if (rt.status === "running" && !rt.timer) scheduleTick(gameId, rt, 0);
   }
 }
 
@@ -2460,11 +1902,18 @@ function snapshotFromRuntime(gameId: string, row: GameRow, rt: GameRuntime): Gam
   // 显式标注 GameSnapshot：避免对象字面量属性拓宽（如 phaseBreaking 拓宽成 string）
   const result: GameSnapshot = {
     gameId,
+    manualRoleAssignEnabled: rt.options.manualRoleAssignEnabled === true,
     pauseReason: rt.pauseReason ?? null,
+    thoughtCollapsed: rt.options.thoughtCollapsed === true,
     boardId: row.boardId,
     boardName: row.boardName,
     titleNo: row.titleNo ?? "",
     status: rt.status,
+    postGameReviewFirst: rt.options.postGameReviewFirst === true,
+    postGameAutoStart: rt.options.postGameAutoStart === true,
+    elapsedMs: elapsedAt(rt.timing, Date.now()),
+    timerRunning: rt.status === "running" && rt.timing.runningSince != null,
+    timingSyncedAt: Date.now(),
     day: shown.day,
     phase: shown.phase,
     phaseLabel: shown.phaseLabel,
@@ -2480,6 +1929,7 @@ function snapshotFromRuntime(gameId: string, row: GameRow, rt: GameRuntime): Gam
       deathInfo: p.deathInfo,
       aiModel: rt.seatAIs.find((a) => a.seat === p.seat)?.model ?? "",
       personaName: personaNameOf(p.seat),
+      personaImageData: rt.personaCards?.get(p.seat)?.imageData ?? null,
     })),
     winner: snap.winner,
     seq: rt.seq,
@@ -2501,29 +1951,85 @@ function snapshotFromRuntime(gameId: string, row: GameRow, rt: GameRuntime): Gam
   return result;
 }
 
-function snapshotFromRow(gameId: string, row: GameRow, seq: number): GameSnapshot {
+/** 历史只读快照的人格头像：开局快照优先，旧对局才回退研究站现卡。 */
+async function personaImagesOf(row: GameRow): Promise<Map<number, string | null> | undefined> {
+  const setup = row.setup as StoredSetup;
+  const binds = setup.seatPersonas ?? [];
+  if (binds.length === 0) return undefined;
+  try {
+    const cards = await getPersonaCardsInternal(binds.map((bind) => bind.personaId));
+    return new Map(binds.map((bind) => [
+      bind.seat,
+      setup.personaSnapshots?.[String(bind.seat)]?.card.imageData ??
+        cards.find((card) => card.id === bind.personaId)?.imageData ?? null,
+    ]));
+  } catch {
+    return undefined;
+  }
+}
+
+function snapshotFromRow(gameId: string, row: GameRow, seq: number, deadSeats?: Set<number>, events?: GameEvent[], personaImages?: Map<number, string | null>): GameSnapshot {
   const setup = row.setup as StoredSetup;
   const finished = row.status === "finished";
+  const dead = deadSeats ?? new Set<number>();
+  const deathInfo = deathInfoBySeatFromEvents(events ?? []);
+  let sheriffSeat: number | null = null;
+  let eventDay: number | null = null;
+  for (const event of events ?? []) {
+    eventDay = Math.max(eventDay ?? 0, event.day);
+    for (const seat of deathSeatsFromEvent(event)) dead.add(seat);
+    if (event.title === "警长落地") {
+      sheriffSeat = Number(/(\d+)号玩家当选警长/.exec(event.content)?.[1] ?? 0) || null;
+    } else if (event.title === "警徽移交") {
+      sheriffSeat = Number(/移交给(\d+)号玩家/.exec(event.content)?.[1] ?? 0) || null;
+    } else if (event.title === "警长定序" && event.actor != null) {
+      sheriffSeat = event.actor;
+    } else if (event.title === "警徽流失") {
+      sheriffSeat = null;
+    }
+  }
+  const finalSurvivors = finalSurvivorsFromEvents(events ?? []);
+  if (finalSurvivors) {
+    for (let seat = 1; seat <= (setup.seatRoles?.length ?? 0); seat++) {
+      if (!finalSurvivors.has(seat)) dead.add(seat);
+    }
+  }
+  const createdMs = row.createdAt instanceof Date ? row.createdAt.getTime() : Date.parse(String(row.createdAt));
+  const updatedMs = row.updatedAt instanceof Date ? row.updatedAt.getTime() : Date.parse(String(row.updatedAt));
+  const rowTiming = setup.timing ?? {
+    ...initialGameTiming(),
+    startedAt: createdMs,
+    accumulatedMs: Math.max(0, updatedMs - createdMs),
+    endedAt: finished ? updatedMs : null,
+    savedAt: updatedMs,
+  };
   return {
     gameId,
+    manualRoleAssignEnabled: setup.options?.manualRoleAssignEnabled === true,
     boardId: row.boardId,
     boardName: row.boardName,
     titleNo: row.titleNo ?? "",
     status: row.status as GameStatus,
-    day: row.dayCount,
+    postGameReviewFirst: setup.options?.postGameReviewFirst === true,
+    postGameAutoStart: setup.options?.postGameAutoStart === true,
+    elapsedMs: elapsedAt(rowTiming, row.status === "running" ? Date.now() : updatedMs),
+    timerRunning: row.status === "running" && rowTiming.runningSince != null,
+    timingSyncedAt: Date.now(),
+    // 只读历史以事件日为准；尚未开始且零事件的对局不应虚标为第1天。
+    day: eventDay ?? (row.status === "created" ? 0 : row.dayCount),
     phase: finished ? "finished" : "interrupted",
     phaseLabel: finished ? "对局已结束" : "对局已中断（服务重启后仅可查看事件流）",
-    // 内存丢失后无法还原存活/警长状态，角色仍全亮（上帝视角），存活信息以事件流为准
     players: (setup.seatRoles ?? []).map((role, i) => ({
       seat: i + 1,
       role,
       roleName: ROLE_META[role]?.name ?? String(role),
       camp: ROLE_META[role]?.camp ?? "villager",
-      alive: true,
-      sheriff: false,
-      deathInfo: null,
+      alive: !dead.has(i + 1),
+      sheriff: sheriffSeat === i + 1,
+      deathInfo: deathInfo.get(i + 1) ?? (finalSurvivors && !finalSurvivors.has(i + 1) ? '出局' : null),
       aiModel: setup.seatModels?.[i] ?? "",
       personaName: (setup.seatPersonas ?? []).find((s) => s.seat === i + 1)?.name ?? null,
+      personaImageData: personaImages?.get(i + 1) ?? null,
     })),
     winner: (row.winner as "wolf" | "good" | null) ?? null,
     seq,
@@ -2541,6 +2047,7 @@ function snapshotFromRow(gameId: string, row: GameRow, seq: number): GameSnapsho
 
 // ---------- 服务实现 ----------
 async function createGame(input: CreateGameInput, userId?: string): Promise<{ gameId: string }> {
+  assertStudyOptions(input.options);
   const board = BOARDS.find((b) => b.id === input.boardId);
   if (!board) throw new Error(`未知版型: ${input.boardId}`);
 
@@ -2557,14 +2064,15 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
     }
   });
 
-  // 随机洗牌分配角色；先建引擎（失败则不落库，保持一致性）
-  const seatRoles = shuffle([...board.roles]);
+  // 非手动模式随机洗牌；手动模式先按版型原顺序占位，开始时以用户分配结果重建引擎。
+  const seatRoles = input.options.manualRoleAssignEnabled ? [...board.roles] : shuffle([...board.roles]);
   const engine = createEngine({ boardId: board.id, seatRoles, options: input.options });
 
-  // 人格研究库：座位人格绑定校验与加载（卡必须属于当前用户；绑定座位走心镜→涌现管线）
+  // 人格研究站：座位人格绑定校验与加载（卡必须属于当前用户；绑定座位走心镜→涌现管线）
   let personaInfos: PersonaSeatInfo[] | undefined;
   let personaCards: Map<number, PersonaCard> | undefined;
-  let personaMemory: Map<number, string> | undefined;
+  let personaMemory: Map<number, MemoryPool> | undefined;
+  let personaSnapshots: Map<number, PersonaSnapshot<MemoryPool>> | undefined;
   if (input.seatPersonas && input.seatPersonas.length > 0) {
     const seen = new Set<number>();
     for (const b of input.seatPersonas) {
@@ -2577,15 +2085,18 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
     personaInfos = [];
     personaCards = new Map();
     personaMemory = new Map();
+    personaSnapshots = new Map();
     for (const b of input.seatPersonas) {
       const card = await getPersona(b.personaId, userId ?? "");
       if (!card) {
         throw new Error(`座位 ${b.seat} 绑定的人格卡不存在或不属于当前用户（id=${b.personaId}）`);
       }
-      personaCards.set(b.seat, card);
+      const memory = await loadMemoryPool(card.id);
+      const snapshot = createPersonaSnapshot(card, memory);
+      personaCards.set(b.seat, snapshot.card);
+      personaMemory.set(b.seat, snapshot.memory);
+      personaSnapshots.set(b.seat, snapshot);
       personaInfos.push({ seat: b.seat, personaId: b.personaId, name: card.name });
-      // 记事簿：跨对局记忆与关系图谱注入（铁律3：人格记得自己的对局）
-      personaMemory.set(b.seat, await loadMemoryContext(card.id));
     }
   }
 
@@ -2609,11 +2120,15 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
       seatRoles,
       seatModels: seats.map((s) => s.model),
       options: input.options,
+      timing: initialGameTiming(),
       seatAIsEnc: encryptSecret(JSON.stringify(seats)),
       // 胜率推测开关随 setup 落库：服务重启/恢复后功能仍在
       winRateEnabled: input.winRateEnabled === true,
-      // 人格绑定快照（含人格名冗余）：断点恢复与快照展示的依据
+      analystAutoGenerate: input.analystAi ? input.analystAi.autoGenerate !== false : false,
+      ...(input.analystAi ? { analystAiEnc: encryptSecret(JSON.stringify(input.analystAi)) } : {}),
+      // 人格绑定与开局内容快照：恢复不得被研究站后续修改覆盖
       ...(personaInfos ? { seatPersonas: personaInfos } : {}),
+      ...(personaSnapshots ? { personaSnapshots: Object.fromEntries(personaSnapshots) } : {}),
     } satisfies StoredSetup,
   });
 
@@ -2634,14 +2149,17 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
     boardId: board.id,
     userId: userId ?? null,
     status: "created",
+    timing: initialGameTiming(),
     seq: 0,
     timer: null,
     pending: null,
     options: input.options,
+    manualRolesAssigned: false,
     ticking: false,
     lastTickAt: Date.now(),
     noProgressTicks: 0,
     pauseWaiters: [],
+    decisionEpoch: 0,
     suspendDraft: null,
     decisionIdx: 0,
     analystAi: input.analystAi ?? null, // 仅存内存注册表，不落库
@@ -2666,16 +2184,17 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
     studyDoneSeats: new Set(),
     studying: false,
     studyDone: false,
-    // 人格研究库：绑定人格的座位（心镜→涌现管线 + 记事簿注入 + 涌现注解暂存）
+    // 人格研究站：绑定人格的座位（心镜→涌现管线 + 记事簿注入 + 涌现注解暂存）
     personaCards,
     personaMemory,
+    personaSnapshots,
     personaEventMeta: personaCards ? new Map() : undefined,
     seatPersonas: personaInfos,
   });
   return { gameId };
 }
 
-async function control(gameId: string, action: "start" | "pause" | "terminate" | "stopPostGame", userId?: string): Promise<{ ok: boolean }> {
+async function control(gameId: string, action: "start" | "pause" | "terminate" | "stopPostGame", userId?: string, seatRoles?: RoleId[]): Promise<{ ok: boolean }> {
   await requireOwnedGame(gameId, userId); // 账户隔离：仅本人可操控对局
   let rt = registry.get(gameId);
 
@@ -2690,11 +2209,13 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
       /* 引擎快照不可用按非赛后处理 */
     }
     if (!inPostGame) return { ok: false };
+    rt.decisionEpoch += 1;
     if (rt.timer) {
       clearTimeout(rt.timer);
       rt.timer = null;
     }
-    rt.status = "finished"; // 先收敛：被唤醒的在飞决策据此挂起停链，不再产出新的赛后发言
+    rt.timing = finishTiming(rt.timing, Date.now());
+  rt.status = "finished"; // 先收敛：被唤醒的在飞决策据此挂起停链，不再产出新的赛后发言
     const waiters = rt.pauseWaiters.splice(0);
     for (const wake of waiters) wake();
     rt.pending = null;
@@ -2726,13 +2247,15 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
     try {
       const snap = rt.engine.getSnapshot();
       await withTimeout(
-        updateGame(gameId, { status: "finished", dayCount: snap.day }),
+        persistGameTiming(gameId, rt.timing, { status: "finished", dayCount: snap.day }),
         DB_TIMEOUT_MS,
         "赛后终止状态落库超时",
       );
     } catch {
       /* 内存已 finished，DB 抖动不阻塞 */
     }
+    // 「自动心理检查」的赛后讨论对局：赛后讨论被手动终止同样视为赛后结束，自动开始心理检查
+    maybeAutoPsyCheck(gameId, rt.options, "postgameEnd");
     return { ok: true };
   }
 
@@ -2743,11 +2266,13 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
   // 已 finished 幂等返回 ok；rt 不在内存（服务重启后）只落库，终止后仍可经断点重放复盘到终止瞬间。
   if (action === "terminate") {
     if (rt && rt.status !== "finished") {
+      rt.decisionEpoch += 1;
       if (rt.timer) {
         clearTimeout(rt.timer);
         rt.timer = null;
       }
-      rt.status = "finished"; // 先收敛状态：被唤醒的在飞决策据此挂起停链，绝不再结算
+      rt.timing = finishTiming(rt.timing, Date.now());
+  rt.status = "finished"; // 先收敛状态：被唤醒的在飞决策据此挂起停链，绝不再结算
       const waiters = rt.pauseWaiters.splice(0);
       for (const wake of waiters) wake();
       rt.pending = null;
@@ -2787,8 +2312,9 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
         } catch {
           /* 引擎快照不可用则保留原值 */
         }
+        const timing = rt?.timing ?? finishTiming((row.setup as StoredSetup).timing ?? initialGameTiming(), Date.now());
         await withTimeout(
-          updateGame(gameId, { status: "finished", dayCount }),
+          persistGameTiming(gameId, timing, { status: "finished", dayCount }),
           DB_TIMEOUT_MS,
           "终止状态落库超时",
         );
@@ -2805,6 +2331,33 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
     if (!rt) return { ok: false };
     if (rt.status !== "created" && rt.status !== "paused") return { ok: false };
     rt.pauseReason = null; // 恢复即清空暂停原因（额度耗尽提示等）
+    // 手动分配：首次提交时校验并重建引擎、持久化；赛前学习/暂停续跑只复用，
+    // 不重复要求 seatRoles，也不重建引擎而丢掉挂起待决。
+    const currentRt = rt;
+    if (currentRt.decisionIdx === 0 && (currentRt.status === "created" || currentRt.status === "paused") && currentRt.options.manualRoleAssignEnabled) {
+      const board = BOARDS.find((b) => b.id === currentRt.boardId);
+      if (!board) return { ok: false };
+      if (seatRoles) {
+        assertBoardSeatRoles(board, seatRoles);
+        currentRt.engine = createEngine({ boardId: board.id, seatRoles, options: currentRt.options });
+        const row = await withTimeout(getGame(gameId), DB_TIMEOUT_MS, "读取对局超时");
+        if (!row) return { ok: false };
+        await withTimeout(
+          updateGame(gameId, {
+            setup: { ...(row.setup as StoredSetup), seatRoles, manualRolesAssigned: true },
+          }),
+          DB_TIMEOUT_MS,
+          "保存角色分配超时",
+        );
+        currentRt.manualRolesAssigned = true;
+        rt.pending = null;
+        rt.acts = null;
+        rt.displayPhase = null;
+      } else if (!currentRt.manualRolesAssigned) {
+        assertBoardSeatRoles(board, []);
+      }
+    }
+    rt.timing = startTiming(rt.timing, Date.now());
     // 图书馆赛前学习：开启开关且未完成学习时，「开始对局」先触发学习——学习全程在对局页
     // 可见（祖母绿状态环+进度+点击座位看详情），全部学完自动开赛进入黑夜
     // （学习期间 status 保持 created 白天态，poll.study 透出进度）
@@ -2823,12 +2376,15 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
             if (rtRef.status === "created") void control(gameId, "start", userId); // 全部学完自动开赛（进入黑夜）
           });
       }
+      try {
+        await withTimeout(persistGameTiming(gameId, rt.timing), DB_TIMEOUT_MS, "保存计时状态超时");
+      } catch { /* 内存计时继续，下一保存点补齐 */ }
       return { ok: true };
     }
     rt.status = "running";
     // DB 抖动不阻塞启动（内存是活对局的权威状态；失败仅影响重启后可见性）
     try {
-      await withTimeout(updateGame(gameId, { status: "running" }), DB_TIMEOUT_MS, "更新对局状态超时");
+      await withTimeout(persistGameTiming(gameId, rt.timing, { status: "running" }), DB_TIMEOUT_MS, "更新对局状态超时");
     } catch { /* 内存已 running，继续 */ }
     // 若上一个 tick 仍在飞（如 pause 后立刻 start），让它自己链式调度
     if (!rt.ticking) scheduleTick(gameId, rt, 0);
@@ -2839,9 +2395,14 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
 
   // pause：先收敛内存状态（即时生效），DB 只做尽力而为的持久化
   if (rt) {
+    rt.decisionEpoch += 1;
+    rt.timing = pauseTiming(rt.timing, Date.now());
     if (rt.status === "running" || rt.status === "created") {
       rt.status = "paused";
     }
+    // 手动暂停不带原因文本（2026-10-15 用户裁定：原因提示只属于额度耗尽/服务中断等异常暂停，
+    // 手动暂停时按钮旁与横幅一律不显示——此前旧额度事件经事件流兜底反复诈尸）
+    rt.pauseReason = null;
     if (rt.timer) {
       clearTimeout(rt.timer);
       rt.timer = null;
@@ -2855,7 +2416,8 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
     const row = await withTimeout(getGame(gameId), DB_TIMEOUT_MS, "读取对局超时");
     if (!row) return { ok: false };
     if (row.status !== "finished") {
-      await withTimeout(updateGame(gameId, { status: "paused" }), DB_TIMEOUT_MS, "更新对局状态超时");
+      const timing = rt?.timing ?? pauseTiming((row.setup as StoredSetup).timing ?? initialGameTiming(), Date.now());
+      await withTimeout(persistGameTiming(gameId, timing, { status: "paused" }), DB_TIMEOUT_MS, "更新对局状态超时");
     }
   } catch {
     // DB 失败不影响暂停本身：内存已 paused，tick 链已停；返回成功避免前端误报「操作失败」
@@ -2863,240 +2425,27 @@ async function control(gameId: string, action: "start" | "pause" | "terminate" |
   return { ok: true };
 }
 
-// 断点重放恢复：服务重启/崩溃后，用落盘的 setup（座位角色+AI配置+选项）与决策日志
-// 确定性重放（引擎无任何随机源），把对局精确重建到断点——包括停在某个待决点的中间态。
-// 恢复后 running 立即补链继续跑；paused/created 保持原状态待用户启动；finished 仅用于完整复盘。
-// 旧对局 setup 无 seatAIs → 返回 null（保持「重启后仅可查看事件」的旧行为）。
-async function recoverGame(gameId: string): Promise<GameRuntime | null> {
-  const inflight = recoveringGames.get(gameId);
-  if (inflight) return inflight;
-  const task = doRecoverGame(gameId).finally(() => recoveringGames.delete(gameId));
-  recoveringGames.set(gameId, task);
-  return task;
+/** 报告与认知指南全部就绪后的自动续跑入口；手动模式只解除开始条件。 */
+async function resumePostGameAfterReview(gameId: string): Promise<void> {
+  const row = await getGame(gameId);
+  if (!row || row.status !== "paused" || row.winner == null) return;
+  const options = (row.setup as StoredSetup).options;
+  if (options.postGameReviewFirst !== true || options.postGameAutoStart !== true) return;
+  const result = await startPostGame(gameId, row.userId);
+  if (!result.started) {
+    console.warn(`[postgame] 对局 ${gameId} 复盘就绪后自动续跑未启动：${result.reason ?? "未知原因"}`);
+  }
 }
 
-async function doRecoverGame(gameId: string): Promise<GameRuntime | null> {
-  const rt = await buildRuntimeFromStore(gameId);
-  // running 的对局立即补链继续跑（恢复前的服务中断等价于一次长卡顿）
-  if (rt && rt.status === "running") {
-    scheduleTick(gameId, rt, 0);
-    maybeWinRateTick(gameId, rt); // 恢复续跑后补一次胜率评估（开关随 setup 落库）
-  }
-  return rt;
-}
-
-// 从落盘原料重建运行时（doRecoverGame 的主体，纯搬运；唯一扩展：optionsOverride 覆盖
-// setup.options——已结束对局补开赛后讨论时强制 postGameDiscuss:true 重放，让生成器
-// 越过 endGame 继续进入 postGamePhase）。
-// 旧对局 setup 无 seatAIs → 返回 null（保持「重启后仅可查看事件」的旧行为）。
-async function buildRuntimeFromStore(
-  gameId: string,
-  opts?: { optionsOverride?: Partial<AdvancedOptions> },
-): Promise<GameRuntime | null> {
-  const row = await withTimeout(getGame(gameId), DB_TIMEOUT_MS, "读取对局超时");
-  if (!row) return null;
-  const setup = (row.setup ?? null) as StoredSetup | null;
-  const seatAIs = setup ? seatAIsOfSetup(setup) : undefined;
-  if (!seatAIs || !setup?.seatRoles?.length) return null; // 旧对局：无恢复原料
-  const board = BOARDS.find((b) => b.id === row.boardId);
-  if (!board) return null;
-
-  const options: AdvancedOptions = { ...setup.options, ...opts?.optionsOverride };
-  const engine = createEngine({ boardId: board.id, seatRoles: setup.seatRoles, options });
-  const decisions = await withTimeout(getDecisions(gameId), DB_TIMEOUT_MS, "决策日志读取超时");
-  const maxSeq = await withTimeout(getMaxEventSeq(gameId), DB_TIMEOUT_MS, "事件游标读取超时");
-  // displayPhase 以库中最后一条阶段提醒为准（显示跟随已落盘内容，而非引擎活阶段值）
-  const latestPhaseEvt = await withTimeout(
-    getLatestPhaseEvent(gameId),
-    DB_TIMEOUT_MS,
-    "阶段提醒读取超时",
-  );
-  // 确定性重放：逐条重放已采纳决策；每个待决点应与记录一致（kind+seat 一致性校验）。
-  // 关键：捕获最后一条决策 decide() 排出的事件批——运行时是「决策日志先于事件落盘」
-  // （appendDecision → persistWithPhaseBreak），崩溃/重启若落在两者之间（含交界静歇的
-  // 数秒睡眠窗口），该批事件会全部或部分（交界切分的前半已落、后半未落）丢失；
-  // 重放只能恢复引擎状态，事件必须由恢复流程比对补齐（见下方断点事件补漏）。
-  let lastDrained: EngineEvent[] = [];
-  for (let i = 0; i < decisions.length; i++) {
-    const rec = decisions[i];
-    // 外部结算条目（auditSettle）：不喂 advance/decide（其时刻待决是被封存而非消费），
-    // 直接调引擎 settleExternal 落定胜者——引擎快照 winner/phase 与赛后衔接全部精确重建
-    //（kind 落库为自由字符串；auditSettle 不在 DecisionKind 枚举内——它是服务层结算标记）
-    if ((rec.kind as string) === "auditSettle") {
-      const d = rec.decision as { auditSettle?: unknown; auditNote?: unknown; auditPub?: unknown };
-      if (d.auditSettle !== "wolf" && d.auditSettle !== "good") {
-        throw new Error(`恢复重放分叉：auditSettle 条目胜者非法（${JSON.stringify(d.auditSettle)}，${gameId}）`);
-      }
-      lastDrained = engine.settleExternal(
-        d.auditSettle,
-        typeof d.auditNote === "string" ? d.auditNote : undefined,
-        typeof d.auditPub === "string" ? d.auditPub : undefined,
-      );
-      continue;
-    }
-    const adv = engine.advance();
-    if (!adv.pending) throw new Error(`恢复重放分叉：第 ${i} 步前引擎已无待决（${gameId}）`);
-    if (adv.pending.kind !== rec.kind || adv.pending.seat !== rec.seat) {
-      throw new Error(
-        `恢复重放分叉：第 ${i} 步期望 ${rec.kind}@seat${rec.seat}，实际 ${adv.pending.kind}@seat${adv.pending.seat}（${gameId}）`,
-      );
-    }
-    lastDrained = engine.decide(rec.decision);
-  }
-
-  // 已落盘事件尾部：① lastDayPart/lastEventPhase 必须以「已落盘内容」为基准——
-  // 引擎活阶段值在 decide() 中先行推进，崩溃恢复时可能领先落盘内容一整个时段
-  // （历史 bug：以引擎活阶段为基准，补漏批的日夜交界被误判为同时段，停歇静默跳过）；
-  // ② 供最后一条决策事件批的落盘前缀比对（断点事件补漏）
-  const persistedTail = await withTimeout(
-    getLatestEvents(gameId, lastDrained.length + 10),
-    DB_TIMEOUT_MS,
-    "事件尾部读取超时",
-  );
-  // 赛前学习笔记（图书馆开启时）：恢复可读，未学全则开赛时补足
-  const studyRows = options.libraryEnabled
-    ? await withTimeout(getStudyNotes(gameId), DB_TIMEOUT_MS, "学习笔记读取超时").catch(() => [] as { seat: number; notes: string }[])
-    : [];
-  const studyMap = new Map<number, string>(studyRows.map((r) => [r.seat, r.notes]));
-  const latestEvt = persistedTail[persistedTail.length - 1] ?? null;
-
-  const rt: GameRuntime = {
-    engine,
-    boardId: board.id,
-    userId: row.userId ?? null,
-    options,
-    seatAIs,
-    status: row.status as GameStatus,
-    pending: null,
-    seq: maxSeq,
-    decisionIdx: decisions.length,
-    timer: null,
-    ticking: false,
-    lastTickAt: Date.now(),
-    noProgressTicks: 0,
-    pauseWaiters: [],
-    suspendDraft: null,
-    analystAi: null, // 分析师配置仅存内存，恢复后由前端再次发起分析时携带/回落座位配置
-    // 时段基准以「已落盘内容」为准（而非引擎活阶段值——崩溃时后者可能领先一整个时段，
-    // 导致补漏批的交界被静默跳过）；无任何落盘事件时按引擎阶段兜底（等价于空基准）
-    lastDayPart: latestEvt
-      ? (partOfPhase(latestEvt.phase) ?? "")
-      : engine.getSnapshot().phase.startsWith("night.")
-        ? "night"
-        : engine.getSnapshot().phase.startsWith("day.")
-          ? "day"
-          : "",
-    lastEventPhase: latestEvt?.phase ?? null,
-    displayPhase: latestPhaseEvt
-      ? {
-          day: latestPhaseEvt.day,
-          phase: latestPhaseEvt.phase,
-          phaseLabel: latestPhaseEvt.title,
-        }
-      : null,
-    pendingHold: false,
-    breakKind: null,
-    acts: null,
-    breakStartedAt: null,
-    winRateEnabled: setup.winRateEnabled === true, // 恢复依据：开关随 setup 落库
-    winRateInFlight: false,
-    winRateFinalPending: false,
-    winRateDirty: false,
-    winRateLastEvalAt: 0,
-    winRateLastSeq: -1,
-    winRateLoopTimer: null,
-    winRateLastStoredSeq: 0,
-    // 胜负落库状态随 row 重建：已落过 winner 的对局（含赛后讨论中断恢复）不再重复落库/触发分析
-    decidedPersisted: row.winner != null,
-    // 恢复重建为 false：只有 running 对局会被恢复，恢复时 rt.pending 非空走直接决策路径，
-    // 挂起只会在「新 advance 出 postgameSpeak」时触发一次（正常对局只会出现一次赛后讨论）
-    postgameAutoHeld: false,
-    // 对局笔记随决策日志重建（与引擎状态同源，重放一致性天然成立）
-    seatNotes: rebuildSeatNotesFromLog(decisions),
-    studyNotes: studyMap,
-    studyDoneSeats: new Set(studyMap.keys()),
-    studying: false,
-    studyDone: options.libraryEnabled ? studyMap.size >= seatAIs.length : true,
-  };
-  registry.set(gameId, rt);
-
-  // 人格研究库：断点恢复时重载人格卡与记事簿（卡被删除的座位自动降级为普通 AI，不阻断对局恢复）
-  if (setup?.seatPersonas?.length) {
-    rt.seatPersonas = setup.seatPersonas;
-    try {
-      const cards = await getPersonaCardsInternal(setup.seatPersonas.map((s) => s.personaId));
-      rt.personaCards = new Map();
-      rt.personaMemory = new Map();
-      rt.personaEventMeta = new Map();
-      for (const info of setup.seatPersonas) {
-        const card = cards.find((c) => c.id === info.personaId);
-        if (!card) continue;
-        rt.personaCards.set(info.seat, card);
-        rt.personaMemory.set(info.seat, await loadMemoryContext(card.id));
-      }
-    } catch {
-      /* 人格数据不可用时整局按普通 AI 继续 */
-    }
-  }
-
-  // ---------- 断点事件补漏 ----------
-  // 运行时顺序是「appendDecision（决策日志）→ persistWithPhaseBreak（事件）」：崩溃/重启
-  // 若落在两者之间——尤其是交界静歇的数秒睡眠窗口（前半已落盘、后半未落盘）——最后一条
-  // 决策的事件批会全部或部分丢失，且引擎重放只恢复状态不补事件（decide 排出即弃）。
-  // 这里把重放捕获的最后一批事件与已落盘尾部做前缀比对，缺失后缀经 persistWithPhaseBreak
-  // 补齐：事件流完整（天亮/夜临公告不再凭空消失），日夜交界停歇也随之恢复。
-  // 倒数第二条及更早的决策必有后续决策落盘背书（其 tick 完整走完），不会缺失。
-  if (lastDrained.length > 0) {
-    const sameEvt = (dbEvt: { day: number; phase: string; type: string; actor: number | null; title: string; content: string; thought: string | null }, ev: EngineEvent): boolean =>
-      dbEvt.day === ev.day &&
-      dbEvt.phase === ev.phase &&
-      dbEvt.type === ev.type &&
-      dbEvt.actor === ev.actor &&
-      dbEvt.title === ev.title &&
-      dbEvt.content === ev.content &&
-      dbEvt.thought === ev.thought;
-    // 已落盘的最长前缀：在尾部任意位置找「lastDrained 前缀的最长连续匹配」——
-    // 崩溃只可能丢失后缀（逐次原子落盘），但批后可能已追加系统类事件（对局终止/系统错误/
-    // 分析失败），故匹配段不一定恰在尾部末端；取最长匹配（并列取更靠后位置），
-    // 杜绝把已完整落盘的批次误判为未落盘而整批重落造成重复（线上事故：终止标记
-    // 跟在批后，旧版只从尾部末端对齐 → 匹配失败 → 整批评重事件 seq 71-78 重复）
-    let bestLen = 0;
-    let bestPos = -1;
-    for (let p = 0; p + bestLen < persistedTail.length; p++) {
-      if (!sameEvt(persistedTail[p], lastDrained[0])) continue;
-      let k = 1;
-      while (
-        p + k < persistedTail.length &&
-        k < lastDrained.length &&
-        sameEvt(persistedTail[p + k], lastDrained[k])
-      ) {
-        k++;
-      }
-      if (k > bestLen || (k === bestLen && p > bestPos)) {
-        bestLen = k;
-        bestPos = p;
-      }
-    }
-    const missing = lastDrained.slice(bestLen);
-    if (missing.length > 0) {
-      await persistWithPhaseBreak(gameId, rt, missing);
-    }
-  }
-
-  return rt;
-}
-
-// 已结束对局补开赛后讨论：用户显式点击「开启赛后讨论」。
-// 引擎决策日志是确定性重放的——用 {...setup.options, postGameDiscuss: true} 重建引擎并
-// 重放全部决策，原对局在最后一条决策处跑完 endGame；强制开启后生成器会继续进入
-// postGamePhase 并停在第一个 postgameSpeak 单待决上（聊天室机制：按座位顺序逐个单问；
-// decide 已排出赛后开场事件，由 buildRuntimeFromStore 的断点事件补漏作为缺失后缀补齐落盘）。
-// 之后按普通 running 对局 tick 直播生成讨论（单 pending 走 decideWithAi，AI 失败启发式兜底=本轮弃权）。
 async function startPostGame(
   gameId: string,
   userId?: string,
 ): Promise<{ started: boolean; reason?: string }> {
   const row = await requireOwnedGame(gameId, userId);
+  const setup = row.setup as StoredSetup;
+  if (setup.options.postGameReviewFirst === true && !(await postGameReviewReady(gameId, row))) {
+    return { started: false, reason: "复盘报告尚未生成完成并写入玩家认知库，暂不能开始赛后讨论；无需查看报告" };
+  }
 
   // 路径A：分出胜负后挂起待开始（内存有运行时、停在 postgameSpeak）——
   // 「开启赛后讨论」的专用恢复通道：不再占用 control("start")（与继续键职责分离）
@@ -3115,9 +2464,10 @@ async function startPostGame(
       return { started: false, reason: "当前不在赛后讨论待开始状态" };
     }
     rt.postgameAutoHeld = true; // 用户显式开启：挂起拦截已消费
+    rt.timing = startTiming(rt.timing, Date.now());
     rt.status = "running";
     try {
-      await withTimeout(updateGame(gameId, { status: "running" }), DB_TIMEOUT_MS, "状态落库超时");
+      await withTimeout(persistGameTiming(gameId, rt.timing, { status: "running" }), DB_TIMEOUT_MS, "状态落库超时");
     } catch {
       /* 内存已 running，DB 抖动不阻塞 */
     }
@@ -3134,8 +2484,8 @@ async function startPostGame(
   if (await hasPostGameEvents(gameId)) {
     return { started: false, reason: "赛后讨论已生成" };
   }
-  const setup = (row.setup ?? null) as StoredSetup | null;
-  if (!setup || !seatAIsOfSetup(setup) || !setup.seatRoles?.length) {
+  const replaySetup = (row.setup ?? null) as StoredSetup | null;
+  if (!replaySetup || !seatAIsOfSetup(replaySetup) || !replaySetup.seatRoles?.length) {
     return { started: false, reason: "该对局缺少回放原料，无法补开" };
   }
   let rt: GameRuntime | null = null;
@@ -3158,10 +2508,11 @@ async function startPostGame(
   }
   rt.pending = adv.pending;
   rt.acts = rt.engine.getSnapshot().pendingActs;
+  rt.timing = startTiming({ ...rt.timing, endedAt: null }, Date.now());
   rt.status = "running";
   rt.postgameAutoHeld = true; // 用户显式点击开启：不再触发挂起拦截
   rt.decidedPersisted = true; // winner 已落库，杜绝重复触发分析
-  await withTimeout(updateGame(gameId, { status: "running" }), DB_TIMEOUT_MS, "状态落库超时");
+  await withTimeout(persistGameTiming(gameId, rt.timing, { status: "running" }), DB_TIMEOUT_MS, "状态落库超时");
   scheduleTick(gameId, rt, 0);
   startWinRateLoop(gameId, rt); // 赛后生成期间胜率预演同样继续
   return { started: true };
@@ -3208,10 +2559,10 @@ function tickKeyOf(rt: GameRuntime): string {
 /** 胜率推测轮询载荷：仅本局开启开关（rt 存活且 winRateEnabled）时查询；查库失败不阻断轮询主路径 */
 async function winRatePayload(
   gameId: string,
-  rt: GameRuntime | null | undefined,
+  enabled: boolean,
   afterWinRateId: number,
 ): Promise<PollResult["winRate"] | undefined> {
-  if (!rt?.winRateEnabled) return undefined;
+  if (!enabled) return undefined;
   try {
     const [entries, latest] = await Promise.all([
       getWinRatesAfter(gameId, afterWinRateId),
@@ -3235,20 +2586,31 @@ async function poll(gameId: string, afterSeq: number, lastSig?: string, userId?:
   }
 
   let rt: GameRuntime | null | undefined = registry.get(gameId);
-  // 运行时缺失（服务重启/崩溃）：优先断点重放恢复；
-  // 原料缺失的旧对局、或决策日志早于新增检查点（如遗言后/技能询问后权衡）导致重放分叉的，
-  // 一律优雅降级为「暂停+行快照」（事件仍可查看），绝不让轮询抛 500
-  if (!rt) {
+  // 续跑对局在运行时缺失时优先断点重放；已结束对局是只读历史，
+  // 直接以最终事件组装快照，避免旧规则兼容问题在每次打开时反复触发。
+  if (!rt && row.status !== "finished") {
     rt = null;
     try {
       rt = await recoverGame(gameId);
-    } catch {
+    } catch (recoverErr) {
+      // 恢复失败可见性（重放分叉/原料异常不再静默降级）：控制台留一行诊断，对前端仍优雅降级
+      console.warn(`[recover] 对局 ${gameId} 断点重放失败：`, recoverErr instanceof Error ? recoverErr.message : recoverErr);
       rt = null;
     }
     if (!rt && (row.status === "created" || row.status === "running")) {
       // 旧对局（setup 无 seatAIs 或日志分叉）：标记暂停（事件仍可看）
       await updateGame(gameId, { status: "paused" });
       row = { ...row, status: "paused" };
+    }
+  }
+
+  // 运行中每 5 秒落一个计时保存点：崩溃恢复只累计到最后保存点，不把停机时间算入对局。
+  if (rt?.status === "running" && rt.timing.runningSince != null && Date.now() - rt.timing.savedAt >= 5_000) {
+    rt.timing = { ...rt.timing, savedAt: Date.now() };
+    try {
+      await persistGameTiming(gameId, rt.timing);
+    } catch {
+      /* 下一保存点重试，不阻断对局轮询 */
     }
   }
 
@@ -3278,7 +2640,7 @@ async function poll(gameId: string, afterSeq: number, lastSig?: string, userId?:
     const snapshot = rt.snapCache?.tickKey === tickKey ? rt.snapCache.snapshot : snapshotFromRuntime(gameId, row, rt);
     rt.snapCache = { tickKey, snapshot };
     const events = await getEventsAfter(gameId, afterSeq);
-    const winRate = await winRatePayload(gameId, rt, afterWinRateId ?? 0);
+    const winRate = await winRatePayload(gameId, rt.winRateEnabled, afterWinRateId ?? 0);
     // 补开赛后讨论资格透出：已结束或暂停待续、分了胜负、且库里确无赛后事件 →
     // 前端据此显示「开启赛后讨论」按钮；查库失败静默不附旗标。
     //（paused 纳入：分出胜负即落库 winner——审核驳回修复等对局停在「胜负已定、赛后未启」的
@@ -3319,7 +2681,8 @@ async function poll(gameId: string, afterSeq: number, lastSig?: string, userId?:
   const events = await getEventsAfter(gameId, afterSeq);
   // 无 runtime 时用增量事件的最大 seq 作为游标（无新事件则维持 afterSeq）
   const seqHint = events.length > 0 ? events[events.length - 1].seq : afterSeq;
-  const snapshot = snapshotFromRow(gameId, row, seqHint);
+  const [allEvents, personaImages] = await Promise.all([getAllEvents(gameId), personaImagesOf(row)]);
+  const snapshot = snapshotFromRow(gameId, row, seqHint, undefined, allEvents, personaImages);
   const tickKey = `row|${snapshot.status}|${seqHint}`;
   if (lastSig && lastSig === tickKey && events.length === 0) {
     return { unchanged: true, events: [] };
@@ -3336,11 +2699,13 @@ async function poll(gameId: string, afterSeq: number, lastSig?: string, userId?:
   }
   // 心理检查进度透出（行快照路径同样透出：无运行时的旧对局也能看到检查状态）
   const psyCheckRow = await psyCheckPayload(gameId, row, null);
+  const winRate = await winRatePayload(gameId, (row.setup as StoredSetup).winRateEnabled === true, afterWinRateId ?? 0);
   return {
     unchanged: false,
     tickKey,
     snapshot,
     events,
+    ...(winRate ? { winRate } : {}),
     ...(postGameEligible ? { postGameEligible } : {}),
     ...(psyCheckRow ? { psyCheck: psyCheckRow } : {}),
   };
@@ -3372,10 +2737,10 @@ async function exportGame(
   const row = userId ? await requireOwnedGame(gameId, userId) : await getGame(gameId);
   if (!row) throw new Error(`对局不存在: ${gameId}`);
   const rt = registry.get(gameId);
-  const events = await getAllEvents(gameId);
+  const [events, personaImages] = await Promise.all([getAllEvents(gameId), personaImagesOf(row)]);
   const snapshot = rt
     ? snapshotFromRuntime(gameId, row, rt)
-    : snapshotFromRow(gameId, row, events.length > 0 ? events[events.length - 1].seq : 0);
+    : snapshotFromRow(gameId, row, events.length > 0 ? events[events.length - 1].seq : 0, deathSeatsFromEvents(events), events, personaImages);
   return { snapshot, events };
 }
 
@@ -3529,7 +2894,7 @@ async function generateAnalysis(
   return { started: true };
 }
 
-/** 人格研究库：本局人格座位的《心理检查报告》列表（归属校验后返回） */
+/** 人格研究站：本局人格座位的《心理检查报告》列表（归属校验后返回） */
 async function personaReports(gameId: string, userId: string) {
   await requireOwnedGame(gameId, userId);
   return getPersonaReportsForGame(gameId);

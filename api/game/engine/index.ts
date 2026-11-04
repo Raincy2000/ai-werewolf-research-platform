@@ -16,7 +16,7 @@ import type {
   PlayerView,
 } from "./api";
 import { SPEECH_REQUIRED_KINDS } from "./api";
-import { BOARDS, ROLE_META } from "../../../contracts/game";
+import { BOARDS, ROLE_META, boardRulesText } from "../../../contracts/game";
 import type { RoleId } from "../../../contracts/game";
 
 // ---------- 内部类型 ----------
@@ -93,6 +93,7 @@ interface PlayerState {
   gravekeeperReveals: { seat: number; wasWolf: boolean }[];
   demonHunterResults: { seat: number; died: "target" | "self" | "none" }[];
   wolfChat: string[];          // 狼人频道夜间讨论记录（仅见面狼可见，跨夜累积）
+  wolfKnifeLog: string[];      // 狼队刀法台账（仅持刀狼可见）：每夜「我投刀谁/狼队最终落刀谁/平票空刀」的准确结果
   fearedNotice: boolean;     // 下一次视图提示"你被恐惧了"
   bloodMoonNotice: boolean;  // 下一次视图提示"血月封印"
 }
@@ -133,6 +134,8 @@ interface NightState {
 export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
   const board = BOARDS.find((b) => b.id === boardId);
   const witchSelfSaveRule = board?.witchSelfSave ?? "never";
+  // 版型官方规则全文（开局即全员公开：每个决策视图都携带，杜绝版型误读）
+  const boardRules = board ? boardRulesText(board, options.sheriffEnabled) : "";
   const n = seatRoles.length;
 
   // ---------- 对局状态 ----------
@@ -172,6 +175,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     gravekeeperReveals: [],
     demonHunterResults: [],
     wolfChat: [],
+    wolfKnifeLog: [],
     fearedNotice: false,
     bloodMoonNotice: false,
   }));
@@ -295,7 +299,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       kind: "badgePass",
       options: others,
       allowSkip: true,
-      hint: `你是阵亡警长（警徽流抉择）：可将警徽移交给一名存活玩家（targets=[目标]，其接任警长、获归票位与1.5票），或撕掉警徽（skip=true，本局再无警长）。警徽是阵营重要资产：好人优先移给确认的好人/信息位（如验出的金水、可信发言者），狼人则可为己方续命——判断失误可能把归票权送给对手。`,
+      hint: `你是阵亡警长（警徽流抉择）：targets=[目标] 移交警徽（其接任警长、获归票位与1.5票），或 skip=true 撕毁警徽（本局再无警长）。两者完全正当、无优劣预设：移交可信好人延续信息链，看走眼则送狼归票权；无人可信时撕毁是干净止损。狼人警长同样：续给狼队友会暴露关联，撕毁则掩埋遗产。`,
     });
     if (!inp.skip && inp.targets?.length) {
       const t = inp.targets[0];
@@ -310,20 +314,31 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     }
   }
 
-  // 猎人/狼王死亡时能否开枪：被毒、被摄梦死（含连带）、自爆、当夜被封印 均不能开枪
+  // 狼王开枪资格的最后一狼规则（网易官方：狼王出局时若其为场上最后一狼——
+  // 其余狼阵营玩家均已出局——不能开枪。2026-10-15 实锤：20261014001 第5天 2号狼王
+  // 作为最后一狼被放逐仍开枪带走猎人，错误的连锁结算把本该神民胜的局判成了狼胜）
+  function wolfKingLastWolfBlocked(p: PlayerState): boolean {
+    if (p.role !== "wolfKing") return false;
+    return !players.some((x) => x.seat !== p.seat && x.alive && campOf(x.role) === "wolf");
+  }
+
+  // 猎人/狼王死亡时能否开枪：被毒、被摄梦死（含连带）、自爆、当夜被封印、狼王为最后一狼 均不能开枪
   function canShootNow(p: PlayerState): boolean {
     if (p.role !== "hunter" && p.role !== "wolfKing") return false;
     if (p.alive || p.hasShot || p.shootBlocked || !p.deathCause) return false;
+    if (wolfKingLastWolfBlocked(p)) return false;
     return !["poison", "dream", "dreamLink", "selfDestruct"].includes(p.deathCause);
   }
 
-  function majority(votes: number[]): number {
+  // 狼刀多数决：平票返回 null（狼刀空悬，今夜无人被刀——2026-10-14 用户裁定：平票不再取最小座位号）
+  function majority(votes: number[]): number | null {
     const counts = new Map<number, number>();
     for (const v of votes) counts.set(v, (counts.get(v) ?? 0) + 1);
     let max = 0;
     for (const c of counts.values()) max = Math.max(max, c);
     const tied = [...counts.entries()].filter(([, c]) => c === max).map(([s]) => s);
-    return Math.min(...tied); // 平票取最小座位号
+    if (tied.length !== 1) return null; // 平票（或无票）：狼刀无效
+    return tied[0]!;
   }
 
   // 预言家视角查验：隐狼为好；机械狼按模仿身份；石像鬼为狼
@@ -369,6 +384,8 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
         .map((x) => x.seat);
       // 狼人频道讨论记录（信息壁垒：仅见面狼可见，绝不进 publicLog）
       if (p.wolfChat.length) priv.wolfChat = p.wolfChat.slice();
+      // 狼队刀法台账（仅持刀狼可见）：每夜「我的票 vs 最终落刀」的准确结果——自身行为客观认知锚点
+      if (p.wolfKnifeLog.length) priv.wolfKnifeLog = p.wolfKnifeLog.slice();
     }
     if (p.seerChecks.length) priv.seerChecks = p.seerChecks.map((c) => ({ ...c }));
     if (p.psychicChecks.length) priv.psychicChecks = p.psychicChecks.map((c) => ({ ...c }));
@@ -406,10 +423,12 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       phase,
       aliveSeats: pubAlive,
       deadSeats: pubDead,
+      deathTimeline: Object.fromEntries(pubDead.map((s) => [s, at(s).deathInfo ?? "已出局"])),
       revealedRoles,
       sheriffSeat,
       selfAlive: p.alive,
       rules: { witchSelfSave: witchSelfSaveRule, postGameDiscuss: !!options.postGameDiscuss },
+      boardRules,
       publicLog: publicLog.slice(),
       private: priv,
     };
@@ -485,7 +504,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
 
     if (speechKinds.has(req.kind)) {
       if (typeof inp.speech !== "string" || !inp.speech.trim())
-        throw new Error("发言类决策必须提供非空 speech");
+        throw new Error(`发言类决策必须提供非空 speech（${req.kind}@${req.seat}）`);
       return;
     }
 
@@ -647,6 +666,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     const killers = meetingAlive.length ? meetingAlive : loneAlive;
     if (night.fearedWolf) {
       emit("action", null, "狼刀被封", "狼队今夜被恐惧，无法袭击。");
+      for (const w of killers) w.wolfKnifeLog.push(`第${day}夜：狼队被恐惧，无法袭击（无人被刀）`);
     } else if (killers.length) {
       setPhase("night.wolf", `第${day}夜 · 狼人行动`);
       const votes: number[] = [];
@@ -656,14 +676,34 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
           kind: "wolfKill",
           options: aliveSeats(),
           allowSkip: false,
-          hint: "狼人：请选择今晚袭击的目标（狼队多数票决定）",
+          hint: "狼人：请选择今晚袭击的目标（狼队多数票决定；平票则狼刀空悬、无人被刀）",
         });
         const t = inp.targets![0];
         votes.push(t);
         emit("action", w.seat, "狼刀投票", `${w.seat}号狼人选择袭击${t}号玩家。`, inp.thought);
       }
       night.knifeTarget = majority(votes);
-      emit("action", null, "狼刀落定", `狼队最终决定袭击${night.knifeTarget}号玩家。`);
+      // 刀法台账回喂（2026-10-14 实锤：投12落3的狼次夜以为自己刀了12——
+      // 狼只记得自己的票，从不知道自己票没赢。每只持刀狼记下「我的票 vs 最终落刀」的准确结果）
+      for (let i = 0; i < killers.length; i++) {
+        const w = killers[i]!;
+        const v = votes[i]!;
+        w.wolfKnifeLog.push(
+          night.knifeTarget == null
+            ? `第${day}夜：你投刀${v}号，狼队平票——狼刀空悬，今夜无人被刀`
+            : night.knifeTarget === v
+              ? `第${day}夜：你投刀${v}号，狼队最终落刀${v}号（与你的票一致）`
+              : `第${day}夜：你投刀${v}号，狼队最终落刀${night.knifeTarget}号（多数决，不是你的票）`,
+        );
+      }
+      emit(
+        "action",
+        null,
+        night.knifeTarget == null ? "狼刀空悬" : "狼刀落定",
+        night.knifeTarget == null
+          ? `狼队刀口投票平票（${killers.map((w, i) => `${w.seat}号→${votes[i]}号`).join("，")}），今夜无人被刀。`
+          : `狼队最终决定袭击${night.knifeTarget}号玩家。`,
+      );
     }
 
     // 4. 机械狼模仿
@@ -1003,7 +1043,8 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     setPhase("day.dawn", `第${day}天 · 公布夜亡`);
     if (nightDeaths.length) {
       const names = nightDeaths.map((s) => `${s}号`).join("、");
-      emit("death", null, "死亡公告", `昨夜${names}玩家死亡。`);
+      const deathInfoBySeat = Object.fromEntries(nightDeaths.map((s) => [s, at(s).deathInfo]));
+      emit("death", null, "死亡公告", `昨夜${names}玩家死亡。`, null, { deathInfoBySeat });
       pub(`【死亡公告】昨夜死亡：${names}`);
       for (const s of nightDeaths) announcedDead.add(s);
     } else {
@@ -1091,25 +1132,32 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     }
 
     if (p.role === "whiteWolfKing") {
-      const inp2 = yield* ask({
-        seat: s,
-        kind: "whiteWolfTake",
-        options: aliveOthers(s),
-        allowSkip: true,
-        hint: "白狼王：自爆可以带走一名玩家同归于尽，或放弃",
-      });
-      if (!inp2.skip && inp2.targets?.length) {
-        const t = inp2.targets[0];
-        emit("action", s, "白狼王带人", `白狼王带走了${t}号玩家！`, inp2.thought, {
-          channel: "skillFired",
-          skillObject: skillCtxObject || undefined,
-          skillChoice: "fired",
+      // 最后一狼规则（网易官方）：白狼王作为场上最后一狼自爆时，狼全灭即终局（神民胜），
+      // 带人技能不进入结算——自爆的代价就是比赛结束，不存在「带走一个再输」的窗口
+      if (players.some((x) => x.alive && campOf(x.role) === "wolf")) {
+        const inp2 = yield* ask({
+          seat: s,
+          kind: "whiteWolfTake",
+          options: aliveOthers(s),
+          allowSkip: true,
+          hint: "白狼王：自爆可以带走一名玩家同归于尽，或放弃",
         });
-        pub(`【白狼王】${s}号白狼王带走了${t}号玩家。`);
-        yield* killPlayer(t, "take", `第${cnNum(day)}日`);
-        announcedDead.add(t);
-        emit("death", t, "死亡公告", `${t}号玩家被白狼王带走。`);
-        if (canShootNow(at(t))) yield* shooterChain([t]);
+        if (!inp2.skip && inp2.targets?.length) {
+          const t = inp2.targets[0];
+          emit("action", s, "白狼王带人", `白狼王带走了${t}号玩家！`, inp2.thought, {
+            channel: "skillFired",
+            skillObject: skillCtxObject || undefined,
+            skillChoice: "fired",
+          });
+          pub(`【白狼王】${s}号白狼王带走了${t}号玩家。`);
+          yield* killPlayer(t, "take", `第${cnNum(day)}日`);
+          announcedDead.add(t);
+          emit("death", t, "死亡公告", `${t}号玩家被白狼王带走。`);
+          if (canShootNow(at(t))) yield* shooterChain([t]);
+        }
+      } else {
+        emit("system", null, "最后一狼规则", "白狼王是场上最后一狼：自爆即狼全灭终局，带人技能不发动。");
+        pub("【最后一狼规则】白狼王是最后一狼，自爆不触发带人。");
       }
     }
   }
@@ -1122,7 +1170,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     const candidates: number[] = [];
     const runSeats = aliveSeats();
     const runHint =
-      "警长竞选报名（全员同时暗选，结果统一公布）：有明确竞选意愿则上警（targets=[1]）；否则留在警下投票选警长（targets=[0]）。流程保障：警上发言结束后还有退水环节，可放弃竞选转为警下投票——可以先上警表表态、不合适再退，不必因怕下不来台而不敢上警。注意：全员上警会因警下无人投票导致警徽直接流失，没有竞选把握建议留在警下。";
+      "警长竞选报名（全员同时暗选，结果统一公布）：有明确竞选意愿则上警（targets=[1]）；否则留在警下投票选警长（targets=[0]）。流程保障：警上发言结束后还有退水环节，可放弃竞选转为警下投票——可以先上警表表态、不合适再退，不必因怕下不来台而不敢上警。即使全员上警也会先完成警上发言和退水；若届时无人退水，才会因警下无人投票导致警徽流失，没有竞选把握建议留在警下。";
     const runInputs = yield* askBatch(
       runSeats.map((s) => ({
         seat: s,
@@ -1146,13 +1194,11 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     // ≥2 名候选人：标记「竞选中」（快照透出灰色警徽）；单人上警直接当选不标记
     if (candidates.length >= 2) sheriffCandidates = candidates.slice();
 
-    if (candidates.length === 0 || candidates.length === aliveSeats().length) {
+    // 只有无人报名时才能提前结束竞选。全员上警也必须先完成警上发言与退水：
+    // 有人退水就会形成警下选民；是否流失应在退水结果确定后再判断。
+    if (candidates.length === 0) {
       sheriffGone = true;
-      // 区分两种流失原因：全员上警≠无人上警（历史 bug 观感：明明人人上警却显示"无人当选"）
-      const reason =
-        candidates.length === 0
-          ? "无人上警竞选，警徽流失，本局无警长。"
-          : "全员上警，警下无人投票，警徽流失，本局无警长。";
+      const reason = "无人上警竞选，警徽流失，本局无警长。";
       emit("system", null, "警徽流失", reason);
       pub(`【警徽流失】${reason}`);
       return "done";
@@ -1309,6 +1355,16 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     }
     // 投票候选池=留任者；退水者与未上警者同为警下投票人
     sheriffCandidates = staying.slice();
+    // 全员留任时警下无人可投票，必须在完成退水后按真实原因流失，
+    // 不能提前在报名阶段抢走玩家的退水机会，也不能误报为普通平票。
+    if (aliveSeats().every((s) => staying.includes(s))) {
+      sheriffGone = true;
+      sheriffCandidates = [];
+      const reason = "全员留任竞选，警下无人投票，警徽流失，本局无警长。";
+      emit("system", null, "警徽流失", reason);
+      pub(`【警徽流失】${reason}`);
+      return "done";
+    }
 
     // 警徽投票（平票则PK一次，再平则警徽流失）
     setPhase("day.sheriff.vote", `第${day}天 · 警徽投票`);
@@ -1508,11 +1564,13 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
   // 可择机打断不利信息的扩散（如狼队友被查杀时立即自爆入夜、骑士听出狼立即决斗）。
   // 不发动则按兵不动（思考量落观察者事件，不进公开记录，不暴露身份）。
   // 构造本轮权衡请求（不立即询问）：objectText 写入按兵/发动事件 meta.skillObject
-  function buildWeighReqs(objectText: string): AskReq[] {
+  // allowKnight（2026-10-15 用户裁定，对齐网易官方）：骑士决斗仅在「放逐发言阶段」（白天发言与
+  // 平票 PK 发言）发起——警上竞选/夜亡公告/警长当选/放逐后的遗言与技能询问等节点一律不提供决斗权衡
+  function buildWeighReqs(objectText: string, allowKnight = false): AskReq[] {
     const actors = players.filter(
       (p) =>
         p.alive &&
-        ((p.role === "knight" && !duelUsed) ||
+        ((p.role === "knight" && !duelUsed && allowKnight) ||
           (options.allowSelfDestruct && MEETING_WOLVES.has(p.role))),
     );
     if (!actors.length) return [];
@@ -1718,8 +1776,9 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       pub(`【白天发言】${s}号玩家：${inp.speech ?? ""}`);
 
       // 基于本段发言的权衡请求：与下一段发言并行询问（可自爆/决斗打断进程）
+      // 放逐发言阶段=骑士决斗的合法发起窗口（allowKnight=true）
       weighObject = `${s}号的发言`;
-      weighReqs = buildWeighReqs(weighObject);
+      weighReqs = buildWeighReqs(weighObject, true);
     }
     // 最后一段发言的权衡：单独询问结算
     if (weighReqs.length) {
@@ -1845,7 +1904,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
           emit("speech", s, "PK发言", inp.speech ?? "", inp.thought);
           pub(`【PK发言】${s}号玩家：${inp.speech ?? ""}`);
           pkWeighObject = `${s}号的平票PK发言`;
-          pkWeighReqs = buildWeighReqs(pkWeighObject);
+          pkWeighReqs = buildWeighReqs(pkWeighObject, true); // 平票PK发言同属放逐发言阶段：骑士可决斗
         }
         // 最后一段平票PK发言的权衡：单独询问结算
         if (pkWeighReqs.length) {
@@ -1925,6 +1984,30 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     emit("speech", exiled, "遗言", inp.speech ?? "（无言）", inp.thought);
     pub(`【遗言】${exiled}号玩家：${inp.speech ?? "（无言）"}`);
 
+    // 最后一狼被放逐：狼全灭胜负已定（2026-10-15 用户裁定）——遗言权保留（已在上方发表），
+    // 但跳过「遗言后权衡」与「放逐技能询问」（最后一狼无任何技能可发动，
+    // 让一个必死之人挂着「权衡中」状态环是对规则与观感的双重错误），直接出局宣判神民胜
+    if (!players.some((x) => x.alive && x.seat !== exiled && campOf(x.role) === "wolf")) {
+      emit(
+        "system",
+        null,
+        "最后一狼规则",
+        `${exiled}号玩家是场上最后一狼：狼队全灭，对局结束，无需技能询问与权衡。`,
+      );
+      pub(`【最后一狼规则】${exiled}号是场上最后一狼，狼全灭，神民阵营胜利。`);
+      if (p.sheriff) {
+        // 警徽流不再进行（胜负已定）：警徽流失处理，不再发起移交/撕毁权衡
+        p.sheriff = false;
+        sheriffSeat = null;
+        emit("system", null, "警徽流失", `警长${exiled}号（最后一狼）阵亡，警徽流失，本局不再设警长。`);
+        pub(`【警徽流失】警长${exiled}号阵亡，本局不再设警长。`);
+      }
+      yield* killPlayer(exiled, "exile", `第${cnNum(day)}日`);
+      announcedDead.add(exiled);
+      emit("death", exiled, "死亡公告", `${exiled}号玩家被放逐出局。`);
+      return;
+    }
+
     // 发动时机①：被放逐玩家发表遗言后——持技玩家获得一次权衡
     const rLw = yield* daySkillCheck(`${exiled}号的遗言`);
     if (rLw === "aborted") {
@@ -1939,8 +2022,10 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     // 2. 放逐技能询问（权衡状态；可开枪者（猎人/狼王）才给目标选项，其余角色仅可沉默——
     //    思考量录入对局记录（非并行权衡，不进右侧权衡框）
     setPhase("day.exileSkill", `第${day}天 · 放逐技能询问`);
+    // 最后一狼规则：狼王为场上最后一狼被放逐时无开枪资格（狼全灭即终局，技能不进入结算）
+    const lastWolfBlocked = p.role === "wolfKing" && wolfKingLastWolfBlocked(p);
     const canShootHere =
-      (p.role === "hunter" || p.role === "wolfKing") && !p.hasShot && !p.shootBlocked;
+      (p.role === "hunter" || p.role === "wolfKing") && !p.hasShot && !p.shootBlocked && !lastWolfBlocked;
     pub(`【放逐】主持人询问${exiled}号玩家是否要发动技能。`);
     const inp2 = yield* ask({
       seat: exiled,
@@ -1949,7 +2034,9 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       allowSkip: true,
       hint: canShootHere
         ? "你被放逐了：你可以发动技能开枪带走一名玩家（targets=[目标]），或保持沉默（skip=true）出局。"
-        : "你被放逐了：主持人询问你是否要发动技能（此询问面向所有人，不代表你有技能）。没有可发动的技能或不想发动则保持沉默（skip=true），沉默后出局。",
+        : lastWolfBlocked
+          ? "你被放逐了：但按规则，你是场上最后一狼——最后一狼出局即狼队全灭终局，不能开枪带人。保持沉默（skip=true）出局。"
+          : "你被放逐了：主持人询问你是否要发动技能（此询问面向所有人，不代表你有技能）。没有可发动的技能或不想发动则保持沉默（skip=true），沉默后出局。",
     });
     emit(
       "action",
@@ -2095,7 +2182,18 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
           hint: `赛后讨论·聊天室（第${round}轮，你还剩 ${left} 次发言机会）：对局已结束，全员身份与全程记录公开，之前所有人的赛后发言都在公开记录的【赛后讨论】条目里。想说什么都可以——复盘分析、点评表现、抒发不满、吐槽批评；点名可 targets=[对方座位]，也可同时 @多人（targets=[3,5]）或 @所有人（targets=[0]），speech 里承接 TA 们的发言。发言填 speech（targets 留空=对大家说）；本轮确实无话可说再 skip=true（不消耗机会，后面仍可发言）。${nudge}`,
         })) as DecisionInput;
         const text = typeof inp.speech === "string" ? inp.speech.trim() : "";
-        if (!text) continue; // 弃权/空发言=本轮过，不消耗机会
+        if (!text) {
+          // 沉默也上公屏（2026-10-15 用户裁定）：弃权/过以正式事件落盘并附心理活动
+          //（观察者可见）；公开记录同步一笔——赛后聊天室里谁沉默了大家都看在眼里；
+          // 不消耗发言机会，后面轮次仍可发言
+          emit("speech", p.seat, "赛后讨论", "（本轮选择沉默，暂不发言）", inp.thought ?? null, {
+            round,
+            remain: left,
+            silent: true,
+          });
+          pub(`【赛后讨论】${p.seat}号本轮沉默。`);
+          continue;
+        }
         used.set(p.seat, (used.get(p.seat) ?? 0) + 1);
         anySpoke = true;
         // 点名对象：单人=number / 多人=number[] / @所有人="all"；无前两者则不附 meta
@@ -2133,7 +2231,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
         options.postGameDiscuss
           ? "本局已开启赛后讨论环节：对局结束后全员身份公开，进入赛后频道自由讨论（想说什么都可以）。"
           : ""
-      }`
+      }${boardRules ? `\n${boardRules}` : ""}`
     );
     pub(`游戏开始：${n}名玩家。${options.postGameDiscuss ? "本局已开启赛后讨论环节。" : ""}`);
     while (true) {
@@ -2276,7 +2374,9 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
         // 批量待决：逐个子请求校验对应子决策（非法即抛错，状态不变，可重试）
         const inputs = input.batchInputs ?? [];
         if (inputs.length !== req.batchOf.length)
-          throw new Error(`并行权衡决策数量不匹配：期望 ${req.batchOf.length}，实际 ${inputs.length}`);
+          throw new Error(
+            `并行权衡决策数量不匹配：期望 ${req.batchOf.length}（${req.batchOf.map((r) => `${r.kind}@${r.seat}`).join("、")}），实际 ${inputs.length}（${inputs.map((inp) => (inp.selfDestruct ? "自爆" : inp.duel != null ? "决斗" : inp.surrender ? "交刀认输" : inp.declareVictory ? "宣布胜利" : "按兵")).join("、")}）`,
+          );
         for (let i = 0; i < req.batchOf.length; i++) {
           validate(req.batchOf[i], inputs[i]);
           const sp = at(req.batchOf[i].seat);

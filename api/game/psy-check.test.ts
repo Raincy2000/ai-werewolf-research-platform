@@ -7,6 +7,8 @@
 // 2) startPsyCheck → 记事簿回写 + 报告 + 事件齐出；poll 透出逐座位 done
 // 3) 中断续跑：删掉一份报告 + 清内存（强制重放重建）→ 再开只补缺失座位（写回不重跑）
 // 4) 未分出胜负拒绝开启
+// 5) 认知笔记机制已下线（COGNITION_NOTE_ENABLED=false）：心理检查收尾不再触发书写、不落事件；
+//    代码保留——开关置 true 即恢复原语义（自省情景开发时启用）
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { AdvancedOptions, SeatAiConfig } from "../../contracts/game";
 import type { PersonaCard } from "../../contracts/persona";
@@ -86,7 +88,7 @@ vi.mock("../queries/library", () => ({
   getStudyNotes: async () => [],
 }));
 
-// 人格研究库查询层：内存卡库 + 内存报告表
+// 人格研究站查询层：内存卡库 + 内存报告表
 vi.mock("../queries/personas", () => ({
   getPersona: async (id: number) => h.cards.get(id) ?? null,
   getPersonaCardsInternal: async (ids: number[]) =>
@@ -102,7 +104,12 @@ vi.mock("../queries/personas", () => ({
   },
   incrementPersonaGameCount: async () => {},
   listRelationshipsAmong: async () => [],
+  // 2026-10-22：回写幂等台账（测试给「无失败座位」；续跑语义仍按报告缺失判定）
+  listPersonaWritebackFailedSeats: async () => [],
   loadMemoryContext: async () => "",
+  // 「记性」：开局加载记忆池，注入文本每回合按情境现算（测试给空池即可）
+  loadMemoryPool: async () => ({ items: [], relationships: [] }),
+  renderMemoryText: () => "",
 }));
 
 // 心理检查师与记事簿回写： mock 为即时成功（只验证编排与续跑语义，不验 AI 内容）
@@ -118,6 +125,15 @@ vi.mock("../persona/notebook", () => ({
     };
   },
 }));
+// 认知笔记自动书写打桩（两程管线属 cognition 单测范围；这里只验证触发编排）
+const hCog = vi.hoisted(() => ({ calls: [] as { personaId: number; mode?: string }[], result: null as { content: string; readReport?: boolean } | null }));
+vi.mock("../persona/cognition", () => ({
+  runCognitionWrite: async (opts: { personaId: number; mode?: string }) => {
+    hCog.calls.push({ personaId: opts.personaId, mode: opts.mode });
+    return hCog.result;
+  },
+}));
+
 vi.mock("../persona/anatomist", () => ({
   runPsyCheck: async () => {
     h.anatomistCalls += 1;
@@ -125,8 +141,28 @@ vi.mock("../persona/anatomist", () => ({
   },
 }));
 
+
+// 通用自动应答（托管抹消后，测试流必须由正常 AI 输出推进）：
+// 定序/退水/竞选特判；发言类按【你的任务】行判定（规则全文/契约里的「发言」字样会误中全文匹配）；
+// 必须行动类取【合法目标】首座；其余 skip
+function autoAnswer(user: string): string {
+  if (user.includes("升序发言")) return '{"thought":"t","targets":[1]}';
+  if (user.includes("退水抉择")) return '{"thought":"t","targets":[0]}';
+  if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
+  const taskLine = user.slice(user.indexOf("【你的任务】"));
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言|赛后讨论·聊天室/.test(taskLine)) {
+    return '{"thought":"t","speech":"测试发言"}';
+  }
+  const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));
+  if (needTarget) {
+    const m = user.match(/【合法目标】([0-9]+)/);
+    if (m) return `{"thought":"t","targets":[${m[1]}]}`;
+  }
+  return '{"thought":"t","skip":true}';
+}
+
 vi.mock("./ai/providers", () => ({
-  callAi: async () => ({ ok: false, text: null, latencyMs: 1, error: "测试：AI 不可用 → 启发式兜底" }),
+  callAi: async (_cfg: unknown, _system: string, user: string) => ({ ok: true, text: autoAnswer(user), latencyMs: 1, error: null }),
 }));
 
 // ---------- 工具 ----------
@@ -188,6 +224,9 @@ beforeEach(() => {
   guideCache.clear();
   h.cards.set(101, makeCard(101, "曹操"));
   h.cards.set(102, makeCard(102, "刘备"));
+
+  hCog.calls.length = 0;
+  hCog.result = null;
 });
 
 describe("心理检查（手动开启 + 可续跑）", () => {
@@ -249,6 +288,31 @@ describe("心理检查（手动开启 + 可续跑）", () => {
     expect(r3.reason).toContain("已完成");
   }, 120_000);
 
+  it("自动心理检查：赛后讨论结束后使用对局属主身份自动开始，无需手动点击", async () => {
+    const { gameService } = await import("./service");
+    const ownerId = "real-owner";
+    const { gameId } = await gameService.createGame({
+      boardId: "standard9",
+      seats: makeSeats(9),
+      options: { ...OPTS, postGameDiscuss: true, postGameAutoStart: true, autoPsyCheck: true },
+      seatPersonas: [
+        { seat: 1, personaId: 101 },
+        { seat: 2, personaId: 102 },
+      ],
+    }, ownerId);
+    await gameService.control(gameId, "start", ownerId);
+    await waitFor(() => registry.get(gameId)?.status === "finished", "赛后讨论结束", 90_000);
+    // 旧实现匿名调用 startPsyCheck，被归属校验拒绝后静默吞错，这里两份报告永远不会出现。
+    await waitFor(() => reportsOf(gameId).length === 2, "自动开始并生成两份心理检查", 30_000);
+    expect(h.anatomistCalls).toBe(2);
+    expect(eventsOf(gameId).some((e) => e.title === "赛后讨论结束")).toBe(true);
+    expect(eventsOf(gameId).some((e) => e.title === "自动心理检查启动失败")).toBe(false);
+    expect((await gameService.poll(gameId, 0, undefined, ownerId)).psyCheck?.seats).toEqual([
+      { seat: 1, status: "done" },
+      { seat: 2, status: "done" },
+    ]);
+  }, 120_000);
+
   it("未分出胜负拒绝开启（对局进行中）", async () => {
     const { gameService } = await import("./service");
     const { gameId } = await gameService.createGame({
@@ -262,4 +326,69 @@ describe("心理检查（手动开启 + 可续跑）", () => {
     expect(r.started).toBe(false);
     expect(r.reason).toContain("尚未分出胜负");
   });
+});
+
+describe("赛后自动书写认知笔记（**机制已下线**：对局侧零痕迹；代码保留待自省情景）", () => {
+  async function gameToFinish(): Promise<string> {
+    const { gameService } = await import("./service");
+    const { gameId } = await gameService.createGame({
+      boardId: "standard9",
+      seats: makeSeats(9),
+      options: OPTS,
+      seatPersonas: [
+        { seat: 1, personaId: 101 },
+        { seat: 2, personaId: 102 },
+      ],
+    });
+    await gameService.control(gameId, "start");
+    await waitFor(() => registry.get(gameId)?.status === "finished", "对局结束", 90_000);
+    return gameId;
+  }
+
+  it("机制下线：心理检查完成后**不**触发书写、不落任何认知笔记事件（卡上开关已无关）", async () => {
+    const { gameService } = await import("./service");
+    // 用 importActual 读**真实**常量（该模块被 vi.mock 拦截，直接 import 拿不到）
+    const { COGNITION_NOTE_ENABLED } = await vi.importActual<
+      typeof import("../persona/cognition")
+    >("../persona/cognition");
+    hCog.result = { content: "我这才看清自己几分。", readReport: true };
+    const gameId = await gameToFinish();
+    const r = await gameService.startPsyCheck(gameId, null);
+    expect(r.started).toBe(true);
+    // 心理检查报告本身照常生成（该机制不受影响）
+    await waitFor(
+      () => eventsOf(gameId).filter((e) => e.title === "心理检查报告已生成").length >= 2,
+      "两座位心理检查报告已生成",
+    );
+    if (COGNITION_NOTE_ENABLED) {
+      // 机制启用时（自省情景开发后）恢复原断言
+      await waitFor(() => hCog.calls.length >= 2, "两座位自动书写触发");
+      expect(hCog.calls.every((c) => c.mode === "auto")).toBe(true);
+      await waitFor(
+        () => eventsOf(gameId).filter((e) => e.title === "认知笔记已更新").length >= 2,
+        "两篇认知笔记事件落盘",
+      );
+    } else {
+      expect(hCog.calls.length).toBe(0);
+      expect(eventsOf(gameId).filter((e) => e.title === "认知笔记已更新").length).toBe(0);
+      expect(eventsOf(gameId).filter((e) => e.title === "认知笔记书写失败").length).toBe(0);
+    }
+  }, 120_000);
+
+  it("显式关闭的人格不触发", async () => {
+    const { gameService } = await import("./service");
+    for (const id of [101, 102]) {
+      const c = h.cards.get(id)!;
+      h.cards.set(id, { ...c, autoCognition: { enabled: false, includeReports: false, includeDrift: false } });
+    }
+    const gameId = await gameToFinish();
+    const r = await gameService.startPsyCheck(gameId, null);
+    expect(r.started).toBe(true);
+    await waitFor(
+      () => eventsOf(gameId).filter((e) => e.title === "心理检查报告已生成").length >= 2,
+      "两座位报告生成",
+    );
+    await new Promise((r2) => setTimeout(r2, 300));
+    expect(hCog.calls.length).toBe(0);
+  }, 120_000);
 });

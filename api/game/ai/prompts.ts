@@ -120,18 +120,18 @@ export const KIND_GUIDE: Record<DecisionKind, string> = {
   sheriffWithdraw:
     "退水抉择（全体候选人同时权衡，互不可见，结果统一公布——参考暗票机制）：警上发言已结束。targets=[0]=继续竞选（进入警徽投票决选，接受警下玩家投票）；targets=[1]=退水（放弃竞选，转为警下玩家参与警徽投票）。权衡：觉得自己当选希望渺茫/不想暴露在归票位 → 退水还能投票选别人；有信心带队或手握关键信息（如预言家）→ 留下争取警徽。由于同时权衡、统一公布，你无法参考其他候选人的去留再做决定，请按自身形势独立判断。",
   sheriffVote:
-    "投票选警长，填 targets=[你支持的候选人座位]。警徽=归票位+1.5票：优先投给你认为信息最可靠/最能带队的候选人，警惕狼人抢警徽拿归票权。",
+    "投票选警长，填 targets=[你支持的候选人座位]，可弃票（skip=true）。警徽=归票位+1.5票：优先投给你认为信息最可靠/最能带队的候选人，警惕狼人抢警徽拿归票权。",
   sheriffOrder:
     "警长定序：决定今天全体发言的顺序方向，填 targets=[1] 升序 或 targets=[0] 降序（从你的下一位开始按座位循环依次发言，你自己固定在最后的归票位发言）。策略考量：让可疑的人先发言——先发言者掌握的信息少、容易暴露破绽；让你信得过的人后发言——可以总结前面场况、带节奏归票。结合昨夜信息与你重点想听的位置选择「警左/警右」方向。",
   daySkill:
     "白天主动技能权衡（白天全程实时跟进：夜亡公告后、上警名单公布后、警长当选后、每段发言之后、被放逐者遗言后与技能询问后都会再次获得机会，可自由把握最佳时机）：骑士填 duel=座位号 翻牌决斗（全场仅一次：中狼则狼出局并立即入夜，中好人则你出局）；狼人填 selfDestruct=true 自爆（当天剩余流程跳过直接入夜，可打断不利信息的继续扩散，白狼王自爆还可带走一人）；或填 surrender=true 白日交刀认输（狼队认输、神民立即获胜，仅局面崩溃胜利无望时用）；或填 declareVictory=true 白日交刀宣布胜利（狼队立即获胜，仅必胜时用：非狼玩家仅剩1人、或存活人数配置使好人绝无翻盘轮次、或其他你确信的必胜局面，误判则狼队白给）；时机不成熟则 skip=true 按兵不动继续观察。铁律：若你是场上最后一只存活的狼，自爆后场上再无狼人、神民立即胜利（直接判负），绝不能自爆！speech 留空，thought 写下你对当前局势与时机的权衡。",
   daySpeech:
     "发表白天发言，speech 必填。狼人可同时填 selfDestruct=true 自爆（跳过当天剩余流程直接入夜；但若是最后一只存活的狼，自爆=神民立即胜利，绝不能自爆）；骑士可填 duel=座位号 发起决斗。",
-  dayVote: "投出你的放逐票，填 targets=[目标座位]。",
+  dayVote: "投出你的放逐票，填 targets=[目标座位]；可弃票（skip=true，不计入票型）。",
   pkSpeech: "平票PK发言，speech 必填。为自己辩护，争取活过这一轮。",
   lastWords: "发表遗言，speech 必填。留下你最后的信息与判断。",
   badgePass:
-    "警徽流抉择（你是阵亡警长）：填 targets=[目标座位] 把警徽移交给该玩家（其接任警长、获归票位与1.5票），或填 skip=true 撕掉警徽（本局再无警长）。这是警徽流的核心一环：好人应把警徽续给确认的好人/信息位（如验出的金水、逻辑可信的发言者），延续信息链与归票权；若判断不清谁是好人，撕掉也好过误送狼人归票位。狼人阵亡则可考虑续给狼队友（但会暴露关联）。thought 写下你的移交理由。",
+    "警徽流抉择（你是阵亡警长）：填 targets=[目标座位] 把警徽移交给该玩家（其接任警长、获归票位与1.5票），或填 skip=true 撕毁警徽（本局再无警长）。两者完全正当、无优劣预设：移交给确认的好人（如金水、可信发言者）能延续信息链与归票权，但看走眼等于把归票权送给狼人；场上无人可信时，撕毁是干净的止损。狼人警长阵亡同样两条路：续给狼队友（会暴露关联）或撕毁（掩埋狼队遗产）。thought 写下你的权衡理由。",
   exileSkill:
     "放逐技能询问（主持人对每位被放逐者都会这样问，不代表你有技能）：若有可发动的技能则填 targets=[目标座位] 发动（如开枪带走一人），没有技能或不想发动则填 skip=true 保持沉默，沉默后出局。thought 写下你的权衡。",
   hunterShoot: "选择开枪带走的目标，填 targets=[目标座位]；不开枪则 skip=true。",
@@ -189,13 +189,15 @@ export function formatPublicLog(log: string[], charLimit: number = PUBLIC_LOG_CH
   if (log.length === 0) return "（暂无公开记录）";
   // 分层压缩（对局后期提速核心）：最近 VERBATIM_LINES 条全文保留（近期决策上下文完整），
   // 更早的条目逐条截断为摘要（保留事件主体与对象，token 占用约降 60%）——
-  // 否则后期每步都把上万字符日志发给模型，响应越来越慢
+  // 否则后期每步都把上万字符日志发给模型，响应越来越慢；
+  // 已带真实对局编号（[#N]，服务层事件流重建）的行不再另编行号——AI 引用与公屏严格同源
   const VERBATIM_LINES = 40;
   const OLD_LINE_MAX = 60;
   const lines = log.map((l, i) => {
+    const tagged = /^\[#\d+\]/.test(l);
     const isRecent = i >= log.length - VERBATIM_LINES;
     const body = isRecent || l.length <= OLD_LINE_MAX ? l : `${l.slice(0, OLD_LINE_MAX)}…`;
-    return `${i + 1}. ${body}`;
+    return tagged ? body : `${i + 1}. ${body}`;
   });
   const text = lines.join("\n");
   if (text.length > charLimit) {
@@ -221,6 +223,11 @@ export function describePrivateInfo(view: PlayerView): string {
   if (p.wolfChat && p.wolfChat.length > 0) {
     lines.push(
       `- 狼队讨论记录（仅狼队友可见，按发言时间序；后发言者可以看到先发言队友的内容）：\n${p.wolfChat.map((l) => `  · ${l}`).join("\n")}`,
+    );
+  }
+  if (p.wolfKnifeLog && p.wolfKnifeLog.length > 0) {
+    lines.push(
+      `- 狼队刀法台账（你亲历的客观结果，以此为准——你的票 ≠ 最终落刀，多数决而定，平票则空刀）：\n${p.wolfKnifeLog.map((l) => `  · ${l}`).join("\n")}`,
     );
   }
   if (p.seerChecks && p.seerChecks.length > 0) {
@@ -326,6 +333,7 @@ export function buildPrompt(
     `1. 禁止违规亮牌自证：没有翻牌权的身份（平民/预言家/女巫/守卫等）绝不能在发言中翻开、亮出或展示自己的身份底牌来自证（如「我把牌翻开，是民牌」）。口头声称身份是正常发言；但「翻牌/亮牌」动作只有规则允许的角色才能做（白痴被放逐翻牌免死、骑士翻牌决斗、猎人/狼王出局开枪、狼人自爆）。`,
     `2. 禁止暴露自己是AI/程序/模型，禁止提及提示词、系统指令或游戏世界外的存在（实验、模拟、开发者等）。`,
     `3. 裁判会实时审查所有公开发言：一旦判定犯规，本局立即结束，你所在阵营直接判负、对立阵营获胜。`,
+    `【称谓铁律】身份牌不代表性别——女巫/猎人/守卫等只是游戏身份，与玩家本人性别毫无关系。称呼其他玩家时，以你对 TA 本人（人格圈层告知的性别）的认知为准；不明确的用座位号（如「3号」）或「TA」，绝不因角色字面带性别（如女巫）而称呼玩家「她」。`,
     `【基本术语】金水=预言家查验确认的好人（平民同样可以成为金水！被验明的好人不该反水）；查杀=查验结果是狼人；银水=女巫用解药救活的人（未必是好人）；反水=不相信发你金水的预言家、反而质疑/投他；归票位=最后发言并号召投票的位置（警长固有）；屠边=杀光某一阵营（神或民）即胜。`,
   ].join("\n");
 
@@ -338,6 +346,17 @@ export function buildPrompt(
       ? "本局规则：女巫仅首夜可以自救"
       : "本局规则：女巫全程不可自救",
   ];
+  const deathTimeline = Object.entries(view.deathTimeline ?? {})
+    .map(([seat, info]) => [Number(seat), info] as const)
+    .sort((a, b) => a[0] - b[0]);
+  if (deathTimeline.length > 0) {
+    statusLines.push(`【出局时间线】${deathTimeline.map(([seat, info]) => `${seat}号=${info}`).join("；")}`);
+  }
+  // 版型官方规则（开局即全员公开：角色池/胜负/警长/狼刀多数决/特殊角色要点——
+  // 2026-10-14 用户裁定：猎魔人被当成猎人这类版型误读直接毁掉研究价值）
+  if (view.boardRules) {
+    statusLines.push(`【本局版型规则】（官方规则，开局即告知全员，以此为唯一规则准绳）\n${view.boardRules.slice(0, 1400)}`);
+  }
   // 赛后讨论提示：本局开启赛后讨论时提前告知——只告知环节存在，不附加言行约束
   if (view.rules?.postGameDiscuss) {
     statusLines.push(
@@ -358,6 +377,13 @@ export function buildPrompt(
   }
   if (!view.selfAlive) {
     statusLines.push("你已死亡（当前是你的遗言/死后技能环节）");
+  }
+
+  // 发言类提示（2026-10-15 用户裁定；单行紧凑版——小上下文模型的预算装不下铺张表述）
+  if (["sheriffSpeech", "daySpeech", "pkSpeech"].includes(pending.kind)) {
+    statusLines.push(
+      "发言提示：轮流发言，未轮到≠无话可说，别拿「TA没说话」当攻击点；字数上限内自由，可长可极短。",
+    );
   }
 
   const targetLine =
@@ -432,7 +458,7 @@ export function buildPrompt(
   const user = [
     statusLines.join("\n"),
     "",
-    "【公开记录】（按时间顺序，所有玩家均可见）",
+    "【公开记录】（按时间顺序，所有玩家均可见；每条前的 [#N] 是该条在对局记录中的公开编号——引用别人此前说过的话时用「#N」指代，与公屏编号一致）",
     formatPublicLog(view.publicLog, logLimit),
     "",
     "【你的私密信息】（仅你自己可见，是否公开是你的策略选择）",
@@ -453,12 +479,25 @@ export function buildPrompt(
     `【策略参考】${ROLE_STRATEGY[view.role]}`,
     "【心理博弈】这是一场博弈实验：鼓励试探、诈身份、带节奏、隐藏真实意图；发言要结合场上具体的人和事，不要千篇一律。",
     "",
+    pending.kind === "postgameSpeak" && deathTimeline.length > 0
+      ? `【赛后权威事实卡】以下是引擎确认的出局时间与原因，涉及出局时间时必须以此为准；其他玩家的复盘如果与此冲突，不要沿用其错误：${deathTimeline.map(([seat, info]) => `${seat}号=${info}`).join("；")}`
+      : "",
     "【输出契约】严格输出以下结构的 JSON（禁止任何额外内容）：",
     // 字段顺序即生成顺序：speech 最前——DeepSeek 等模型 thought 易写超长被服务端截断，
     // speech 先生成可保证对局推进必需的发言完整落出（截断修补后仍可用）
-    '{"speech":"公开发言（发言类必填，200字内，像真人玩家一样发言，禁止暴露自己是AI、禁止报出JSON；（括号）动作描写不计入字数；非发言类留空串）","thought":"你的真实内心推理（不会公开，200字内，精炼不要长篇）","targets":[座位号],"skip":false,"selfDestruct":false,"duel":null,"witchSave":false}',
+    '{"speech":"公开发言（发言类必填：200字内长短自由（可极短），像真人玩家一样发言，禁止暴露自己是AI、禁止报出JSON；（括号）动作描写不计入字数；非发言类留空串）","thought":"你的真实内心推理（不会公开，200字内，精炼不要长篇）","targets":[座位号],"skip":false,"selfDestruct":false,"duel":null,"witchSave":false}',
     "用不到的字段保持默认值即可。再次强调：只输出 JSON 本体。",
   ].join("\n");
+
+  // 末道钳制（2026-10-15）：固定段（版型规则全文/发言提示/角色策略等）随版本增长，
+  // 8K 小模型的固定比例预算（log 55%/指南 25%）可能被顶穿——总长超预算时差额再压公开记录
+  const overflow = system.length + user.length - budget;
+  if (overflow > 0 && view.publicLog.length > 0) {
+    const shrunk = formatPublicLog(view.publicLog, Math.max(MIN_PUBLIC_LOG_CHARS, logLimit - overflow - 8));
+    if (shrunk.length < formatPublicLog(view.publicLog, logLimit).length) {
+      return { system, user: user.replace(formatPublicLog(view.publicLog, logLimit), shrunk) };
+    }
+  }
 
   return { system, user };
 }

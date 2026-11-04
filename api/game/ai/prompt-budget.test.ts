@@ -109,6 +109,27 @@ describe("prompt 长度预算", () => {
     expect(user2).toContain(LONGER_LOG[LONGER_LOG.length - 1]);
   });
 
+  it("出局时间线进入状态区，不依赖长公开记录猜测死亡日期", () => {
+    const pending = makePending([]);
+    pending.view.deathTimeline = { 10: "第三日 · 被放逐", 2: "第二夜 · 被女巫毒杀" };
+    const { user } = buildPrompt(pending);
+    expect(user).toContain("【出局时间线】");
+    expect(user).toContain("10号=第三日 · 被放逐");
+    expect(user).toContain("2号=第二夜 · 被女巫毒杀");
+  });
+
+  it("赛后权威事实卡紧邻输出契约，明确出局时间的核对依据", () => {
+    const pending = makePending([]);
+    pending.kind = "postgameSpeak";
+    pending.view.phase = "postgame.discuss";
+    pending.view.deathTimeline = { 10: "第三日 · 被放逐" };
+    const { user } = buildPrompt(pending);
+    expect(user).toContain("【赛后权威事实卡】");
+    expect(user).toContain("涉及出局时间时必须以此为准");
+    expect(user.indexOf("【赛后权威事实卡】")).toBeGreaterThan(user.indexOf("【心理博弈】"));
+    expect(user.indexOf("【赛后权威事实卡】")).toBeLessThan(user.indexOf("【输出契约】"));
+  });
+
   it("缺省 modelContext 按保守 16K 处理", () => {
     const budget = promptCharBudget(16384);
     const { system, user } = buildPrompt(makePending(LONG_LOG), { guide: LONG_GUIDE });

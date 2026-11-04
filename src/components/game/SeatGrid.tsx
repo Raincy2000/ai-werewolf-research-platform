@@ -10,14 +10,23 @@
 
 import { memo, useEffect, useRef, useState } from 'react'
 import { SheriffBadge } from '@/components/icons/SheriffBadge'
-import type { Camp, PlayerSnapshot } from '@contracts/game'
+import type { Camp, PlayerSnapshot, RoleId } from '@contracts/game'
+import { ROLE_META } from '@contracts/game'
 import { cn } from '@/lib/utils'
-import { Badge } from '@/components/ui/badge'
+import type { RoleAssignments } from '@/lib/roleAssignment'
 
 const CAMP_BADGE_CLASS: Record<Camp, string> = {
   wolf: 'border-wolf/50 bg-wolf/10 text-wolf',
   god: 'border-god/50 bg-god/10 text-god',
   villager: 'border-villager/50 bg-villager/10 text-villager',
+}
+
+const CHINESE_DAY_NUMBERS = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二']
+function formatDeathInfo(info: string): string {
+  return info.replace(/第(\d+)(天|夜)/g, (_match, day: string, unit: string) => {
+    const n = Number(day)
+    return `第${CHINESE_DAY_NUMBERS[n] ?? day}${unit}`
+  })
 }
 
 /** 座位状态种类与配色（ring=状态圈颜色，text=状态文字颜色）
@@ -94,6 +103,11 @@ interface SeatGridProps {
   /** 右栏当前选中的座位 */
   selectedSeat: number | null
   onSelect: (seat: number) => void
+  /** 仅创建阶段的手动分配模式开启；此时角色以客户端分配表为准 */
+  manualRoleAssignEnabled?: boolean
+  roleAssignments?: RoleAssignments
+  onRoleDragStart?: (role: RoleId, fromSeat?: number) => void
+  onRoleDrop?: (seat: number) => void
 }
 
 export const SeatGrid = memo(function SeatGrid({
@@ -101,6 +115,10 @@ export const SeatGrid = memo(function SeatGrid({
   pendingActs,
   selectedSeat,
   onSelect,
+  manualRoleAssignEnabled = false,
+  roleAssignments = {},
+  onRoleDragStart,
+  onRoleDrop,
 }: SeatGridProps) {
   // 引擎状态（发言/技能发动/上票/权衡）按座位跟踪，since 保留首次出现时间
   const [engineStates, setEngineStates] = useState<ReadonlyMap<number, SeatState>>(new Map())
@@ -136,10 +154,16 @@ export const SeatGrid = memo(function SeatGrid({
         if (engine) states.push(engine)
         if (selectedSeat === p.seat) states.push({ kind: 'selected', since: selectedSinceRef.current })
         states.sort((a, b) => a.since - b.since)
+        const assignedRole = roleAssignments[p.seat]
+        const roleName = manualRoleAssignEnabled
+          ? assignedRole
+            ? ROLE_META[assignedRole].name
+            : '待分配'
+          : p.roleName
+        const camp = manualRoleAssignEnabled && assignedRole ? ROLE_META[assignedRole].camp : p.camp
+        const longPersonaName = (p.personaName?.length ?? 0) > 4
 
         return (
-          // 包装层：状态环与状态文本挂这里（不吃卡片的灰化滤镜）——
-          // 出局座位的卡片变灰，但赛后讨论/心理检查等环节的状态环与状态文字必须保持彩色可辨
           <div key={p.seat} className="relative">
             {/* 多状态圈：内圈=最早出现的状态，逐圈向外扩散 */}
             {states.map((s, i) => (
@@ -155,52 +179,118 @@ export const SeatGrid = memo(function SeatGrid({
             ))}
             <button
               type="button"
+              data-role-seat={p.seat}
               onClick={() => handleSelect(p.seat)}
+              onDragOver={manualRoleAssignEnabled ? (event) => event.preventDefault() : undefined}
+              onDrop={manualRoleAssignEnabled ? (event) => {
+                event.preventDefault()
+                event.stopPropagation()
+                onRoleDrop?.(p.seat)
+              } : undefined}
               aria-pressed={selectedSeat === p.seat}
-              title={p.alive ? `${p.seat}号 ${p.roleName}` : `${p.seat}号 ${p.roleName} · ${p.deathInfo ?? '已死亡'}`}
+              title={p.alive ? `${p.seat}号 ${roleName}` : `${p.seat}号 ${roleName} · ${p.deathInfo ?? '已死亡'}`}
               className={cn(
                 'flex h-full w-full items-stretch rounded-lg border bg-card text-center transition-colors',
-                p.alive ? 'border-border' : 'border-border/60 opacity-60 grayscale',
+                p.alive ? 'border-border' : 'border-border/60 bg-stone-100 dark:bg-stone-900',
               )}
             >
-
-              {/* 主内容列 */}
-              <div className="flex min-w-0 flex-1 flex-col items-center gap-1.5 px-2 py-3">
-                <span className="flex items-center gap-1">
-                  <span className="font-mono text-lg font-semibold leading-6 text-foreground">
-                    {p.seat}
+              {/* 主内容列：状态标注以此为水平中线，死亡条出现时整体自然左移 */}
+              <div data-testid="seat-main" className={cn('relative flex min-w-0 flex-1 flex-col items-center gap-2 px-2 py-3', !p.personaName && 'justify-center')}>
+                {p.personaName ? (
+                  <div data-testid="persona-composition" className="flex h-16 w-[5.25rem] max-w-full items-stretch justify-center gap-1">
+                    <span className="flex w-4 shrink-0 flex-col items-center justify-center text-[11px] font-semibold leading-4 text-foreground">
+                      <span data-testid="seat-number">{p.seat}</span>
+                      <span className="[writing-mode:vertical-rl]">号玩家</span>
+                    </span>
+                    <span
+                      data-testid="seat-avatar"
+                      className="flex h-14 w-11 shrink-0 self-center items-center justify-center overflow-hidden rounded-sm border border-border bg-secondary text-lg font-semibold text-foreground"
+                      style={{ borderColor: states.length > 0 ? STATE_META[states[states.length - 1]!.kind].ring : undefined }}
+                    >
+                      {p.personaImageData ? (
+                        <img src={p.personaImageData} alt={`${p.personaName}的头像`} className={cn('h-full w-full object-cover', !p.alive && 'grayscale')} />
+                      ) : (
+                        p.personaName.slice(0, 1)
+                      )}
+                    </span>
+                    <span data-testid="persona-name-viewport" className={cn('relative h-14 w-4 shrink-0 self-center overflow-hidden text-[11px] font-semibold leading-4 text-foreground', !longPersonaName && 'flex items-center')} title={`人格：${p.personaName}`}>
+                      {longPersonaName ? (
+                        <span className="persona-name-marquee absolute left-0 top-1/2 flex flex-col items-center">
+                          {[0, 1].map((copy) => (
+                            <span data-testid="persona-name" key={copy} className="pb-6 -translate-y-1/2 [writing-mode:vertical-rl]">
+                              {p.personaName}
+                            </span>
+                          ))}
+                        </span>
+                      ) : (
+                        <span data-testid="persona-name" className="[writing-mode:vertical-rl]">
+                          {p.personaName}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                ) : (
+                  <span className={cn('flex min-h-6 items-center justify-center gap-1', !p.alive && 'grayscale')}>
+                    <span className="text-sm font-semibold leading-6 text-foreground">{p.seat}号玩家</span>
                   </span>
+                )}
+
+                <span data-testid="role-status-group" className="flex items-center justify-center gap-1">
+                  {manualRoleAssignEnabled && !assignedRole ? (
+                    <span data-testid="role-pending" aria-label={`${p.seat}号玩家待分配角色`} className="h-6 min-w-12 w-fit rounded-sm border border-dashed border-muted-foreground/60" />
+                  ) : (
+                    <span
+                      data-testid="seat-role-card"
+                      draggable={Boolean(manualRoleAssignEnabled && assignedRole && onRoleDragStart)}
+                      onDragStart={manualRoleAssignEnabled && assignedRole ? (event) => {
+                        event.stopPropagation()
+                        event.dataTransfer.effectAllowed = 'move'
+                        event.dataTransfer.setData('text/plain', assignedRole)
+                        onRoleDragStart?.(assignedRole, p.seat)
+                      } : undefined}
+                      className={cn(
+                        'flex h-6 min-w-12 w-fit items-center justify-center whitespace-nowrap rounded-sm border px-2 text-xs font-normal',
+                        CAMP_BADGE_CLASS[camp],
+                        manualRoleAssignEnabled && assignedRole && 'cursor-grab active:cursor-grabbing',
+                        !p.alive && 'grayscale',
+                      )}
+                    >
+                      {roleName}
+                    </span>
+                  )}
                   {p.sheriff ? (
-                    <SheriffBadge className="h-4 w-4 text-god" aria-label="警长" />
+                    <SheriffBadge className="h-3.5 w-3.5 shrink-0 text-god" aria-label="警长" />
                   ) : p.sheriffCandidate ? (
-                    // 上警竞选中（≥2 人才标记）：亮蓝警徽，与警长金色高区分度（警长落地/警徽流失/退水后消失）
-                    <SheriffBadge className="h-4 w-4 text-sky-500" aria-label="上警竞选中" />
+                    <SheriffBadge className="h-3.5 w-3.5 shrink-0 text-sky-500" aria-label="上警竞选中" />
                   ) : null}
                 </span>
 
-                <Badge variant="outline" className={cn('text-xs font-normal', CAMP_BADGE_CLASS[p.camp])}>
-                  {p.roleName}
-                </Badge>
-
-                {/* 人格研究库：该座位绑定的人格名（其一切言行由该人格驱动） */}
-                {p.personaName ? (
-                  <span
-                    className="max-w-full truncate rounded-full border border-purple-500/50 bg-purple-500/10 px-1.5 py-0.5 text-[10px] text-purple-600 dark:text-purple-300"
-                    title={`人格：${p.personaName}`}
-                  >
-                    {p.personaName}
-                  </span>
-                ) : null}
-
-                {/* 状态占位行：保持卡片高度稳定（彩色状态文本由外层覆盖呈现，不吃灰化滤镜） */}
+                {/* 状态占位行与覆盖层都在主内容列内，始终与头像区域同一条水平中线 */}
                 <span className="text-[11px] font-medium leading-4 text-transparent select-none">
                   {p.alive ? '存活' : '出局'}
+                </span>
+                <span data-testid="seat-status" className="pointer-events-none absolute inset-x-1 bottom-3 text-center text-[11px] font-medium leading-4">
+                  {states.length > 0 ? (
+                    <span className="rounded bg-background/85">
+                      {states.map((s, i) => {
+                        const meta = STATE_META[s.kind]
+                        const last = i === states.length - 1
+                        return (
+                          <span key={s.kind} style={{ color: meta.text }}>
+                            {meta.label}
+                            {last ? '中' : '/'}
+                          </span>
+                        )
+                      })}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">{p.alive ? '存活' : '出局'}</span>
+                  )}
                 </span>
               </div>
 
               {/* 出局原因：右侧灰底白字竖向滚动条 */}
               {!p.alive ? (
-                // 灰色条右缘圆角 = 卡片圆角(8px) - 边框(1px)，完美贴合卡片的两个右侧圆角
                 <div className="relative w-7 shrink-0 overflow-hidden rounded-r-[7px] bg-stone-500/80">
                   <div className="seat-marquee absolute inset-x-0 top-0 flex flex-col items-center">
                     {[0, 1].map((k) => (
@@ -208,33 +298,13 @@ export const SeatGrid = memo(function SeatGrid({
                         key={k}
                         className="py-2 text-[10px] font-medium tracking-wider text-white [writing-mode:vertical-rl]"
                       >
-                        {`${p.deathInfo ?? '死亡'} · ${p.deathInfo ?? '死亡'}`}
+                        {`${formatDeathInfo(p.deathInfo ?? '死亡')} · ${formatDeathInfo(p.deathInfo ?? '死亡')}`}
                       </span>
                     ))}
                   </div>
                 </div>
               ) : null}
             </button>
-
-            {/* 状态文本覆盖层（外层、不吃灰化）：无状态时显示灰字 存活/出局 */}
-            {states.length > 0 ? (
-              <span className="pointer-events-none absolute inset-x-1 bottom-2 rounded bg-background/85 text-center text-[11px] font-medium leading-4">
-                {states.map((s, i) => {
-                  const meta = STATE_META[s.kind]
-                  const last = i === states.length - 1
-                  return (
-                    <span key={s.kind} style={{ color: meta.text }}>
-                      {meta.label}
-                      {last ? '中' : '/'}
-                    </span>
-                  )
-                })}
-              </span>
-            ) : (
-              <span className="pointer-events-none absolute inset-x-1 bottom-2 text-center text-[11px] leading-4 text-muted-foreground">
-                {p.alive ? '存活' : '出局'}
-              </span>
-            )}
           </div>
         )
       })}

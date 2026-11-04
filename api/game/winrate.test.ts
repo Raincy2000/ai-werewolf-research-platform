@@ -99,6 +99,26 @@ vi.mock("../queries/winrates", () => ({
     h.winrates.filter((r) => r.gameId === gameId).slice(-1)[0] ?? null,
 }));
 
+
+// 通用自动应答（托管抹消后，测试流必须由正常 AI 输出推进）：
+// 定序/退水/竞选特判；必须行动类取【合法目标】首座；发言类给 speech；其余 skip
+function autoAnswer(user: string): string {
+  if (user.includes("升序发言")) return '{"thought":"t","targets":[1]}';
+  if (user.includes("退水抉择")) return '{"thought":"t","targets":[0]}';
+  if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
+  // 发言类判定只看【你的任务】行（版型规则全文/输出契约里有「发言/PK发言」字样，全文匹配会误中）
+  const taskLine = user.slice(user.indexOf("【你的任务】"));
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言|赛后讨论·聊天室/.test(taskLine)) {
+    return '{"thought":"t","speech":"测试发言"}';
+  }
+  const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));
+  if (needTarget) {
+    const m = user.match(/【合法目标】([0-9]+)/);
+    if (m) return `{"thought":"t","targets":[${m[1]}]}`;
+  }
+  return '{"thought":"t","skip":true}';
+}
+
 vi.mock("./ai/providers", () => ({
   // 胜率分析调用（system 含「实时评估」标识）返回可控文本；其余（玩家决策）恒失败 → 启发式兜底
   callAi: async (_cfg: unknown, system: string, user: string) => {
@@ -117,7 +137,7 @@ vi.mock("./ai/providers", () => ({
     h.aiCalls += 1;
     const scripted = h.playerHook?.(system, user);
     if (scripted != null) return { ok: true, text: scripted, latencyMs: 1, error: null };
-    return { ok: false, text: null, latencyMs: 1, error: "测试：AI 不可用 → 启发式兜底" };
+    return { ok: true, text: autoAnswer(user), latencyMs: 1, error: null };
   },
 }));
 
@@ -260,7 +280,15 @@ describe("分析师胜率推测", () => {
     await waitFor(() => decisionsOf(gameId).length > d0, "分析在飞期间决策继续推进", 190);
     expect(rt.winRateInFlight).toBe(true); // 此刻分析仍未完成
 
-    await waitFor(() => winratesOf(gameId).length >= 1, "延迟分析最终落库");
+    try {
+      await waitFor(() => winratesOf(gameId).length >= 1, "延迟分析最终落库", 8000);
+    } catch (e) {
+      console.log("DIAG pauseReason:", registry.get(gameId)?.pauseReason, "status:", registry.get(gameId)?.status, "decisions:", decisionsOf(gameId).length,
+        "winRateCalls:", h.winRateCalls, "winrates:", winratesOf(gameId).length,
+        "inFlight:", registry.get(gameId)?.winRateInFlight,
+        "lastEvents:", h.events.filter((x) => x.gameId === gameId).slice(-3).map((x) => x.title));
+      throw e;
+    }
     await stopGame(gameId);
   }, 60_000);
 
@@ -360,6 +388,13 @@ describe("分析师胜率推测", () => {
     expect(p2.winRate!.entries.length).toBeGreaterThan(0);
     expect(p2.winRate!.entries.every((e) => e.id > maxId)).toBe(true);
     expect(p2.winRate!.entries.length).toBeLessThan(winratesOf(gameId).length);
+
+    // 已结束且无运行时：行快照路径同样必须返回胜率，否则复盘折线图消失
+    registry.delete(gameId);
+    h.games.get(gameId)!.status = "finished";
+    const p3 = await gameService.poll(gameId, 0, undefined, undefined, 0);
+    expect(p3.winRate).toBeDefined();
+    expect(p3.winRate!.entries.length).toBeGreaterThan(0);
 
     await stopGame(gameId);
   }, 60_000);

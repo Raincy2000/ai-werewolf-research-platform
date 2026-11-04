@@ -21,6 +21,11 @@ const h = vi.hoisted(() => ({
   decisions: [] as Record<string, unknown>[],
   aiCalls: 0,
   holdAi: false, // true = AI 悬挂不返回（让赛后生成停在 running，供 stopPostGame 测试）
+  postgameMode: "speak" as "speak" | "fail", // speak=赛后正常发言（托管抹消后流程推进的标准形态）；fail=赛后调用层超时→应暂停
+  analysisReady: false,
+  analysisGameId: null as string | null,
+  analyses: new Map<string, Record<string, unknown>>(),
+  guides: [] as Record<string, unknown>[],
 }));
 
 vi.mock("../queries/games", () => ({
@@ -63,14 +68,18 @@ vi.mock("../queries/decisions", () => ({
 }));
 
 vi.mock("../queries/guide", () => ({
-  countGuides: async () => 0,
-  getAnalysis: async () => null,
+  countGuides: async (userId: string, scope: string) => h.guides.filter((g) => g.userId === userId && g.scope === scope).length,
+  getAnalysis: async (gameId: string) => h.analyses.get(gameId) ?? (h.analysisReady ? { report: "复盘与指南已就绪" } : null),
   getGuideVersion: async () => null,
-  getLatestGuide: async () => null,
-  insertGuideVersion: async () => {},
-  listGuideScopes: async () => [],
-  listGuideVersions: async () => [],
-  upsertAnalysis: async () => {},
+  getLatestGuide: async (userId: string, scope: string) => h.analysisReady
+    ? { userId, scope, version: 1, content: "本局认知指南", gameId: h.analysisGameId, createdAt: new Date() }
+    : h.guides.filter((g) => g.userId === userId && g.scope === scope).sort((a, b) => (b.version as number) - (a.version as number))[0] ?? null,
+  insertGuideVersion: async (row: Record<string, unknown>) => { h.guides.push({ createdAt: new Date(), ...row }); },
+  listGuideScopes: async (userId: string) => [...new Set(h.guides.filter((g) => g.userId === userId).map((g) => g.scope as string))],
+  listGuideVersions: async (userId: string, scope: string) => h.guides.filter((g) => g.userId === userId && g.scope === scope),
+  upsertAnalysis: async (gameId: string, report: string, model: string) => {
+    h.analyses.set(gameId, { gameId, report, model, createdAt: new Date() });
+  },
 }));
 
 vi.mock("../queries/winrates", () => ({
@@ -85,17 +94,43 @@ vi.mock("../queries/library", () => ({
   getStudyNotes: async () => [],
 }));
 
+
+// 通用自动应答（托管抹消后，主线流程必须由正常 AI 输出推进）
+function autoAnswer(user: string): string {
+  if (user.includes("升序发言")) return '{"thought":"t","targets":[1]}';
+  if (user.includes("退水抉择")) return '{"thought":"t","targets":[0]}';
+  if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
+  const taskLine = user.slice(user.indexOf("【你的任务】"));
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言/.test(taskLine)) {
+    return '{"thought":"t","speech":"测试发言"}';
+  }
+  const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));
+  if (needTarget) {
+    const m = user.match(/【合法目标】([0-9]+)/);
+    if (m) return `{"thought":"t","targets":[${m[1]}]}`;
+  }
+  return '{"thought":"t","skip":true}';
+}
+
 vi.mock("./ai/providers", () => ({
-  // 玩家决策恒失败 → 启发式兜底（postgameSpeak 兜底=全员 skip，一轮静默即结束）；
+  // 玩家决策恒失败 → 启发式兜底（赛后 postgameSpeak 按 postgameMode 分流：
+  //   invalid=输出非法（模型行为）→ 兜底全员 skip，一轮静默即结束；
+  //   fail=调用层超时（服务故障）→ 2026-10-15 新规：赛后故障即暂停，不托管吞声）；
   // holdAi=true 时悬挂不返回（赛后生成停在 running，供 stopPostGame 测试）
-  callAi: async (_cfg: unknown, system: string) => {
+  callAi: async (_cfg: unknown, system: string, user: string) => {
     h.aiCalls += 1;
     if (h.holdAi) return new Promise(() => {});
     // 赛前学习调用：返回学习心得（学习提示词含「图书馆」字样）
     if (typeof system === "string" && system.includes("图书馆")) {
       return { ok: true, text: "我学到了：金水包括平民，警徽要续给可信信息位。", latencyMs: 1, error: null };
     }
-    return { ok: false, text: null, latencyMs: 1, error: "测试：AI 不可用 → 启发式兜底" };
+    if (typeof user === "string" && user.includes("赛后讨论·聊天室")) {
+      if (h.postgameMode === "speak") {
+        return { ok: true, text: '{"thought":"复盘思考","speech":"测试赛后发言"}', latencyMs: 1, error: null };
+      }
+      return { ok: false, text: null, latencyMs: 1, error: "测试：请求超时（150s）" };
+    }
+    return { ok: true, text: autoAnswer(user), latencyMs: 1, error: null };
   },
 }));
 
@@ -129,12 +164,19 @@ async function waitFor(cond: () => boolean, label: string, timeoutMs = 25_000): 
 
 const eventsOf = (gameId: string) => h.events.filter((e) => e.gameId === gameId);
 
-beforeEach(() => {
+beforeEach(async () => {
+  const { analysisJobs } = await import("./service");
   h.games.clear();
   h.events.length = 0;
   h.decisions.length = 0;
+  h.analyses.clear();
+  h.guides.length = 0;
   h.aiCalls = 0;
   h.holdAi = false;
+  h.postgameMode = "speak";
+  h.analysisReady = false;
+  h.analysisGameId = null;
+  analysisJobs.clear();
   registry.clear();
   guideCache.clear();
 });
@@ -182,14 +224,39 @@ describe("赛后讨论挂起（进房才开始生成）", () => {
 
     expect(eventsOf(gameId).some((e) => e.title === "赛后讨论结束")).toBe(true);
     expect(h.games.get(gameId)?.status).toBe("finished");
-    // 顺序单问：12 个座位各一条独立 postgameSpeak 决策日志（非整批一条），全部弃权
+    // 顺序单问：12 座位 × 每人 5 次机会说满 = 60 条独立 postgameSpeak 决策日志（非整批一条），全部正常发言
     const pgDecisions = h.decisions.filter((d) => d.gameId === gameId && d.kind === "postgameSpeak");
-    expect(pgDecisions.length).toBe(12);
+    expect(pgDecisions.length).toBe(60);
     expect(new Set(pgDecisions.map((d) => d.seat)).size).toBe(12);
     expect(
-      pgDecisions.every((d) => (d.decision as { skip?: boolean }).skip === true),
+      pgDecisions.every((d) => typeof (d.decision as { speech?: string }).speech === "string"),
     ).toBe(true);
   }, 180_000);
+
+  it("赛后讨论发言调用层故障：暂停（不托管吞声），决策未被消费、发言机会保留（2026-10-15 新规）", async () => {
+    h.postgameMode = "fail"; // 赛后调用层超时（服务故障）
+    const { gameService } = await import("./service");
+    const { gameId } = await gameService.createGame({
+      boardId: "standard12",
+      seats: makeSeats(12),
+      options: { ...OPTS, postGameAutoStart: true }, // 径直进入赛后生成
+      winRateEnabled: false,
+    });
+    await gameService.control(gameId, "start");
+    // 首个 postgameSpeak 调用层超时 → 立即暂停（不是托管 skip）
+    await waitFor(() => registry.get(gameId)?.status === "paused", "赛后故障暂停", 90_000);
+    const rt = registry.get(gameId)!;
+    expect(rt.pauseReason).toContain("赛后讨论");
+    expect(rt.pauseReason).toContain("连续无响应");
+    // 决策未被兜底消费（旧行为会落 skip 决策继续跑）；发言机会原样保留
+    expect(h.decisions.filter((d) => d.gameId === gameId && d.kind === "postgameSpeak").length).toBe(0);
+    expect(h.games.get(gameId)?.status).not.toBe("finished");
+    // 恢复：引擎协程原地待决 → 同一 postgameSpeak 重新提问（随后故障依旧再暂停，终止收尾）
+    await gameService.control(gameId, "start");
+    await waitFor(() => registry.get(gameId)?.status === "paused", "恢复后再次故障暂停", 30_000);
+    expect(h.decisions.filter((d) => d.gameId === gameId && d.kind === "postgameSpeak").length).toBe(0);
+    await gameService.control(gameId, "terminate");
+  }, 120_000);
 
   it("未开启 postGameDiscuss 的对局不挂起：径直跑到 finished", async () => {
     const { gameService } = await import("./service");
@@ -204,6 +271,8 @@ describe("赛后讨论挂起（进房才开始生成）", () => {
     await waitFor(() => registry.get(gameId)?.status === "finished", "对局终局", 90_000);
     expect(eventsOf(gameId).some((e) => e.title === "赛后讨论待开始")).toBe(false);
     expect(eventsOf(gameId).some((e) => (e.phase as string).startsWith("postgame"))).toBe(false);
+    expect(registry.get(gameId)!.timing.endedAt).not.toBeNull();
+    expect(registry.get(gameId)!.timing.runningSince).toBeNull();
   }, 120_000);
 
   it("开启 postGameAutoStart：分出胜负后不挂起，径直生成赛后讨论至终局", async () => {
@@ -221,6 +290,8 @@ describe("赛后讨论挂起（进房才开始生成）", () => {
     expect(eventsOf(gameId).some((e) => e.title === "赛后讨论待开始")).toBe(false);
     expect(eventsOf(gameId).some((e) => e.title === "赛后讨论结束")).toBe(true);
     expect(h.games.get(gameId)?.status).toBe("finished");
+    expect(registry.get(gameId)!.timing.endedAt).not.toBeNull();
+    expect(registry.get(gameId)!.timing.runningSince).toBeNull();
   }, 120_000);
 
   it("startPostGame 专用通道：挂起待开始的对局直接恢复生成（不占 control('start')）", async () => {
@@ -240,13 +311,49 @@ describe("赛后讨论挂起（进房才开始生成）", () => {
       90_000,
     );
 
+    await gameService.control(gameId, "pause");
+    expect(registry.get(gameId)!.timing.runningSince).toBeNull();
     // 专用通道恢复（与 control('start') 继续键职责分离）
     const r = await gameService.startPostGame(gameId);
     expect(r.started).toBe(true);
+    expect(registry.get(gameId)!.timing.runningSince).not.toBeNull();
+    expect((h.games.get(gameId)!.setup as { timing: { runningSince: number | null } }).timing.runningSince).not.toBeNull();
     await waitFor(() => registry.get(gameId)?.status === "finished", "续跑赛后讨论至终局", 60_000);
     expect(eventsOf(gameId).some((e) => e.title === "赛后讨论结束")).toBe(true);
     expect(h.games.get(gameId)?.status).toBe("finished");
+    expect(registry.get(gameId)!.timing.endedAt).not.toBeNull();
+    expect(registry.get(gameId)!.timing.runningSince).toBeNull();
   }, 180_000);
+
+  it("复盘前置：只等报告与认知库就绪，无需查看，自动从1号开始讨论", async () => {
+    const { gameService } = await import("./service");
+    const ownerId = "review-owner";
+    const { gameId } = await gameService.createGame({
+      boardId: "standard12",
+      seats: makeSeats(12),
+      options: { ...OPTS, postGameAutoStart: true, postGameReviewFirst: true },
+      winRateEnabled: false,
+    }, ownerId);
+    await gameService.control(gameId, "start", ownerId);
+    await waitFor(() => registry.get(gameId)?.status === "paused", "复盘前置挂起", 90_000);
+    expect(registry.get(gameId)?.pending?.kind).toBe("postgameSpeak");
+    expect(registry.get(gameId)?.pending?.seat).toBe(1);
+    expect((await gameService.startPostGame(gameId, ownerId)).started).toBe(false);
+    expect(h.analyses.has(gameId)).toBe(false);
+    expect(h.guides.filter((g) => g.gameId === gameId)).toHaveLength(0);
+
+    // 直接生成分析，不打开报告、不传入任何“已查看”标记。
+    await gameService.generateAnalysis(gameId, ownerId, {
+      provider: "kimi", baseUrl: "http://test.local/v1", model: "analyst-model", apiKey: "test-key",
+    });
+    await waitFor(() => registry.get(gameId)?.status === "finished", "指南写入后自动赛后讨论", 60_000);
+    expect(h.analyses.get(gameId)?.report).toBeTruthy();
+    expect(new Set(h.guides.filter((g) => g.gameId === gameId).map((g) => g.scope))).toEqual(new Set(["common", "standard12"]));
+    expect(eventsOf(gameId).some((e) => e.title === "赛后讨论结束")).toBe(true);
+    const pgDecisions = h.decisions.filter((d) => d.gameId === gameId && d.kind === "postgameSpeak");
+    expect(pgDecisions[0]?.seat).toBe(1);
+    expect((h.games.get(gameId)!.setup as Record<string, unknown>).postGameReportViewed).not.toBe(true);
+  }, 120_000);
 
   it("stopPostGame：赛后生成中手动终止——收敛 finished、落终止标记、胜负不受影响", async () => {
     const { gameService } = await import("./service");
@@ -342,9 +449,9 @@ describe("已结束对局补开赛后讨论（startPostGame）", () => {
     expect(eventsOf(gameId).some((e) => e.title === "赛后讨论结束")).toBe(true);
     expect(h.games.get(gameId)?.status).toBe("finished");
     expect(h.games.get(gameId)?.winner).toBe(winner);
-    // 顺序单问：12 个座位各一条独立 postgameSpeak 决策日志
+    // 顺序单问：12 座位 × 每人 5 次机会说满 = 60 条独立 postgameSpeak 决策日志
     const pgDecisions = h.decisions.filter((d) => d.gameId === gameId && d.kind === "postgameSpeak");
-    expect(pgDecisions.length).toBe(12);
+    expect(pgDecisions.length).toBe(60);
 
     // 幂等：已有赛后内容，再次补开拒绝
     const again = await gameService.startPostGame(gameId);
@@ -417,6 +524,7 @@ describe("已结束对局补开赛后讨论（startPostGame）", () => {
         stepDelayMs: 200,
         postGameDiscuss: true,
         postGameAutoStart: true,
+        postGameReviewFirst: true,
         postGameSpeechLimit: 3,
         aiTimeLimitSec: 45,
         libraryEnabled: true,
@@ -428,6 +536,7 @@ describe("已结束对局补开赛后讨论（startPostGame）", () => {
     });
     const setup = h.games.get(gameId)?.setup as { options?: Record<string, unknown> } | undefined;
     expect(setup?.options?.postGameAutoStart).toBe(true);
+    expect(setup?.options?.postGameReviewFirst).toBe(true);
     expect(setup?.options?.postGameSpeechLimit).toBe(3);
     expect(setup?.options?.aiTimeLimitSec).toBe(45);
     expect(setup?.options?.libraryEnabled).toBe(true);

@@ -130,6 +130,7 @@ function buildModel(snapshot: GameSnapshot, events: GameEvent[]): DigestModel {
 
   let gameResult: string | null = null;
   for (const ev of events) {
+    if (ev.phase.startsWith("postgame.")) continue; // 赛后讨论不属于主对局证据，避免挤掉白天发言
     if (ev.type === "phase") continue; // 阶段标记无信息量
     if (ev.type === "result") {
       gameResult = ev.content; // 对局结果（含终局身份表），始终完整保留

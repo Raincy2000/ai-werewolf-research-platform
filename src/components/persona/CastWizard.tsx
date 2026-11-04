@@ -5,7 +5,7 @@
  */
 
 import { useEffect, useState } from 'react'
-import { CircleAlert, Loader2, RefreshCw, Search, Sparkles, Wand2 } from 'lucide-react'
+import { CircleAlert, Loader2, Pencil, RefreshCw, Search, Sparkles, Wand2 } from 'lucide-react'
 import type {
   AiProvider,
   ApiPreset,
@@ -14,7 +14,7 @@ import type {
   PersonaCardInput,
   PersonaCastResult,
 } from '@/lib/gameApi'
-import { getProviderPreset, useGameApi } from '@/lib/gameApi'
+import { COGNITION_NOTE_ENABLED, getProviderPreset, useGameApi } from '@/lib/gameApi'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -27,7 +27,6 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectContent,
@@ -207,24 +206,34 @@ function QuadEditor({
 // 向导主体
 // ---------------------------------------------------------------------------
 
-type Step = 'input' | 'candidates' | 'casting' | 'draft'
+type Step = 'input' | 'candidates' | 'batchCands' | 'casting' | 'draft'
+
+/** 行式名单的一行：人格名 + 消歧提示 + 该行独立的三 AI 配置与流程开关（配置框默认收起） */
+interface CastRow {
+  name: string
+  hint: string
+  cfg: CasterSettings
+  expanded: boolean
+}
 
 export function CastWizard({
   open,
   onOpenChange,
   presets,
   onDraftReady,
+  targetCastId,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   presets: ApiPreset[]
-  onDraftReady: (draft: PersonaCardInput) => void
+  onDraftReady: (draft: PersonaCardInput, castId?: string | null) => void
+  // 指名打开的铸造任务（草稿箱/生成中卡片入口）：精确恢复该任务，不再「猜最近的」
+  targetCastId?: string | null
 }) {
   const api = useGameApi()
   const [step, setStep] = useState<Step>('input')
-  const [name, setName] = useState('')
-  const [hint, setHint] = useState('')
-  const [settings, setSettings] = useState<CasterSettings>(() => loadCasterSettings())
+  // 每行独立配置（新增行默认复制第一行此刻的配置；首行配置改动持久化到 localStorage）
+  const [rows, setRows] = useState<CastRow[]>(() => [{ name: '', hint: '', cfg: loadCasterSettings(), expanded: false }])
   const [candidates, setCandidates] = useState<CasterCandidate[]>([])
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -234,9 +243,14 @@ export function CastWizard({
   // 真实铸造进度（后端 persona.castProgress 轮询；castId 每次任务新生成）
   const [castId, setCastId] = useState<string | null>(null)
   const [progress, setProgress] = useState<CastProgressState | null>(null)
-  // 批量铸造模式（一行一个人名并发铸造；共享三 AI 配置与流程开关）
-  const [batchMode, setBatchMode] = useState(false)
-  const [batchText, setBatchText] = useState('')
+  // 批量身份核对（每人一格候选，默认选首候选；无候选的行自动跳过并注明）
+  const [batchCands, setBatchCands] = useState<
+    { name: string; hint: string; cfg: CasterSettings; cands: CasterCandidate[]; selected: number; error: string | null }[] | null
+  >(null)
+  // 单轮的 name/hint 即 rows[0]（行式名单的第一行）——派生存取，单一事实源
+  const name = rows[0]?.name ?? ''
+  const hint = rows[0]?.hint ?? ''
+
 
   // 铸造阶段的轮播提示（进度未回传时的兜底；有真实进度后由 progress 顶替）
   useEffect(() => {
@@ -287,25 +301,41 @@ export function CastWizard({
     }
   }, [busy, castId, api])
 
-  // 向导打开时找回最近铸造：进行中→恢复铸造界面与轮询；已完成未取走→直接进草稿步
-  // （根治「铸造途中界面消失后，重新点开不知道进程到哪了」）
+  // 向导打开时的现场恢复（20261013 重订）：
+  // - 指名 targetCastId（草稿箱/生成中卡片点入）：精确恢复该任务——完成且有产物→草稿步，
+  //   进行中/已暂停→铸造步接管轮询（批量并发铸造不再串台：不再「猜最近一个」）
+  // - 裸开（「AI 铸造」按钮）：只接管进行中的任务；已完成草稿一律留在草稿箱等用户点取，
+  //   绝不自动弹出（草稿是用户资产，长期保存，只有用户主动删除才会消失）
   useEffect(() => {
     if (!open) return
     let cancelled = false
     void (async () => {
       try {
-        const active = await api.getCastActive()
-        if (cancelled || !active) return
+        const active = targetCastId
+          ? await api.getCastProgress(targetCastId)
+          : await api.getCastActive()
+        if (cancelled) return
+        if (!active) {
+          // 指名打开但任务不存在（已被取走/清除）：显式告知，绝不静默落在新建页（20261014 实锤）
+          if (targetCastId) setError('该铸造任务已不存在（草稿可能已被取走或删除）')
+          return
+        }
         if (active.done) {
-          if (active.result && step === 'input') {
+          // 草稿步只在「指名打开」时进入（裸开不打扰草稿箱）；
+          // 指名打开不受陈旧 step/busy 影响（上次会话残留曾把用户绊在新建页）
+          if (targetCastId && active.result) {
             setCastId(active.castId)
             setCastResult(active.result)
             setNotice(active.result.notice ?? null)
+            setBusy(false)
             setStep('draft')
           }
           return
         }
-        if (step === 'input' && !busy) {
+        // 进行中/已暂停：仅指名打开（人格卡「详情」/草稿箱「查看进度」）才接管进度页；
+        // 裸开（点「AI 铸造」按钮）一律进新建主页——2026-10-14 用户裁定：
+        // 进行中的进程已有固定入口，铸造按钮只负责发起新的铸造
+        if (targetCastId) {
           setCastId(active.castId)
           setProgress(active)
           setBusy(true)
@@ -319,14 +349,17 @@ export function CastWizard({
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }, [open, targetCastId])
 
-  function updateSettings(patch: Partial<CasterSettings>) {
-    setSettings((prev) => {
-      const next = { ...prev, ...patch }
-      saveCasterSettings(next)
-      return next
-    })
+  function updateRowCfg(i: number, patch: Partial<CasterSettings>) {
+    setRows((prev) =>
+      prev.map((r, j) => {
+        if (j !== i) return r
+        const next = { ...r.cfg, ...patch }
+        if (j === 0) saveCasterSettings(next) // 首行配置持久化（新增行的默认模板）
+        return { ...r, cfg: next }
+      }),
+    )
   }
 
   function reset() {
@@ -337,49 +370,87 @@ export function CastWizard({
     setNotice(null)
     setCastId(null)
     setProgress(null)
-    setBatchMode(false)
-    setBatchText('')
+    setBusy(false)
+    setRows([{ name: '', hint: '', cfg: loadCasterSettings(), expanded: false }])
+    setBatchCands(null)
   }
 
-  /** 批量铸造：一行一人（可选「| 提示」），并发闸门 2 排队进行 */
-  async function handleBatchCast() {
-    if (busy) return
-    const seen = new Set<string>()
-    const items: { name: string; hint?: string }[] = []
-    for (const line of batchText.split('\n')) {
-      const t = line.trim()
-      if (!t) continue
-      const [n, h] = t.split('|').map((s) => s.trim())
-      if (!n || seen.has(n)) continue
-      seen.add(n)
-      items.push({ name: n, hint: h || undefined })
-      if (items.length >= 12) break
-    }
+  /** 统一检索入口：一行=旧单轮流程；多行=逐行并行消歧检索，进批量身份核对步 */
+  async function handleResearchAll() {
+    const items = rows
+      .map((r) => ({ name: r.name.trim(), hint: r.hint.trim(), cfg: r.cfg }))
+      .filter((r) => r.name)
+      .slice(0, 12)
     if (items.length === 0) {
-      setError('请先输入要批量铸造的人物（一行一个）')
+      setError('请先输入人物名')
       return
     }
+    if (items.length === 1) return handleResearch()
+    if (busy) return
     setBusy(true)
     setError(null)
     try {
-      await api.castPersonaBatch({
-        items,
-        searchAi: settings.search,
-        understandAi: settings.understand,
-        synthAi: settings.synth,
-        web: { stage1: settings.web.s1, stage2: settings.web.s2, stage3: settings.web.s3 },
-        deepRead: { segmented: settings.deep.segmented, selfCritique: settings.deep.critique },
-      })
-      setNotice(
-        `已启动 ${items.length} 项批量铸造（并发 2 个、排队进行）：各人格的生成进度见人格研究库卡列表顶部的「生成中」卡片，可随时暂停/终止；重名者已自动选定首候选。`,
+      // 逐行并行检索（复用单轮消歧接口；共享①搜集 AI 配置）
+      const results = await Promise.all(
+        items.map(async (it) => {
+          try {
+            if (!quadComplete(it.cfg.search)) {
+              return { name: it.name, hint: it.hint, cands: [], selected: 0, error: 'AI 配置不完整（搜集 AI 缺模型或 Key）' }
+            }
+            const r = await api.researchPersona({
+              name: it.name,
+              hint: it.hint || undefined,
+              searchAi: it.cfg.search,
+              webSearch: it.cfg.web.s1,
+              castId: crypto.randomUUID(),
+            })
+            return { name: it.name, hint: it.hint, cands: r.candidates, selected: 0, error: null }
+          } catch (err) {
+            return {
+              name: it.name,
+              hint: it.hint,
+              cands: [],
+              selected: 0,
+              error: err instanceof Error ? err.message : '检索失败',
+            }
+          }
+        }),
       )
-      setBatchText('')
-      setBatchMode(false)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '批量铸造启动失败，请重试')
+      setBatchCands(results.map((r, i) => ({ ...r, cfg: items[i]!.cfg })))
+      setStep('batchCands')
     } finally {
       setBusy(false)
     }
+  }
+
+  /** 批量确认铸造：逐行入队铸魂生产队列（选定的候选对象；无候选行跳过） */
+  function handleBatchConfirm() {
+    if (!batchCands) return
+    const picked = batchCands.filter((r) => r.cands.length > 0 && r.selected >= 0)
+    if (picked.length === 0) {
+      setError('没有可铸造的对象（全部检索失败或无候选）')
+      return
+    }
+    for (const r of picked) {
+      const c = r.cands[r.selected]!
+      void api.castPersona({
+        name: c.name,
+        source: c.source || undefined,
+        hint: r.hint || undefined,
+        searchAi: r.cfg.search,
+        understandAi: r.cfg.understand,
+        synthAi: r.cfg.synth,
+        web: { stage1: r.cfg.web.s1, stage2: r.cfg.web.s2, stage3: r.cfg.web.s3 },
+        deepRead: { segmented: r.cfg.deep.segmented, selfCritique: r.cfg.deep.critique },
+        castId: crypto.randomUUID(),
+      })
+    }
+    setNotice(
+      `已入队 ${picked.length} 项铸造（滚动并发窗 2 个、排队进行）：各人格的生成进度见人格研究站卡列表顶部的卡片，可随时暂停/终止；完成后草稿入草稿箱长期保存。`,
+    )
+    setRows((prev) => [{ name: '', hint: '', cfg: prev[0]!.cfg, expanded: true }])
+    setBatchCands(null)
+    setStep('input')
   }
 
   async function handleResearch() {
@@ -393,8 +464,8 @@ export function CastWizard({
       const r = await api.researchPersona({
         name: name.trim(),
         hint: hint.trim() || undefined,
-        searchAi: settings.search,
-        webSearch: settings.web.s1,
+        searchAi: rows[0]!.cfg.search,
+        webSearch: rows[0]!.cfg.web.s1,
         castId: id,
       })
       setCandidates(r.candidates)
@@ -425,11 +496,11 @@ export function CastWizard({
         name: c.name,
         source: c.source || undefined,
         hint: hint.trim() || undefined,
-        searchAi: settings.search,
-        understandAi: settings.understand,
-        synthAi: settings.synth,
-        web: { stage1: settings.web.s1, stage2: settings.web.s2, stage3: settings.web.s3 },
-        deepRead: { segmented: settings.deep.segmented, selfCritique: settings.deep.critique },
+        searchAi: rows[0]!.cfg.search,
+        understandAi: rows[0]!.cfg.understand,
+        synthAi: rows[0]!.cfg.synth,
+        web: { stage1: rows[0]!.cfg.web.s1, stage2: rows[0]!.cfg.web.s2, stage3: rows[0]!.cfg.web.s3 },
+        deepRead: { segmented: rows[0]!.cfg.deep.segmented, selfCritique: rows[0]!.cfg.deep.critique },
         castId: id,
       })
     } catch (err) {
@@ -439,15 +510,15 @@ export function CastWizard({
     }
   }
 
-  const searchOk = quadComplete(settings.search)
-  const understandOk = quadComplete(settings.understand)
-  const synthOk = quadComplete(settings.synth)
+  const searchOk = rows.every((r) => !r.name.trim() || quadComplete(r.cfg.search))
+  const understandOk = rows.every((r) => !r.name.trim() || quadComplete(r.cfg.understand))
+  const synthOk = rows.every((r) => !r.name.trim() || quadComplete(r.cfg.synth))
 
   const CAST_STAGES = [
     '① 搜集 AI 正在全网搜集人物资料（生平/人设/经历/关系/语录，真实可靠第一）…',
     '② 深读 AI 正在透过表象把握人物核心（分段深挖：人格结构/冲突防御/依恋关系/压力与语言）…',
     '② 深读 AI 正在自我批判复读（揪出无据推测、恢复被调和的冲突）…',
-    '③ 整合 AI 正在生成完整档案并量化七组参数（含人格精粹与肖像挑选）…',
+    '③ 整合 AI 正在生成完整档案并量化七组参数（含肖像挑选）…',
   ]
 
   return (
@@ -477,102 +548,165 @@ export function CastWizard({
         ) : null}
 
         {/* 第一步：人物名 + 双 AI 配置 */}
+        {/* 第一步：行式名单 + 每行独立 AI 配置（新增行默认复制首行配置，后可自改） */}
         {step === 'input' ? (
           <div className="space-y-4">
-            {!batchMode ? (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <div className="space-y-1.5">
-                  <Label>人物名 *</Label>
-                  <Input
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="如：曹操 / 福尔摩斯 / 马斯克"
-                    onKeyDown={(e) => e.key === 'Enter' && void handleResearch()}
-                  />
+            {/* 顶部提醒（用户裁定的两点提示）：并发额度与独立配置注意事项 */}
+            <p className="rounded-md border border-god/30 bg-god/5 px-3 py-2 text-[12px] leading-5 text-muted-foreground">
+              同一 API 最多同时铸造 2 个人格（约 6 条流程），超出自动排队——不同 API 的人格可以并行；每个人格可独立配置
+              AI（新增行默认跟随第一行，点笔图标展开修改），配置不完整的行会在核对页标出、不会混入铸造。
+            </p>
+            {rows.map((row, i) => (
+              <div key={i} className="space-y-2.5 rounded-xl border border-border p-3">
+                {/* 名单框：人格名+消歧提示缩短，右侧双方块按钮（笔=展开/定位配置框，叉=删除行） */}
+                <div className="flex items-start gap-2">
+                  <div className="grid flex-1 grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div className="space-y-1.5">
+                      {i === 0 ? <Label>人物名 *</Label> : null}
+                      <Input
+                        value={row.name}
+                        onChange={(e) =>
+                          setRows((prev) => prev.map((r, j) => (j === i ? { ...r, name: e.target.value } : r)))
+                        }
+                        placeholder={i === 0 ? '如：曹操 / 福尔摩斯 / 马斯克' : '再一个人物名'}
+                        onKeyDown={(e) => e.key === 'Enter' && void handleResearchAll()}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      {i === 0 ? <Label>消歧提示（可空）</Label> : null}
+                      <Input
+                        value={row.hint}
+                        onChange={(e) =>
+                          setRows((prev) => prev.map((r, j) => (j === i ? { ...r, hint: e.target.value } : r)))
+                        }
+                        placeholder={i === 0 ? '如：《三国演义》里的，不是其他人' : '消歧提示（可空）'}
+                      />
+                    </div>
+                  </div>
+                  <div className={`flex shrink-0 gap-1.5 ${i === 0 ? 'mt-6' : ''}`}>
+                    <Button
+                      size="icon"
+                      variant={row.expanded ? 'default' : 'outline'}
+                      className="h-9 w-9"
+                      title={row.expanded ? '收起该人格的 AI 配置' : '展开/编辑该人格的 AI 配置'}
+                      onClick={() =>
+                        setRows((prev) => prev.map((r, j) => (j === i ? { ...r, expanded: !r.expanded } : r)))
+                      }
+                    >
+                      <Pencil className="h-4 w-4" aria-hidden />
+                    </Button>
+                    {rows.length > 1 ? (
+                      <Button
+                        size="icon"
+                        variant="outline"
+                        className="h-9 w-9 text-muted-foreground hover:text-wolf"
+                        title="移除这个人格"
+                        onClick={() => setRows((prev) => prev.filter((_, j) => j !== i))}
+                      >
+                        ✕
+                      </Button>
+                    ) : null}
+                  </div>
                 </div>
-                <div className="space-y-1.5">
-                  <Label>消歧提示（可空）</Label>
-                  <Input
-                    value={hint}
-                    onChange={(e) => setHint(e.target.value)}
-                    placeholder="如：《三国演义》里的，不是其他人"
-                  />
+                {/* AI 配置框（手风琴动画：grid-rows 0fr→1fr 展开/收起过渡；
+                    新增人格时旧配置框自动折叠、新框展开） */}
+                <div
+                  className={`grid transition-all duration-300 ease-in-out ${
+                    row.expanded ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'
+                  }`}
+                  aria-hidden={!row.expanded}
+                >
+                  <div className="overflow-hidden">
+                    <div className="space-y-3 rounded-lg border border-god/30 bg-god/5 p-3">
+                    {i > 0 ? (
+                      <p className="text-[11px] text-muted-foreground">
+                        「{row.name || `第 ${i + 1} 个人格`}」的独立配置（默认跟随第一行，可自改）
+                      </p>
+                    ) : null}
+                    <QuadEditor
+                      title="① 搜集 AI"
+                      desc="全网搜集人物资料，真实可靠第一（默认 Kimi，内置 $web_search；换其他家则退化为内部知识）"
+                      quad={row.cfg.search}
+                      presets={presets}
+                      onChange={(q) => updateRowCfg(i, { search: q })}
+                    />
+                    <QuadEditor
+                      title="② 深读 AI"
+                      desc="透过表象把握人物核心（核心人格结构/内在冲突/创伤防御/动机系统；建议推理强模型）"
+                      quad={row.cfg.understand}
+                      presets={presets}
+                      onChange={(q) => updateRowCfg(i, { understand: q })}
+                    />
+                    <QuadEditor
+                      title="③ 整合 AI"
+                      desc="整合①②成果 → 完整人物档案 + 七组量化参数（建议长上下文模型）"
+                      quad={row.cfg.synth}
+                      presets={presets}
+                      onChange={(q) => updateRowCfg(i, { synth: q })}
+                    />
+                    {/* 分阶段联网开关 + 深读深度（每行独立） */}
+                    <div className="space-y-2.5 rounded-lg border border-border bg-card p-4">
+                      <p className="text-sm font-semibold text-foreground">流程开关</p>
+                      {(
+                        [
+                          ['s1', '①搜集时联网检索（模型原生联网 + 服务端证据池实搜）'],
+                          ['s2', '②深读时联网检索（注入评论/访谈/分析旁证材料）'],
+                          ['s3', '③整合时联网检索（事实核对与肖像佐证）'],
+                        ] as const
+                      ).map(([k, label]) => (
+                        <div key={k} className="flex items-center justify-between gap-3">
+                          <Label className="cursor-pointer text-xs font-normal leading-5 text-muted-foreground">{label}</Label>
+                          <Switch
+                            className="shrink-0"
+                            checked={row.cfg.web[k]}
+                            onCheckedChange={(v) => updateRowCfg(i, { web: { ...row.cfg.web, [k]: v } })}
+                          />
+                        </div>
+                      ))}
+                      <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2.5">
+                        <Label className="cursor-pointer text-xs font-normal leading-5 text-muted-foreground">
+                          ②深度深读（四段分段深挖 + 自我批判复读；更慢更透，关掉即快速模式）
+                        </Label>
+                        <Switch
+                          className="shrink-0"
+                          checked={row.cfg.deep.segmented && row.cfg.deep.critique}
+                          onCheckedChange={(v) => updateRowCfg(i, { deep: { segmented: v, critique: v } })}
+                        />
+                      </div>
+                    </div>
+                    </div>
+                  </div>
                 </div>
+                {!row.expanded ? (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 rounded-md border border-dashed border-border px-3 py-1.5 text-left text-[11px] text-muted-foreground transition-colors hover:border-god/40 hover:text-god"
+                    onClick={() =>
+                      setRows((prev) => prev.map((r, j) => (j === i ? { ...r, expanded: true } : r)))
+                    }
+                  >
+                    AI 配置：{row.cfg.search.model || '未设'} / {row.cfg.understand.model || '未设'} / {row.cfg.synth.model || '未设'}（点此处或笔图标展开）
+                  </button>
+                ) : null}
               </div>
-            ) : (
-              <div className="space-y-1.5">
-                <Label>批量人物名单 *（每行一个；可加「| 提示」辅助消歧，最多 12 人）</Label>
-                <Textarea
-                  rows={5}
-                  value={batchText}
-                  onChange={(e) => setBatchText(e.target.value)}
-                  placeholder={'曹操\n福尔摩斯\n马斯克 | 现实人物\n五条悟'}
-                />
-              </div>
-            )}
-            <label className="flex cursor-pointer items-center gap-2 text-[13px] text-muted-foreground">
-              <Switch
-                checked={batchMode}
-                onCheckedChange={(v) => {
-                  setBatchMode(v)
-                  setError(null)
-                }}
-              />
-              批量铸造（一行一个人名，同时铸造多个；共享下方 AI 配置与流程开关）
-            </label>
-            <QuadEditor
-              title="① 搜集 AI"
-              desc="全网搜集人物资料，真实可靠第一（默认 Kimi，内置 $web_search；换其他家则退化为内部知识）"
-              quad={settings.search}
-              presets={presets}
-              onChange={(q) => updateSettings({ search: q })}
-            />
-            <QuadEditor
-              title="② 深读 AI"
-              desc="透过表象把握人物核心（核心人格结构/内在冲突/创伤防御/动机系统；建议推理强模型）"
-              quad={settings.understand}
-              presets={presets}
-              onChange={(q) => updateSettings({ understand: q })}
-            />
-            <QuadEditor
-              title="③ 整合 AI"
-              desc="整合①②成果 → 完整人物档案 + 七组量化参数（建议长上下文模型）"
-              quad={settings.synth}
-              presets={presets}
-              onChange={(q) => updateSettings({ synth: q })}
-            />
-            {/* 分阶段联网开关 + 深读深度 */}
-            <div className="space-y-2.5 rounded-lg border border-border bg-card p-4">
-              <p className="text-sm font-semibold text-foreground">流程开关</p>
-              {(
-                [
-                  ['s1', '①搜集时联网检索（模型原生联网 + 服务端证据池实搜）'],
-                  ['s2', '②深读时联网检索（注入评论/访谈/分析旁证材料）'],
-                  ['s3', '③整合时联网检索（事实核对与肖像佐证）'],
-                ] as const
-              ).map(([k, label]) => (
-                <div key={k} className="flex items-center justify-between gap-3">
-                  <Label className="cursor-pointer text-xs font-normal leading-5 text-muted-foreground">{label}</Label>
-                  <Switch
-                    className="shrink-0"
-                    checked={settings.web[k]}
-                    onCheckedChange={(v) => updateSettings({ web: { ...settings.web, [k]: v } })}
-                  />
-                </div>
-              ))}
-              <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2.5">
-                <Label className="cursor-pointer text-xs font-normal leading-5 text-muted-foreground">
-                  ②深度深读（四段分段深挖 + 自我批判复读；更慢更透，关掉即快速模式）
-                </Label>
-                <Switch
-                  className="shrink-0"
-                  checked={settings.deep.segmented && settings.deep.critique}
-                  onCheckedChange={(v) =>
-                    updateSettings({ deep: { segmented: v, critique: v } })
-                  }
-                />
-              </div>
-            </div>
+            ))}
+            {/* 批量加行入口：虚线矩形（新行默认复制首行此刻的配置；
+                手风琴：旧配置框全部自动折叠，新框展开待配置） */}
+            {rows.length < 12 ? (
+              <button
+                type="button"
+                onClick={() =>
+                  setRows((prev) => [
+                    ...prev.map((r) => ({ ...r, expanded: false })),
+                    { name: '', hint: '', cfg: JSON.parse(JSON.stringify(prev[0]!.cfg)) as CasterSettings, expanded: true },
+                  ])
+                }
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-god/40 bg-god/5 px-4 py-2.5 text-[13px] text-god transition-colors hover:bg-god/10"
+              >
+                <Wand2 className="h-3.5 w-3.5" aria-hidden />
+                批量生成更多人格
+              </button>
+            ) : null}
             {busy && progress ? (
               <p className="text-xs text-god">
                 {progress.label}
@@ -582,29 +716,21 @@ export function CastWizard({
             <div className="flex items-center justify-between border-t border-border pt-3">
               <p className="text-xs text-muted-foreground">
                 {!searchOk || !understandOk || !synthOk
-                  ? '请先补全三位 AI 的配置（模型 + API Key）'
-                  : batchMode
-                    ? '配置就绪，开始批量铸造（消歧自动选定首候选）'
+                  ? '有行的 AI 配置不完整（模型 + API Key）——核对页会标出，不完整行不会混入铸造'
+                  : rows.filter((r) => r.name.trim()).length > 1
+                    ? `配置就绪，开始检索（${rows.filter((r) => r.name.trim()).length} 人逐人消歧，齐全后统一核对）`
                     : '配置就绪，开始检索消歧'}
               </p>
               <Button
-                onClick={() => void (batchMode ? handleBatchCast() : handleResearch())}
-                disabled={
-                  busy ||
-                  (batchMode ? !batchText.trim() : !name.trim()) ||
-                  !searchOk ||
-                  !understandOk ||
-                  !synthOk
-                }
+                onClick={() => void handleResearchAll()}
+                disabled={busy || rows.every((r) => !r.name.trim())}
               >
                 {busy ? (
                   <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                ) : batchMode ? (
-                  <Wand2 className="h-4 w-4" aria-hidden />
                 ) : (
                   <Search className="h-4 w-4" aria-hidden />
                 )}
-                {batchMode ? '开始批量铸造' : '开始检索'}
+                开始检索
               </Button>
             </div>
           </div>
@@ -635,6 +761,82 @@ export function CastWizard({
             <div className="flex justify-between border-t border-border pt-3">
               <Button variant="ghost" onClick={reset}>
                 都不是，返回重检
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {/* 批量身份核对（与单轮同一套候选卡片语言：每人一格、默认首候选、可改选） */}
+        {step === 'batchCands' && batchCands ? (
+          <div className="space-y-4">
+            <p className="text-sm leading-6 text-muted-foreground">
+              逐人确认要铸造的对象（默认选定首候选；检索失败的行自动跳过）：
+            </p>
+            <div className="space-y-4">
+              {batchCands.map((row, ri) => (
+                <div key={ri} className="rounded-lg border border-border p-4">
+                  <p className="mb-2.5 flex items-center gap-2 text-sm font-semibold text-foreground">
+                    {row.name}
+                    {row.hint ? (
+                      <span className="text-xs font-normal text-muted-foreground">（{row.hint}）</span>
+                    ) : null}
+                    {row.cands.length === 0 ? (
+                      <Badge variant="outline" className="border-wolf/50 text-wolf">
+                        {row.error ? `检索失败：${row.error}` : '查无此人，将跳过'}
+                      </Badge>
+                    ) : (
+                      <Badge variant="outline">{row.cands.length} 个候选</Badge>
+                    )}
+                  </p>
+                  {row.cands.length > 0 ? (
+                    <div className="space-y-2">
+                      {row.cands.map((c, ci) => (
+                        <button
+                          key={ci}
+                          type="button"
+                          onClick={() =>
+                            setBatchCands((prev) =>
+                              prev && prev.map((r, j) => (j === ri ? { ...r, selected: ci } : r)),
+                            )
+                          }
+                          className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                            row.selected === ci
+                              ? 'border-god bg-god/10'
+                              : 'border-border hover:border-god/40 hover:bg-god/5'
+                          }`}
+                        >
+                          <span className="mb-0.5 flex items-center gap-2">
+                            <span
+                              className={`flex h-3.5 w-3.5 items-center justify-center rounded-full border ${
+                                row.selected === ci ? 'border-god bg-god' : 'border-muted-foreground'
+                              }`}
+                              aria-hidden
+                            >
+                              {row.selected === ci ? (
+                                <span className="h-1.5 w-1.5 rounded-full bg-white" />
+                              ) : null}
+                            </span>
+                            <span className="text-[13px] font-medium text-foreground">{c.name}</span>
+                            <Badge variant="outline" className="px-1 text-[10px] font-normal">
+                              {c.source || '出处未知'}
+                            </Badge>
+                            <span className="text-xs text-muted-foreground">{c.identity}</span>
+                          </span>
+                          <p className="pl-5.5 text-xs leading-5 text-muted-foreground">{c.summary}</p>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center justify-between border-t border-border pt-3">
+              <Button variant="ghost" onClick={() => { setBatchCands(null); setStep('input') }}>
+                返回修改名单
+              </Button>
+              <Button onClick={handleBatchConfirm}>
+                <Wand2 className="h-4 w-4" aria-hidden />
+                确认铸造 {batchCands.filter((r) => r.cands.length > 0).length} 人格
               </Button>
             </div>
           </div>
@@ -690,9 +892,9 @@ export function CastWizard({
                 <p className="line-clamp-3 text-[13px] leading-6 text-muted-foreground">
                   {castResult.draft.profile.summary || '（概要为空）'}
                 </p>
-                {castResult.draft.profile.essence ? (
+                {COGNITION_NOTE_ENABLED && castResult.draft.profile.essence ? (
                   <p className="mt-2 line-clamp-3 text-[13px] leading-6 text-god">
-                    人格精粹：{castResult.draft.profile.essence}
+                    自我认知笔记：{castResult.draft.profile.essence}
                   </p>
                 ) : null}
               </div>
@@ -722,11 +924,23 @@ export function CastWizard({
               送入编辑器后可逐项核对微调，保存后才正式入库（来源标记为「AI 铸造」）。
             </p>
             <div className="flex justify-between border-t border-border pt-3">
-              <Button variant="outline" onClick={() => { if (castId) void api.ackCast(castId); reset() }}>
+              <Button variant="outline" onClick={() => { reset() }}>
                 <RefreshCw className="h-4 w-4" aria-hidden />
                 重新铸造别人
               </Button>
-              <Button onClick={() => { if (castId) void api.ackCast(castId); onDraftReady(castResult.draft) }}>
+              <Button
+                onClick={() => {
+                  try {
+                    // 不核销：草稿在草稿箱保留到「编辑器保存成功」为止（用户规则：
+                    // 只有主动删除才能删草稿；送入编辑器≠删除，编辑器没保存就回来草稿还在）
+                    onDraftReady(castResult.draft, castId)
+                  } catch (err) {
+                    setError(
+                      `打开编辑器失败：${err instanceof Error ? err.message : String(err)}——草稿仍在草稿箱，可重试`,
+                    )
+                  }
+                }}
+              >
                 送入编辑器核对
               </Button>
             </div>

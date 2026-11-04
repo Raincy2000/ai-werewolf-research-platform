@@ -17,8 +17,16 @@ describe("netErrorMessage 人话翻译", () => {
   });
 
   it("连接类错误 → 「无法连接模型服务」文案", () => {
-    for (const code of ["UND_ERR_CONNECT_TIMEOUT", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]) {
+    for (const code of ["UND_ERR_CONNECT_TIMEOUT", "ECONNREFUSED"]) {
       expect(netErrorMessage(errWithCause(code))).toContain("无法连接模型服务");
+    }
+  });
+
+  it("域名解析失败 → 指引核对地址拼写/DNS（ENOTFOUND/EAI_AGAIN）", () => {
+    for (const code of ["ENOTFOUND", "EAI_AGAIN"]) {
+      const msg = netErrorMessage(errWithCause(code));
+      expect(msg).toContain("域名解析失败");
+      expect(msg).toContain(code);
     }
   });
 

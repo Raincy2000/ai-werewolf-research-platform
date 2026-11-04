@@ -20,3 +20,11 @@ const OUTAGE_RE =
 export function isOutageErrorText(text: string | null | undefined): boolean {
   return !!text && OUTAGE_RE.test(text);
 }
+
+/** 决策预算耗尽识别（单次决策的全部重试在预算内全数落空=该模型此刻实质无响应）。
+ *  2026-10-15 实锤（20261014001 第5天 10号发言）：单座位预算耗尽走托管产出「没什么头绪」
+ *  垃圾发言污染人格对局——此类应即暂停等用户处置，而非硬塞兜底发言 */
+const BUDGET_RE = /预算耗尽/;
+export function isBudgetErrorText(text: string | null | undefined): boolean {
+  return !!text && BUDGET_RE.test(text);
+}

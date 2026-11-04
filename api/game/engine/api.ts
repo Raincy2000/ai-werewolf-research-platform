@@ -29,16 +29,19 @@ export interface PlayerView {
   phase: string;
   aliveSeats: number[];           // 存活座位
   deadSeats: number[];            // 已死亡座位（不知道身份，除非翻牌）
+  deathTimeline?: Record<number, string>; // 已公告死者的出局时间与原因（公开事实，不含未公告夜亡）
   revealedRoles: Record<number, RoleId>; // 已公开翻牌的身份（白痴翻牌、骑士翻牌、自爆狼等）
   sheriffSeat: number | null;
   selfAlive: boolean;
   rules?: { witchSelfSave: "firstNight" | "never"; postGameDiscuss?: boolean }; // 本局公开规则（引擎填充后必有；可选仅为兼容手写测试夹具）
+  boardRules?: string;            // 版型官方规则全文（开局即全员公开：角色池/胜负/警长/女巫/特殊角色要点）
   // 公开历史：发言与投票记录（所有玩家都能看到的东西）
   publicLog: string[];            // 按时间排序的公开事件文本（发言全文、投票明细、死亡公告）
   // 私密信息（因角色而异；不包含其他玩家身份！）
   private: {
     wolfTeammates?: number[];     // 狼队队友座位（石像鬼/隐狼不见面，不在其中）
     wolfChat?: string[];          // 狼人频道夜间讨论记录（仅见面狼队可见，按时间序，形如 "3号：先刀5号"）
+    wolfKnifeLog?: string[];      // 狼队刀法台账（仅持刀狼可见）：每夜「你投刀谁/狼队最终落刀谁/平票空刀」的准确结果
     seerChecks?: { seat: number; result: "good" | "wolf" }[];
     psychicChecks?: { seat: number; result: string }[];   // 具体身份名
     gargoyleChecks?: { seat: number; result: string }[];

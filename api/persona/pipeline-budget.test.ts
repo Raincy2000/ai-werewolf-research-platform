@@ -109,6 +109,8 @@ describe("双程管线预算纪律（涌现优先）", () => {
     expect(res.decision).not.toBeNull();
     expect(res.decision!.speech).toContain("大家好");
     expect(res.personaMeta?.dual).toBe(true);
+    expect(res.personaMeta?.contextVersion).toContain("persona-context-v1:");
+    expect(res.personaMeta?.degraded).toEqual([]);
 
     // 心镜：35% 上限（≈91s），deadlineAt 把心镜内部重试也锁在上限内
     expect(h.calls.length).toBe(2);
@@ -205,5 +207,28 @@ describe("圈层文本抵达管线（对局 20260930001 截断事故回归）", 
     });
     expect(res.decision).not.toBeNull();
     expect(h.calls.at(-1)!.user).toContain("【人格圈层】5号=五条悟");
+  });
+
+  it("非发言行动契约优先生成 targets，避免长心理文本截断动作字段", async () => {
+    const basePending = makePending();
+    const sheriffPending: PendingDecision = {
+      ...basePending,
+      kind: "sheriffRun",
+      options: [1, 0],
+      view: { ...basePending.view, phase: "day.sheriff.run" },
+    };
+    h.script.push({ ok: true, text: VALID_MIRROR }, { ok: true, text: '{"thought":"决定上警","targets":[1]}' });
+    const res = await runPersonaPipeline({
+      cfg: CFG,
+      card: makeCard(),
+      memoryText: null,
+      pending: sheriffPending,
+      base: BASE,
+      modelContext: 1_048_576,
+      deadlineAt: h.t0 + 260_000,
+    });
+    expect(res.decision?.targets).toEqual([1]);
+    const contract = h.calls.at(-1)!.user.slice(h.calls.at(-1)!.user.indexOf("【输出契约】"));
+    expect(contract.indexOf('"targets"')).toBeLessThan(contract.indexOf('"thought"'));
   });
 });

@@ -11,36 +11,54 @@
 //   关系图谱增量传递（亲疏/信任按对局表现调整）、人格漂移写卡并留痕（附录可查）
 // ============================================================
 
-import type { SeatAiConfig } from "../../contracts/game";
+import { ROLE_META, type SeatAiConfig } from "../../contracts/game";
 import type {
   PersonaCard,
   PersonaDriftChange,
   PersonaMemory,
   PersonaRelationship,
 } from "../../contracts/persona";
-import { getParamValue } from "../../contracts/persona";
+import {
+  getParamValue,
+  clampParam,
+  driftLimitOf,
+  DRIFT_BUDGET_PER_GAME,
+  appraisalFactor,
+  EVOLUTION_MECHANISM_VERSION,
+  accumulateStep,
+  evolveParam,
+  formatDriftPanel,
+} from "../../contracts/persona";
 import { callAi } from "../game/ai/providers";
 import { parseJsonRobust } from "../game/ai/parse";
 import {
   decayPersonaMemories,
   applyPersonaDrift,
+  saveParamsResidual,
+  insertStateObservations,
+  countSameDirectionObservations,
+  insertTraitUpdates,
+  type NewStateObservation,
+  type NewTraitUpdate,
   insertPersonaMemories,
   reinforcePersonaMemories,
-  upsertPersonaRelationship,
-  insertPersonaRelationshipHistory,
-  hasPersonaRelationshipHistory,
+  beginPersonaWriteback,
+  finishPersonaWriteback,
 } from "../queries/personas";
 
 const NOTEBOOK_TIMEOUT_MS = 240_000;
 const DECAY_FACTOR = 0.85; // 每局未被触及的记忆强度 ×0.85
 const REINFORCE_BOOST = 15; // 被再度唤起的记忆 +15（封顶 100）
-const DRIFT_MAX_DELTA = 12; // 单局单参数最大漂移幅度（防止人格突变）
+// 单局单参数漂移上限改为「分层标定」（contracts/persona.ts DRIFT_LIMIT_BY_GROUP）：
+// 特质层 ±2 / 依恋 ±1 / 适应层 ±3 / 状态层 ±6
+// 依据 Roberts et al. (2017)（数周干预约 0.5 SD）与 Fraley et al. (2011)（依恋较大五更稳定）。
 
 // ---------- 回写输出契约 ----------
 interface WritebackMemory {
-  type: "trauma" | "relationship" | "general";
+  type: "trauma" | "triumph" | "relationship" | "general";
   content: string;
-  emotionalWeight: number; // 0-100
+  emotionalWeight: number; // 0-100 唤醒度（arousal）
+  valence: number; // -100..100 效价（valence）：负=创伤/挫败，正=高光/成就（Russell 1980 情绪二维）
   reinforceMemoryId: number | null; // 与本条同源的已有记忆 id（强化之）
 }
 
@@ -65,6 +83,8 @@ export interface WritebackSummary {
   relationshipsTouched: number;
   driftApplied: PersonaDriftChange[];
   text: string; // 事件流汇报用一句话
+  /** 幂等跳过（本局该座位已成功回写过） */
+  skipped?: boolean;
 }
 
 /** 座位名册条目：回写时告知记事簿「观察者视角下该座位的人格可知性」 */
@@ -132,19 +152,25 @@ export function buildWritebackPrompt(opts: {
     "【已有关系图谱】",
     relList,
     "",
-    "【人格参数卡（漂移参考）】大五/依恋/黑暗四/情绪调节/SDT 当前值见路径，如 bigFive.neuroticism=",
-    JSON.stringify(card.params.bigFive),
+    "【人格参数卡（漂移参考）】以下为全部可漂移参数（path=当前值）；请优先选择与本局情境真正相关的维度，不要默认落在神经质/宜人性：",
+    formatDriftPanel(card.params),
     "",
     "【输出契约】严格输出 JSON：",
-    `{"memories":[{"type":"trauma|relationship|general","content":"第一人称记忆（具体到人与事，≤120字）","emotionalWeight":0,"reinforceMemoryId":null}],"relationships":[{"targetName":"关系锚点（见规则3）","relation":"关系标签","affinityDelta":0,"trustDelta":0,"note":"关键事件一句"}],"drift":[{"path":"参数路径","delta":0,"reason":"漂移事由"}]}`,
+    `{"memories":[{"type":"trauma|triumph|relationship|general","content":"第一人称记忆（具体到人与事，≤120字）","emotionalWeight":0,"valence":0,"reinforceMemoryId":null}],"relationships":[{"targetName":"关系锚点（见规则3）","relation":"关系标签","affinityDelta":0,"trustDelta":0,"note":"关键事件一句"}],"drift":[{"path":"参数路径","delta":0,"reason":"漂移事由"}]}`,
     "规则：",
-    "1. memories ≤4 条：只写真正塑造 TA 的事件（被背叛/被信任/濒死/翻盘/手刃……），type=trauma 留给真正的创伤；",
+    "1. memories ≤4 条：只写真正塑造 TA 的事件（被背叛/被信任/濒死/翻盘/手刃……）；type：trauma=创伤、triumph=高光/成就、general=其他。emotionalWeight=唤醒度(0-100)，valence=效价(-100..100)——情绪是二维的，两者都要给；高光同样值得被记住；",
     "2. reinforceMemoryId：本条记忆与某条已有记忆同源（同一人物/同一主题）时填其 id——旧记忆会被强化而非重复；",
     "3. relationships ≤4 条：只写本局与 TA 产生真实交互的对象；affinity/trust 用增量（如被票出局 trustDelta=-30）。targetName 是关系的永久锚点，按对象身份可知性双轨：",
     "   - 对象是人格可知的人格玩家（名册中标注「人格玩家」）：targetName 必须精确等于 TA 的人格名（如「五条悟」）——人格跨对局存续，锚定点是人格本身，禁止带座位号（每局座位绑定会变）；",
     `   - 对象是迷雾玩家或无人格玩家：targetName 用「对局标题号·N号玩家」格式（本局如「${gameTitleNo}·10号玩家」）——TA 们对 TA 而言只是这局的一个代号，必须带对局编号才能区分；`,
     "4. 记忆内容同理（锚点一致性铁律）：提及人格可知的对象时写人格名（「五条悟骗了我」），绝不写 TA 的座位号；提及迷雾/无人格对象时写「N号玩家」（记忆本身已带对局归属）；",
-    "5. drift ≤3 条：只有经历真正撼动人格时才漂移（如反复被背叛 → attachment.anxiety +8）；单参数幅度 ±12 内；",
+    "5. drift ≤3 条：只有经历真正撼动人格时才漂移，且必须同时评估两个方向：",
+    "   · 创伤面（被背叛/被放逐/误判）→ 例：attachment.anxiety +1、bigFive.neuroticism +2；",
+    "   · 成长面（识破/翻盘/救场/被信任）→ 例：sdt.competence +3、bigFive.agreeableness +2、attachment.anxiety -1；",
+    "   ★ 创伤后成长（PTG）：同一次创伤可同时带来痛苦与成长（如 神经质 +2 且 宜人 +2 且 归属 +3）——都要写，绝不许互相抵消；",
+    "   · 单参数幅度按层级上限：大五 ±2、依恋 ±1、黑暗四联/SDT ±3、情绪调节/防御/认知偏差 ±6；",
+    `   · 全部 drift 的 |delta| 之和 ≤ ${DRIFT_BUDGET_PER_GAME}；`,
+    "   · 优先选择本局情境真正相关的维度——不要默认落在神经质/宜人性；",
     "6. 没有可写的内容就返回空数组——平庸的对局不产生记忆。",
     `7. 引用对局时一律使用标题号（本局为「${gameTitleNo}」，其他对局的标题号可从已有记忆中延续）——这是你与他人讨论对局的统一编号。`,
   ].join("\n");
@@ -169,7 +195,7 @@ export function parseWriteback(text: string): {
     const n = typeof v === "number" && Number.isFinite(v) ? Math.round(v) : dflt;
     return Math.max(lo, Math.min(hi, n));
   };
-  const VALID_TYPES = new Set(["trauma", "relationship", "general"]);
+  const VALID_TYPES = new Set(["trauma", "triumph", "relationship", "general"]);
 
   const memories: WritebackMemory[] = (Array.isArray(o.memories) ? o.memories : [])
     .map((x) => {
@@ -180,6 +206,7 @@ export function parseWriteback(text: string): {
         type: VALID_TYPES.has(String(r.type)) ? (String(r.type) as WritebackMemory["type"]) : "general",
         content,
         emotionalWeight: clamp(r.emotionalWeight, 0, 100, 50),
+        valence: clamp(r.valence, -100, 100, 0),
         reinforceMemoryId:
           typeof r.reinforceMemoryId === "number" && Number.isInteger(r.reinforceMemoryId)
             ? r.reinforceMemoryId
@@ -205,16 +232,29 @@ export function parseWriteback(text: string): {
     .filter((x): x is NonNullable<typeof x> => x !== null)
     .slice(0, 4);
 
-  const drift: WritebackDrift[] = (Array.isArray(o.drift) ? o.drift : [])
+  const rawDrift: WritebackDrift[] = (Array.isArray(o.drift) ? o.drift : [])
     .map((x) => {
       const r = (x ?? {}) as Record<string, unknown>;
       const path = String(r.path ?? "").trim();
-      const delta = clamp(r.delta, -DRIFT_MAX_DELTA, DRIFT_MAX_DELTA);
-      if (!path || delta === 0) return null;
+      if (!path) return null;
+      // 分层限幅：特质层 ±2 / 依恋 ±1 / 适应层 ±3 / 状态层 ±6
+      const limit = driftLimitOf(path);
+      const delta = clamp(r.delta, -limit, limit);
+      if (delta === 0) return null;
       return { path, delta, reason: String(r.reason ?? "").trim().slice(0, 120) };
     })
     .filter((x): x is NonNullable<typeof x> => x !== null)
     .slice(0, 3);
+
+  // 单局漂移预算：Σ|delta| 超预算则等比缩放（保号；防止一局改写过多维度）
+  const used = rawDrift.reduce((s, d) => s + Math.abs(d.delta), 0);
+  const drift: WritebackDrift[] =
+    used > DRIFT_BUDGET_PER_GAME
+      ? rawDrift.map((d) => {
+          const scaled = Math.trunc((d.delta * DRIFT_BUDGET_PER_GAME) / used);
+          return { ...d, delta: scaled === 0 ? (d.delta > 0 ? 1 : -1) : scaled };
+        })
+      : rawDrift;
 
   return { memories, relationships, drift };
 }
@@ -260,18 +300,31 @@ export function normalizeRelationAnchor(
 
 /** 记忆内容锚点归一化：人格可知的座位引用改写为人格名（「9号玩家」「9号」→「夜神月」）。
  * 只替换观察者可知的人格座位（迷雾中的座位引用原样保留——TA 本就不知道那是谁）。
- * 保守原则：只动精确的座位引用形态，自由文本绝不改写。 */
+ * 保守原则：只动精确的座位引用形态，自由文本绝不改写。
+ * 2026-10-22 修复：`标题号·N号玩家` 历史锚点绝不改写；只有当前局标题号前缀才归一。 */
 export function normalizeMemoryContent(
   content: string,
   knownPersonas: { seat: number; name: string }[],
   excludeSeat?: number, // 观察者自己的座位：铁律0——人格即本人，绝不自称其名，自己的引用保持原样
+  currentGameTitleNo?: string,
 ): string {
-  let out = content;
-  // 座位号降序替换（两位座位优先），lookbehind 防止「1号」误伤「11号」「21号」
-  for (const p of [...knownPersonas].sort((a, b) => b.seat - a.seat)) {
-    if (p.seat === excludeSeat) continue;
-    out = out.replace(new RegExp(`(?<![0-9])${p.seat}号(?:玩家)?`, "g"), p.name);
-  }
+  const seatToName = new Map(
+    knownPersonas.filter((p) => p.seat !== excludeSeat).map((p) => [p.seat, p.name] as const),
+  );
+  let out = content.replace(
+    /(?<![0-9])(\d+)号(?:玩家)?/g,
+    (match: string, numStr: string, offset: number, full: string) => {
+      const name = seatToName.get(Number(numStr));
+      if (!name) return match;
+      const before = full.slice(Math.max(0, offset - 16), offset);
+      const prefixed = /(\d{8,})·$/.exec(before);
+      if (prefixed) {
+        // 历史对局锚点：原样保留（那局的 N 号是谁不可考，绝不能记到本局人格头上）
+        if (!currentGameTitleNo || prefixed[1] !== currentGameTitleNo) return match;
+      }
+      return name;
+    },
+  );
   // 叠词收敛：原文若已是「9号夜神月」/「1号艾伦」形态，替换座位号后会变
   // 「夜神月夜神月」/「艾伦·耶格尔艾伦」——收拢为一次（全名粘连与全名+短名粘连两种）
   for (const p of knownPersonas) {
@@ -280,6 +333,26 @@ export function normalizeMemoryContent(
     if (first !== p.name) out = out.split(p.name + first).join(p.name);
   }
   return out;
+}
+
+/** 关系定性文本 → 受控 kind 的保守映射（模型输出是自由中文，映射不上就 unspecified） */
+export function mapRelationLabelToKind(label: string): string {
+  const s = String(label || "");
+  const rules: Array<[RegExp, string]> = [
+    [/(宿敌|死敌|仇敌|敌手|对手)/, "nemesis"],
+    [/(挚爱|恋人|爱人|所爱|挚爱之人)/, "beloved"],
+    [/(生死之交|挚友|挚交|结义|兄弟)/, "sworn_friend"],
+    [/(家人|亲人|血缘|兄妹|姐弟|父子|母女)/, "kin"],
+    [/(师徒|师长|师父|老师|弟子)/, "mentor"],
+    [/(上级|统领|君主|臣属|主从)/, "sovereign"],
+    [/(同伴|战友|队友|同盟|并肩)/, "comrade"],
+    [/(同侪|同辈|同窗|同学)/, "peer"],
+    [/(亏欠|恩情|债|欠着)/, "creditor"],
+    [/(亲手|了结|杀死|弑)/, "kin_slayer"],
+    [/(竞争|较劲)/, "rival"],
+  ];
+  for (const [re, kind] of rules) if (re.test(s)) return kind;
+  return "unspecified";
 }
 
 /**
@@ -298,12 +371,25 @@ export async function runNotebookWriteback(opts: {
   otherPersonas: SeatRosterEntry[]; // 本局其他人格座位名册（含观察者视角的可知性）
 }): Promise<WritebackSummary | null> {
   const { cfg, card, gameId, otherPersonas } = opts;
+  // 2026-10-22：幂等守卫（persona_writeback_runs）——同一 (人格,对局,座位) 成功回写后重放/重试不再双计
+  const shouldRun = await beginPersonaWriteback(card.id, gameId, opts.seat);
+  if (!shouldRun) {
+    return {
+      memoriesAdded: 0,
+      memoriesReinforced: 0,
+      memoriesDecayed: false,
+      relationshipsTouched: 0,
+      driftApplied: [],
+      skipped: true,
+      text: "已回写（幂等跳过）",
+    };
+  }
+  let runOk = false;
+  let runError: string | null = null;
+  try {
   // 人格可知的对象（迷雾关闭/未被上迷雾）：记忆与关系锚点归一到人格名的依据
   const knownPersonas = otherPersonas.filter((p) => p.known);
-  const [memories, relationships] = await Promise.all([
-    listPersonaMemoriesInternal(card.id),
-    listPersonaRelationshipsInternal(card.id),
-  ]);
+  const memories = await listPersonaMemoriesInternal(card.id);
   const prompt = buildWritebackPrompt({
     card: opts.card,
     seat: opts.seat,
@@ -312,7 +398,7 @@ export async function runNotebookWriteback(opts: {
     gameTitleNo: opts.gameTitleNo,
     digest: opts.digest,
     memories,
-    relationships,
+    relationships: [],
     seatRoster: otherPersonas,
   });
   const res = await callAi(cfg, prompt.system, prompt.user, {
@@ -328,14 +414,24 @@ export async function runNotebookWriteback(opts: {
   const reinforceIds = parsed.memories
     .map((m) => m.reinforceMemoryId)
     .filter((id): id is number => id !== null && memories.some((m) => m.id === id));
+  // 情境签名（编码特异性）：记录本局阵营，供**下一局**在相似处境下优先唤起
+  // （Tulving & Thomson 1973：提取线索须与编码情境重合）
+  const campHit = Object.values(ROLE_META).find((meta) => meta.name === opts.roleName);
+  const situationSignature = `game:${campHit?.camp ?? "good"}`;
   const newRows = parsed.memories.map((m) => ({
     personaId: card.id,
     gameId,
+    situationSignature,
     type: m.type,
     // 记忆内容锚点归一化：人格可知的座位引用改写为人格名（锚点一致性铁律的代码兜底）
-    content: normalizeMemoryContent(m.content, knownPersonas, opts.seat),
+    content: normalizeMemoryContent(m.content, knownPersonas, opts.seat, opts.gameTitleNo),
     emotionalWeight: m.emotionalWeight,
-    strength: Math.max(10, Math.min(100, Math.round(30 + m.emotionalWeight * 0.5))),
+    valence: m.valence,
+    // 强度 = 唤醒度 + |效价|：高光与创伤同样持久（Russell 1980 情绪二维）
+    strength: Math.max(
+      10,
+      clampParam(30 + m.emotionalWeight * 0.4 + Math.abs(m.valence) * 0.2),
+    ),
   }));
   const newIds = await insertPersonaMemories(newRows);
   newIds.forEach((id) => touched.add(id));
@@ -345,68 +441,127 @@ export async function runNotebookWriteback(opts: {
   if (reinforceIds.length > 0) await reinforcePersonaMemories(reinforceIds, REINFORCE_BOOST);
   await decayPersonaMemories(card.id, [...touched], DECAY_FACTOR);
 
-  // 4. 关系传递（targetName 能匹配本局人格时建立卡间链接）
-  let relTouched = 0;
-  for (const r of parsed.relationships) {
-    // 锚点归一化（双轨制代码兜底，模型不严格按格式写也能正确入库）
-    const { targetName, targetPersonaId } = normalizeRelationAnchor(
-      r.targetName,
-      knownPersonas,
-      opts.gameTitleNo,
-    );
-    const settled = await upsertPersonaRelationship({
-      personaId: card.id,
-      targetPersonaId,
-      targetName,
-      relation: r.relation,
-      affinityDelta: r.affinityDelta,
-      trustDelta: r.trustDelta,
-      note: r.note,
-      gameId,
-    });
-    // 关系沿革留痕：人格锚点的逐局变迁追加进历史表（汇总行看现状，历史行看沿革）；
-    // 无人格锚点（targetPersonaId=null）不入此表——它们的锚点本身已是「标题号·代号」逐局独立的；
-    // 幂等守卫：该局该对已有沿革（追溯回填补过/重复回写）则不追加
-    if (targetPersonaId != null && !(await hasPersonaRelationshipHistory(card.id, targetPersonaId, gameId))) await insertPersonaRelationshipHistory({
-      personaId: card.id,
-      targetPersonaId,
-      targetName,
-      gameId,
-      titleNo: opts.gameTitleNo,
-      relation: r.relation,
-      affinityDelta: r.affinityDelta,
-      trustDelta: r.trustDelta,
-      affinity: settled.affinity,
-      trust: settled.trust,
-      note: r.note,
-    });
-    relTouched++;
-  }
-
-  // 5. 人格漂移（from 取当前值，to 钳位后写卡 + 留痕）
+  // 5. 人格漂移（v3 · EWMA）：trait ← trait + α_eff × (state − trait)
+  //    语义：LLM 给的 delta = 本局表现相对**自身特质**的偏离量（不是「特质该改变多少」）
+  //    α_eff 的评价调节按**该人格自己**的调节装置取值（Bucciol 2024），不借用外部目标值
+  const residual: Record<string, number> = { ...((card.paramsResidual ?? {}) as Record<string, number>) };
+  const defenses = card.params.defenseMechanisms;
+  const appraisal = appraisalFactor({
+    cognitiveReappraisal: card.params.emotionRegulation.cognitiveReappraisal,
+    rumination: card.params.emotionRegulation.rumination,
+    defenseMaturity: defenses.length
+      ? defenses.filter((x) => x.maturity === "mature").length / defenses.length
+      : 0.5,
+  });
+  const scenarioIndex = card.gameCount ?? 1;
+  // 情境类 = 情境签名（game:<阵营>）：φ 的「同情境」判据（Tulving & Thomson 1973）
+  const situationClassId = situationSignature;
   const driftChanges: PersonaDriftChange[] = [];
+  const newObservations: NewStateObservation[] = [];
+  const pendingUpdates: Array<Omit<NewTraitUpdate, "observationIds"> & { pathKey: string }> = [];
   for (const d of parsed.drift) {
     const from = getParamValue(card.params, d.path);
     if (from === null) continue;
-    driftChanges.push({ path: d.path, from, to: from + d.delta, reason: d.reason });
+    const state = clampParam(from + d.delta); // 本局表现水平
+    const direction: "up" | "down" = state >= from ? "up" : "down";
+    // φ 的输入：同情境·同向的历史观测次数（本次为第 prior+1 次）
+    // 统计失败**不阻塞对局**：退化为「首次经历」
+    let prior = 0;
+    try {
+      prior = await countSameDirectionObservations(card.id, situationClassId, d.path, direction);
+    } catch {
+      prior = 0;
+    }
+    const { delta, alphaEff, factors } = evolveParam(from, state, d.path, {
+      repeatCount: prior + 1,
+      appraisal,
+    });
+    const salience = Math.round(factors.salience * 100);
+    // 观测**每次都写**：φ 靠观测累积（幂等由唯一索引 idx_pso_dedup 保证，重复回写不虚增）
+    newObservations.push({
+      personaId: card.id,
+      scenarioId: gameId,
+      scenarioKind: "game",
+      scenarioIndex,
+      cumulativeSalience: 0,
+      traitPath: d.path,
+      stateValue: state,
+      direction,
+      situationClassId,
+      situationSignature: situationClassId,
+      salience,
+      sourceParam: d.path,
+    });
+    // 小数累积器：|累积| ≥ 1 才落整数位移，余数留存到下一局
+    // —— 这正是「反复小经历累积」的实现（Dugan 2023）；否则单局 <0.5 分会被取整归零
+    const { step, residual: rest } = accumulateStep(residual[d.path] ?? 0, delta);
+    residual[d.path] = rest; // 严格有界 [-1, 1]
+    if (step === 0) continue;
+    const to = clampParam(from + step);
+    if (to === from) continue; // 阻尼/钳位后无净变化则不落痕
+    driftChanges.push({ path: d.path, from, to, reason: d.reason });
+    pendingUpdates.push({
+      personaId: card.id,
+      scenarioId: gameId,
+      traitPath: d.path,
+      valueFrom: from,
+      valueTo: to,
+      alphaEff,
+      factorsJson: factors,
+      mechanismVersion: EVOLUTION_MECHANISM_VERSION,
+      pathKey: d.path,
+    });
   }
+  // 审计链写入（铁律7）：累积器 → 观测 → 台账。任一失败都**不阻塞对局**
+  try {
+    await saveParamsResidual(card.id, residual);
+  } catch { /* 累积器失败仅丢一局的小数残留，不阻塞 */ }
+  let observationIds: number[] = [];
+  try {
+    observationIds = await insertStateObservations(newObservations);
+  } catch { /* 观测失败仅影响 φ 统计，不阻塞 */ }
   if (driftChanges.length > 0) {
     await applyPersonaDrift(card.id, gameId, driftChanges, "记事簿回写");
+    try {
+      const idByPath = new Map<string, number[]>();
+      newObservations.forEach((o, i) => {
+        const arr = idByPath.get(o.traitPath) ?? [];
+        const id = observationIds[i];
+        if (id) arr.push(id);
+        idByPath.set(o.traitPath, arr);
+      });
+      await insertTraitUpdates(
+        pendingUpdates.map(({ pathKey, ...rest }) => ({
+          ...rest,
+          observationIds: idByPath.get(pathKey) ?? [],
+        })),
+      );
+    } catch { /* 台账失败不影响已生效的漂移 */ }
   }
 
+  runOk = true;
   return {
     memoriesAdded: newIds.length,
     memoriesReinforced: reinforceIds.length,
     memoriesDecayed: true,
-    relationshipsTouched: relTouched,
+    relationshipsTouched: 0,
     driftApplied: driftChanges,
-    text: `记忆+${newIds.length}/强化${reinforceIds.length}/关系${relTouched}/漂移${driftChanges.length}`,
+    text: `记忆+${newIds.length}/强化${reinforceIds.length}/关系0/漂移${driftChanges.length}`,
   };
+  } catch (e) {
+    runError = e instanceof Error ? e.message : String(e);
+    throw e;
+  } finally {
+    // 成功才置 done；AI 失败/异常置 failed，允许下次 startPsyCheck 重试
+    try {
+      await finishPersonaWriteback(card.id, gameId, opts.seat, runOk ? "done" : "failed", runError);
+    } catch { /* 台账失败不掩盖主流程 */ }
+  }
 }
 
 // ---------- 内部读取（不校验归属；绑卡时已校验） ----------
 import { getDb } from "../queries/connection";
-import { personaMemories, personaRelationships } from "../../db/schema";
+import { personaMemories } from "../../db/schema";
 import { desc, eq } from "drizzle-orm";
 
 async function listPersonaMemoriesInternal(personaId: number): Promise<PersonaMemory[]> {
@@ -425,27 +580,6 @@ async function listPersonaMemoriesInternal(personaId: number): Promise<PersonaMe
     emotionalWeight: r.emotionalWeight,
     strength: r.strength,
     createdAt: (r.createdAt instanceof Date ? r.createdAt : new Date(r.createdAt)).toISOString(),
-    updatedAt: (r.updatedAt instanceof Date ? r.updatedAt : new Date(r.updatedAt)).toISOString(),
-  }));
-}
-
-async function listPersonaRelationshipsInternal(personaId: number): Promise<PersonaRelationship[]> {
-  const db = getDb();
-  const rows = await db
-    .select()
-    .from(personaRelationships)
-    .where(eq(personaRelationships.personaId, personaId))
-    .orderBy(desc(personaRelationships.updatedAt));
-  return rows.map((r: typeof personaRelationships.$inferSelect) => ({
-    id: r.id,
-    personaId: r.personaId,
-    targetPersonaId: r.targetPersonaId,
-    targetName: r.targetName,
-    relation: r.relation,
-    affinity: r.affinity,
-    trust: r.trust,
-    note: r.note,
-    gameId: r.gameId,
     updatedAt: (r.updatedAt instanceof Date ? r.updatedAt : new Date(r.updatedAt)).toISOString(),
   }));
 }

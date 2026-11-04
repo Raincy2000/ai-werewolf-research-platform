@@ -11,6 +11,11 @@ const seatSchema = z.object({
   apiKey: z.string(),
 });
 
+const roleIdSchema = z.enum([
+  "villager", "werewolf", "wolfKing", "whiteWolfKing", "gargoyle", "nightmare", "bloodMoon", "hiddenWolf", "mechWolf",
+  "seer", "psychic", "witch", "hunter", "guard", "idiot", "knight", "dreamer", "gravekeeper", "demonHunter", "crow",
+]);
+
 export const gameRouter = createRouter({
   // 版型定义为静态契约：公开可读（未登录也可浏览版型）
   boards: publicQuery.query(() => BOARDS),
@@ -29,15 +34,25 @@ export const gameRouter = createRouter({
         // 必须显式声明：zod 默认剥离未知键，漏掉它会导致前端传的赛后讨论开关被静默丢弃、setup 里根本没有它
         postGameDiscuss: z.boolean().optional(),
         postGameAutoStart: z.boolean().optional(),
+        postGameReviewFirst: z.boolean().optional(),
         postGameSpeechLimit: z.number().int().min(1).max(10).optional(),
         // AI 单决策总时限（0=不限制）
         aiTimeLimitSec: z.number().int().min(0).max(600).optional(),
-        // 图书馆赛前学习开关与单座最长学习时间（不设下限）
+        // 赛前学习总开关、三个独立来源与单座最长学习时间（不设下限）
         libraryEnabled: z.boolean().optional(),
+        studyHistoryEnabled: z.boolean().optional(),
+        studyGuideEnabled: z.boolean().optional(),
+        studyLibraryEnabled: z.boolean().optional(),
         libraryMaxSec: z.number().int().min(1).max(3600).optional(),
+        // 手动分配角色（创建页拖牌，开始时提交完整 seatRoles）
+        manualRoleAssignEnabled: z.boolean().optional(),
         // 玩家人格可见度三档与 partial 档迷雾座位（必须显式声明：zod 默认剥离未知键）
         personaVisibility: z.enum(["full", "partial", "none"]).optional(),
         personaFogSeats: z.array(z.number().int().min(1)).optional(),
+        // 心理活动默认收起（必须显式声明：zod 默认剥离未知键）
+        thoughtCollapsed: z.boolean().optional(),
+        // 自动心理检查（赛后讨论关闭=报告生成后/开启=赛后结束后自动开始）
+        autoPsyCheck: z.boolean().optional(),
       }),
       analystAi: z.object({
         provider: z.enum(["kimi", "openai", "deepseek", "custom", "anthropic"]),
@@ -49,7 +64,7 @@ export const gameRouter = createRouter({
       }).nullable().optional(),
       // 胜率推测开关（必须显式声明：zod 默认剥离未知键）
       winRateEnabled: z.boolean().optional(),
-      // 人格研究库：座位人格绑定（必须显式声明：zod 默认剥离未知键）
+      // 人格研究站：座位人格绑定（必须显式声明：zod 默认剥离未知键）
       seatPersonas: z
         .array(z.object({ seat: z.number().int().min(1), personaId: z.number().int().positive() }))
         .optional(),
@@ -57,8 +72,12 @@ export const gameRouter = createRouter({
     .mutation(({ input, ctx }) => gameService.createGame(input, ctx.user.id)),
 
   control: authedProcedure
-    .input(z.object({ gameId: z.string(), action: z.enum(["start", "pause", "terminate", "stopPostGame"]) }))
-    .mutation(({ input, ctx }) => gameService.control(input.gameId, input.action, ctx.user.id)),
+    .input(z.object({
+      gameId: z.string(),
+      action: z.enum(["start", "pause", "terminate", "stopPostGame"]),
+      seatRoles: z.array(roleIdSchema).optional(),
+    }))
+    .mutation(({ input, ctx }) => gameService.control(input.gameId, input.action, ctx.user.id, input.seatRoles)),
 
   // 已结束对局补开赛后讨论：强制 postGameDiscuss 重放到断点，续跑生成赛后讨论
   startPostGame: authedProcedure
@@ -148,7 +167,7 @@ export const gameRouter = createRouter({
     }))
     .mutation(({ input, ctx }) => gameService.generateAnalysis(input.gameId, ctx.user.id, input.analystAi)),
 
-  // 人格研究库：本局人格座位的《心理检查报告》（对局页「心理检查」入口）
+  // 人格研究站：本局人格座位的《心理检查报告》（对局页「心理检查」入口）
   personaReports: authedProcedure
     .input(z.object({ gameId: z.string() }))
     .query(({ input, ctx }) => gameService.personaReports(input.gameId, ctx.user.id)),

@@ -2,28 +2,99 @@
 // 记事簿回写解析 + 铸魂师草稿清洗 + 参数路径读写（铁律1/3）
 // ============================================================
 
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   defaultPersonaParams,
   getParamValue,
   setParamValue,
+  type PersonaCard,
 } from "../../contracts/persona";
-import { parseWriteback, normalizeRelationAnchor, normalizeMemoryContent, buildWritebackPrompt } from "./notebook";
+import type { SeatAiConfig } from "../../contracts/game";
+import { callAi } from "../game/ai/providers";
+import * as personaQueries from "../queries/personas";
+import { getDb } from "../queries/connection";
+import { applyRelationDelta } from "../network/writeModel";
+import { parseWriteback, normalizeRelationAnchor, normalizeMemoryContent, buildWritebackPrompt, runNotebookWriteback } from "./notebook";
+
+vi.mock("../game/ai/providers", () => ({ callAi: vi.fn() }));
+vi.mock("../network/writeModel", () => ({ applyRelationDelta: vi.fn() }));
+vi.mock("../queries/connection", () => ({ getDb: vi.fn() }));
+vi.mock("../queries/personas", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../queries/personas")>();
+  return {
+    ...actual,
+    beginPersonaWriteback: vi.fn(),
+    finishPersonaWriteback: vi.fn(),
+    insertPersonaMemories: vi.fn(),
+    reinforcePersonaMemories: vi.fn(),
+    decayPersonaMemories: vi.fn(),
+    applyPersonaDrift: vi.fn(),
+    saveParamsResidual: vi.fn(),
+    insertStateObservations: vi.fn(),
+    countSameDirectionObservations: vi.fn(),
+    insertTraitUpdates: vi.fn(),
+    upsertPersonaRelationship: vi.fn(),
+    insertPersonaRelationshipHistory: vi.fn(),
+    hasPersonaRelationshipHistory: vi.fn(),
+  };
+});
 import { sanitizeCastedDraft } from "./caster";
 
-describe("parseWriteback（记忆回写清洗与钳位）", () => {  it("合法输出解析；权重/增量/漂移幅度全部钳位", () => {
+describe("parseWriteback（记忆回写清洗与钳位）", () => {
+  it("合法输出解析；权重/效价/增量/漂移幅度全部按分层钳位", () => {
     const r = parseWriteback(`{"memories":[
-        {"type":"trauma","content":"第3天被5号当众票出，我记住了他。","emotionalWeight":130,"reinforceMemoryId":7},
+        {"type":"trauma","content":"第3天被5号当众票出，我记住了他。","emotionalWeight":130,"valence":-140,"reinforceMemoryId":7},
         {"type":"weird","content":"平安夜大家都挺客气。","emotionalWeight":20}
       ],"relationships":[{"targetName":"刘备","relation":"宿怨","affinityDelta":-999,"trustDelta":-30,"note":"被他骗了"}],
       "drift":[{"path":"attachment.anxiety","delta":25,"reason":"反复被背叛"},{"path":"","delta":5,"reason":"无效"}]}`)!;
     expect(r.memories.length).toBe(2);
-    expect(r.memories[0]!.emotionalWeight).toBe(100); // 钳位
+    expect(r.memories[0]!.emotionalWeight).toBe(100); // 唤醒度钳位
+    expect(r.memories[0]!.valence).toBe(-100); // 效价钳位（Russell 1980 情绪二维）
     expect(r.memories[0]!.reinforceMemoryId).toBe(7);
     expect(r.memories[1]!.type).toBe("general"); // 非法类型归一
+    expect(r.memories[1]!.valence).toBe(0); // 缺省效价
     expect(r.relationships[0]!.affinityDelta).toBe(-100); // 钳位
     expect(r.drift.length).toBe(1);
-    expect(r.drift[0]!.delta).toBe(12); // 单局漂移上限
+    // 分层漂移上限（v3 收紧）：依恋层 ±0.5（Fraley et al. 2011：依恋较大五更稳定）
+    expect(r.drift[0]!.delta).toBe(0.5);
+    expect(r.drift[0]!.path).toBe("attachment.anxiety");
+  });
+
+  it("分层漂移上限（v3）：特质层 ±1、适应层 ±2、状态层 ±4", () => {
+    const r = parseWriteback(JSON.stringify({
+      memories: [],
+      relationships: [],
+      drift: [
+        { path: "bigFive.neuroticism", delta: 99, reason: "x" },
+        { path: "sdt.competence", delta: 99, reason: "y" },
+        { path: "defenseMechanisms.humor", delta: 99, reason: "z" },
+      ],
+    }))!;
+    const byPath = Object.fromEntries(r.drift.map((d) => [d.path, Math.abs(d.delta)]));
+    expect(byPath["bigFive.neuroticism"]).toBe(1); // v3 特质层 ±1
+    expect(byPath["sdt.competence"]).toBe(2); // v3 适应层 ±2
+    expect(byPath["defenseMechanisms.humor"]).toBe(4); // v3 状态层 ±4
+  });
+
+  it("单局漂移预算：Σ|delta| 超预算等比缩放（保号）", () => {
+    const r = parseWriteback(JSON.stringify({
+      memories: [],
+      relationships: [],
+      drift: [
+        { path: "emotionRegulation.rumination", delta: 99, reason: "a" },
+        { path: "defenseMechanisms.humor", delta: 99, reason: "b" },
+        { path: "cognitiveBiases.confirmation", delta: 99, reason: "c" },
+      ],
+    }))!;
+    const total = r.drift.reduce((s, d) => s + Math.abs(d.delta), 0);
+    expect(total).toBeLessThanOrEqual(12);      // 预算生效
+    expect(r.drift.every((d) => d.delta > 0)).toBe(true); // 保号
+  });
+
+  it("高光记忆类型 triumph 合法且带正效价（创伤后成长通道）", () => {
+    const r = parseWriteback('{"memories":[{"type":"triumph","content":"我识破了悍跳","emotionalWeight":80,"valence":90}],"relationships":[],"drift":[]}')!;
+    expect(r.memories[0]!.type).toBe("triumph");
+    expect(r.memories[0]!.valence).toBe(90);
   });
 
   it("空数组合法；垃圾输入返回 null", () => {
@@ -175,6 +246,46 @@ describe("buildWritebackPrompt（关系锚点双轨写进契约）", () => {
     expect(user).toContain("20261010001·10号玩家"); // 无人格锚点示例
     expect(user).toContain("精确等于 TA 的人格名"); // 人格锚点规则
   });
+
+  it("漂移参考面板注入全部层级 + PTG 双通道（修复：原来只注入 bigFive）", () => {
+    const card = {
+      id: 1,
+      name: "测试人格",
+      params: {
+        bigFive: { openness: 50, conscientiousness: 50, extraversion: 50, agreeableness: 16, neuroticism: 96 },
+        attachment: { anxiety: 50, avoidance: 50 },
+        darkTetrad: { machiavellianism: 50, narcissism: 50, psychopathy: 50, sadism: 50 },
+        cognitiveBiases: [{ id: "confirmation", label: "确认偏误", strength: 70 }],
+        defenseMechanisms: [{ id: "humor", label: "幽默", tendency: 80, maturity: "mature" }],
+        emotionRegulation: { cognitiveReappraisal: 50, expressiveSuppression: 50, rumination: 50 },
+        sdt: { autonomy: 50, competence: 50, relatedness: 50 },
+        inferred: [],
+      },
+      profile: { quotes: [] },
+    } as unknown as Parameters<typeof buildWritebackPrompt>[0]["card"];
+    const { user } = buildWritebackPrompt({
+      card,
+      seat: 3,
+      roleName: "平民",
+      outcome: "神民阵营胜利",
+      gameTitleNo: "20261010001",
+      digest: "摘要",
+      memories: [],
+      relationships: [],
+      seatRoster: [],
+    });
+    // 根因 R1 回归：全部层级都必须在面板里（否则 LLM 只能在大五内漂移）
+    for (const prefix of ["bigFive.", "attachment.", "darkTetrad.", "emotionRegulation.", "sdt."]) {
+      expect(user).toContain(prefix);
+    }
+    expect(user).toContain("cognitiveBiases.confirmation=");   // 数组型参数必须用 group.<id>
+    expect(user).toContain("defenseMechanisms.humor=");
+    expect(user).toContain("bigFive.neuroticism=96");           // 携带当前值
+    // 根因 R3/R4 回归：PTG 双通道 + 情绪二维 + 分层幅度
+    expect(user).toContain("创伤后成长");
+    expect(user).toContain("valence");
+    expect(user).toContain("大五 ±2");
+  });
 });
 
 describe("迷雾双轨：座位代号的归属由人格可知性决定", () => {
@@ -264,5 +375,60 @@ describe("粘连收敛（原文已含人格名片段）", () => {
     ];
     expect(normalizeMemoryContent("最后带走9号夜神月", roster)).toBe("最后带走夜神月");
     expect(normalizeMemoryContent("1号艾伦自爆跳预言家", roster)).toBe("艾伦·耶格尔自爆跳预言家");
+  });
+});
+
+describe("runNotebookWriteback（赛后关系写入停用）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getDb).mockReturnValue({
+      select: () => ({
+        from: () => ({
+          where: () => ({ orderBy: async () => [] }),
+        }),
+      }),
+    } as never);
+    vi.mocked(personaQueries.beginPersonaWriteback).mockResolvedValue(true);
+    vi.mocked(personaQueries.insertPersonaMemories).mockResolvedValue([101]);
+    vi.mocked(personaQueries.insertStateObservations).mockResolvedValue([201]);
+    vi.mocked(personaQueries.countSameDirectionObservations).mockResolvedValue(0);
+    vi.mocked(personaQueries.upsertPersonaRelationship).mockResolvedValue({ affinity: 40, trust: 45 } as never);
+    vi.mocked(personaQueries.hasPersonaRelationshipHistory).mockResolvedValue(false);
+    vi.mocked(callAi).mockResolvedValue({
+      ok: true,
+      text: JSON.stringify({
+        memories: [{ type: "trauma", content: "五条悟骗了我", emotionalWeight: 80, valence: -60, reinforceMemoryId: null }],
+        relationships: [{ targetName: "五条悟", relation: "宿敌", affinityDelta: -10, trustDelta: -5, note: "被他骗了" }],
+        drift: [{ path: "bigFive.neuroticism", delta: 1, reason: "被背叛" }],
+      }),
+    } as never);
+  });
+
+  it("保留记忆与漂移写入，但不写新旧关系存储", async () => {
+    const card = {
+      id: 1,
+      name: "测试人格",
+      params: defaultPersonaParams(),
+      paramsResidual: { "bigFive.neuroticism": 1 },
+      gameCount: 1,
+    } as unknown as PersonaCard;
+    const summary = await runNotebookWriteback({
+      cfg: {} as SeatAiConfig,
+      card,
+      seat: 1,
+      roleName: "平民",
+      outcome: "神民阵营胜利",
+      gameTitleNo: "20261010001",
+      digest: "摘要",
+      gameId: "game-1",
+      otherPersonas: [{ seat: 2, name: "五条悟", personaId: 11, known: true }],
+    });
+
+    expect(personaQueries.insertPersonaMemories).toHaveBeenCalled();
+    expect(personaQueries.applyPersonaDrift).toHaveBeenCalled();
+    expect(applyRelationDelta).not.toHaveBeenCalled();
+    expect(personaQueries.upsertPersonaRelationship).not.toHaveBeenCalled();
+    expect(personaQueries.insertPersonaRelationshipHistory).not.toHaveBeenCalled();
+    expect(summary?.relationshipsTouched).toBe(0);
   });
 });

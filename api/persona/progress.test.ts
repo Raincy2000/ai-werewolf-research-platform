@@ -1,8 +1,33 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// 持久化查询层打桩（登记处规则的单测不碰库；落库/删库被调用即可）
+const h = vi.hoisted(() => ({
+  upserted: [] as string[],
+  deleted: [] as string[],
+  statusSet: [] as { castId: string; status: string }[],
+}));
+vi.mock("../queries/personas", () => ({
+  upsertPersonaCastDraft: async (r: { castId: string }) => {
+    h.upserted.push(r.castId);
+  },
+  listPersonaCastDrafts: async () => [],
+  deletePersonaCastDraft: async (castId: string) => {
+    h.deleted.push(castId);
+  },
+  setCastDraftStatus: async (castId: string, status: string) => {
+    h.statusSet.push({ castId, status });
+  },
+  listCastCheckpoints: async () => ({}),
+  deleteCastCheckpoints: async () => {},
+  upsertCastCheckpoint: async () => {},
+  listAllCastCheckpointParams: async () => [],
+}));
+
 import {
   ackCast,
   castCheckpoint,
   castControl,
+  discardCastDraft,
   getActiveCast,
   getCastProgress,
   makeCharsReporter,
@@ -195,5 +220,43 @@ describe("铸造进度登记处", () => {
     expect(castControl("job-gone", 999, "cancel")).toBe(false); // 越权不可终止
     expect(castControl("job-gone", 11, "cancel")).toBe(true); // 本人终止已 done 条目=丢弃草稿
     expect(getCastProgress("job-gone", 11)).toBeNull();
+  });
+});
+
+describe("草稿箱持久化语义（20261013 实锤：30min 清扫吞草稿、向导串台）", () => {
+  it("done+result 的草稿不被清扫、完成即落库、核销转 saved 留痕保留", async () => {
+    const draft = { draft: { name: "测试人格" }, notice: undefined };
+    await startCastJob("t-draft", "u1", "测试人格", async () => draft);
+    await tick(200);
+
+    // 完成即落库
+    expect(h.upserted).toContain("t-draft");
+    // 终态保留（清扫只扫失败/无结果条目——这里无法快进 30min，直接验证条目健在且可取）
+    const p = getCastProgress("t-draft");
+    expect(p?.done).toBe(true);
+    expect(p?.result).not.toBeNull();
+    // 核销入库：条目移除、草稿不删（status 转 saved 留痕保留——2026-10-14 用户裁定：
+    // 清库唯一通道是用户主动删除 discardCastDraft）
+    ackCast("t-draft");
+    await tick(50);
+    expect(getCastProgress("t-draft")).toBeNull();
+    expect(h.deleted).not.toContain("t-draft");
+    expect(h.statusSet.some((s) => s.castId === "t-draft" && s.status === "saved")).toBe(true);
+    // 用户主动删除：草稿+检查点连清
+    discardCastDraft("t-draft", "u1");
+    await tick(50);
+    expect(h.deleted).toContain("t-draft");
+  });
+
+  it("失败终态也留痕（status=failed/interrupted 落库；任何清扫都不再发生——2026-10-14 用户裁定）", async () => {
+    await startCastJob("t-fail", "u1", "失败人格", async () => {
+      throw new Error("AI 故障");
+    });
+    await tick(80);
+    // 失败也写穿草稿箱（有 params 检查点则 interrupted，否则 failed——mock 无检查点表数据）
+    const p = getCastProgress("t-fail");
+    expect(p?.error).toContain("AI 故障");
+    // 永不自动清扫：条目必须健在（等待远超原 30min 清扫语义的时间窗口已无意义，验证其在册即可）
+    expect(p).not.toBeNull();
   });
 });

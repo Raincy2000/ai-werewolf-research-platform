@@ -253,6 +253,9 @@ export function parseDecision(rawText: string, pending: PendingDecision): Decisi
     // 用正则直接提取完整的 thought/speech 字符串字段——救回可用内容远胜于整次托管
     const salvaged = salvageFields(cleaned);
     if (!salvaged) return null;
+    // 终极打捞只含 thought/speech，不能证明必选动作存在。
+    // 此类输出必须回到服务层重新提问，绝不可凭一段心理文本进入结算或暂停流程。
+    if (NEED_TARGET_KINDS.has(pending.kind)) return null;
     return salvaged;
   }
   if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;

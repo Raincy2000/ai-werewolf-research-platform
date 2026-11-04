@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
+import { assertStudyOptions } from '@contracts/game'
 import {
   CheckCircle2,
   ChevronDown,
@@ -104,7 +105,7 @@ interface PersistedLobby {
   batch: BatchConfig
   seats: SeatAiConfig[]
   options: AdvancedOptions
-  /** 人格研究库：座位 → 人格卡 id 绑定（随大厅配置持久化与云端同步） */
+  /** 人格研究站：座位 → 人格卡 id 绑定（随大厅配置持久化与云端同步） */
   seatPersonas?: Record<number, number>
 }
 
@@ -118,6 +119,7 @@ const DEFAULT_OPTIONS: AdvancedOptions = {
   postGameDiscuss: true, // 赛后讨论：UI 默认开（引擎默认关，不传即关闭）
   postGameAutoStart: false, // 赛后自动开始讨论：默认关（分出胜负后挂起，手动开启）
   postGameSpeechLimit: 5, // 每玩家赛后最多发言机会（默认 5）
+  studyLibraryEnabled: true, // 学习来源默认仅图书馆（保持旧配置行为）
   personaVisibility: 'full', // 玩家人格可见度：默认完全可见（人格圈层互知名，无人格者为迷雾）
 }
 
@@ -237,7 +239,7 @@ export default function Home() {
     // 旧出厂默认的间隔值随默认升级迁移（用户显式改过的值不动）
     () => ({ ...DEFAULT_OPTIONS, ...migrateLegacyOptions(persisted?.options ?? {}) }),
   )
-  // 人格研究库：座位 → 人格卡 id 绑定（拖拽/点击指派；随大厅配置持久化与云同步）
+  // 人格研究站：座位 → 人格卡 id 绑定（拖拽/点击指派；随大厅配置持久化与云同步）
   const [seatPersonas, setSeatPersonas] = useState<Record<number, number>>(
     () => persisted?.seatPersonas ?? {},
   )
@@ -934,6 +936,7 @@ export default function Home() {
     setCreating(true)
     setCreateError(null)
     try {
+      assertStudyOptions(options)
       // 分析师配置完整则随对局创建提交（对局结束自动复盘并沉淀指南）；
       // 配置推导为空（如开了「选择存档」却未选、定制项也不完整）时回落到座位批量配置
       const analystAi =
@@ -947,7 +950,7 @@ export default function Home() {
         options,
         analystAi,
         winRateEnabled: analyst.winRateEnabled,
-        // 人格研究库：座位人格绑定（拖拽自人格卡库；绑定座位以该人格参赛）
+        // 人格研究站：座位人格绑定（拖拽自人格卡库；绑定座位以该人格参赛）
         ...(Object.keys(seatPersonas).length > 0
           ? {
               seatPersonas: Object.entries(seatPersonas).map(([seat, personaId]) => ({
@@ -1581,13 +1584,13 @@ export default function Home() {
               <div className="min-h-0 flex-1 overflow-y-auto p-2">
                 {!userId ? (
                   <p className="px-2 py-6 text-center text-xs text-muted-foreground">
-                    登录后可使用人格研究库
+                    登录后可使用人格研究站
                   </p>
                 ) : personaList.length === 0 ? (
                   <p className="px-2 py-6 text-center text-xs text-muted-foreground">
                     还没有人格卡。到
                     <Link to="/personas" className="mx-1 text-foreground underline underline-offset-2">
-                      人格研究库
+                      人格研究站
                     </Link>
                     手动建卡或 AI 铸造。
                   </p>
@@ -1968,10 +1971,25 @@ export default function Home() {
                 </p>
               </div>
               <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
-                <Label htmlFor="opt-library" className="cursor-pointer">
-                  图书馆赛前学习
+                <Label htmlFor="opt-manual-role-assign" className="cursor-pointer">
+                  手动分配角色
                   <span className="ml-2 text-xs text-muted-foreground">
-                    开赛前各座位 AI 先自主学习图书馆资料形成心得，学完才开赛 · 默认关
+                    创建后拖动角色牌到座位，分齐再开赛 · 默认关（随机分配）
+                  </span>
+                </Label>
+                <Switch
+                  id="opt-manual-role-assign"
+                  checked={options.manualRoleAssignEnabled ?? false}
+                  onCheckedChange={(checked) =>
+                    setOptions((prev) => ({ ...prev, manualRoleAssignEnabled: checked }))
+                  }
+                />
+              </div>
+              <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+                <Label htmlFor="opt-library" className="cursor-pointer">
+                  赛前学习
+                  <span className="ml-2 text-xs text-muted-foreground">
+                    开赛前各座位 AI 先学习所选材料形成心得，学完才开赛 · 默认关
                   </span>
                 </Label>
                 <Switch
@@ -1981,6 +1999,53 @@ export default function Home() {
                     setOptions((prev) => ({ ...prev, libraryEnabled: checked }))
                   }
                 />
+              </div>
+              <div className="space-y-2 rounded-md border border-border px-3 py-2">
+                <div className="flex items-center justify-between">
+                  <Label>学习范围（可自由组合）</Label>
+                  <span className="text-xs text-muted-foreground">至少选择一项</span>
+                </div>
+                <div className="flex flex-wrap gap-x-5 gap-y-2">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm" htmlFor="study-history">
+                    <Checkbox
+                      id="study-history"
+                      checked={options.studyHistoryEnabled ?? false}
+                      disabled={!(options.libraryEnabled ?? false)}
+                      onCheckedChange={(checked) =>
+                        setOptions((prev) => ({ ...prev, studyHistoryEnabled: checked === true }))
+                      }
+                    />
+                    对局历史
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-2 text-sm" htmlFor="study-guide">
+                    <Checkbox
+                      id="study-guide"
+                      checked={options.studyGuideEnabled ?? false}
+                      disabled={!(options.libraryEnabled ?? false)}
+                      onCheckedChange={(checked) =>
+                        setOptions((prev) => ({ ...prev, studyGuideEnabled: checked === true }))
+                      }
+                    />
+                    经验指南
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-2 text-sm" htmlFor="study-library">
+                    <Checkbox
+                      id="study-library"
+                      checked={options.studyLibraryEnabled ?? true}
+                      disabled={!(options.libraryEnabled ?? false)}
+                      onCheckedChange={(checked) =>
+                        setOptions((prev) => ({ ...prev, studyLibraryEnabled: checked === true }))
+                      }
+                    />
+                    图书馆
+                  </label>
+                </div>
+                {options.libraryEnabled &&
+                !(options.studyHistoryEnabled ?? false) &&
+                !(options.studyGuideEnabled ?? false) &&
+                !(options.studyLibraryEnabled ?? true) ? (
+                  <p className="text-xs text-wolf">赛前学习至少需要选择一个学习来源</p>
+                ) : null}
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="opt-library-max">最长学习时间（秒/座位）</Label>
@@ -2107,6 +2172,22 @@ export default function Home() {
                   }
                 />
               </div>
+              <div className="ml-4 flex items-center justify-between rounded-md border border-border px-3 py-2">
+                <Label htmlFor="opt-postgame-review-first" className="cursor-pointer">
+                  复盘与认知就绪后讨论
+                  <span className="ml-2 text-xs text-muted-foreground">
+                    附属赛后讨论：报告生成并写入玩家认知库后才进入讨论，无需查看报告 · 默认关
+                  </span>
+                </Label>
+                <Switch
+                  id="opt-postgame-review-first"
+                  disabled={!(options.postGameDiscuss ?? true)}
+                  checked={(options.postGameReviewFirst ?? false) && (options.postGameDiscuss ?? true)}
+                  onCheckedChange={(checked) =>
+                    setOptions((prev) => ({ ...prev, postGameReviewFirst: checked }))
+                  }
+                />
+              </div>
               <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
                 <Label htmlFor="opt-postgame-autostart" className="cursor-pointer">
                   赛后自动开始讨论
@@ -2120,6 +2201,36 @@ export default function Home() {
                   checked={(options.postGameAutoStart ?? false) && (options.postGameDiscuss ?? true)}
                   onCheckedChange={(checked) =>
                     setOptions((prev) => ({ ...prev, postGameAutoStart: checked }))
+                  }
+                />
+              </div>
+              <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+                <Label htmlFor="opt-thought-collapsed" className="cursor-pointer">
+                  心理活动默认收起
+                  <span className="ml-2 text-xs text-muted-foreground">
+                    只收起心镜分析层（撕裂/参数/双视角），涌现正文仍常显 · 默认关（全部展开）
+                  </span>
+                </Label>
+                <Switch
+                  id="opt-thought-collapsed"
+                  checked={options.thoughtCollapsed ?? false}
+                  onCheckedChange={(checked) =>
+                    setOptions((prev) => ({ ...prev, thoughtCollapsed: checked }))
+                  }
+                />
+              </div>
+              <div className="flex items-center justify-between rounded-md border border-border px-3 py-2">
+                <Label htmlFor="opt-auto-psycheck" className="cursor-pointer">
+                  自动心理检查
+                  <span className="ml-2 text-xs text-muted-foreground">
+                    赛后讨论关闭=复盘报告生成完后自动开始；开启=赛后讨论结束后自动开始 · 默认关（手动开启）
+                  </span>
+                </Label>
+                <Switch
+                  id="opt-auto-psycheck"
+                  checked={options.autoPsyCheck ?? false}
+                  onCheckedChange={(checked) =>
+                    setOptions((prev) => ({ ...prev, autoPsyCheck: checked }))
                   }
                 />
               </div>

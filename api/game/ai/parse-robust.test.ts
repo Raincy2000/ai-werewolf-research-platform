@@ -84,6 +84,18 @@ describe("parseDecision 鲁棒修复", () => {
     expect(d!.thought).toContain("昨天8号跳预言家");
   });
 
+  it("终极打捞缺少必选动作时返回 null：不得以 thought 单独逃过校验", () => {
+    const sheriffPending: PendingDecision = {
+      ...pending,
+      kind: "sheriffRun",
+      options: [1, 0],
+      view: { ...view, phase: "day.sheriff.run" },
+    };
+    // 与 20261025002 的 2 号故障同型：JSON 整体损坏，salvageFields 只能捞出 thought。
+    // 若直接返回该对象，批量层会把它当作有效结果并暂停，而不是重新提问。
+    expect(parseDecision('{"thought":"只写心理，没有报名动作" garbage}', sheriffPending)).toBeNull();
+  });
+
   it("正常 JSON 不受影响", () => {
     const d = parseDecision(
       JSON.stringify({ thought: "t", speech: "大家好我是好人", targets: [1] }),

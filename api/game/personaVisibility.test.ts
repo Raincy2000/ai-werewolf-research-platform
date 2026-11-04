@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildPersonaCircleText, injectCircleText, type PersonaBondInfo } from "./personaVisibility";
+import { buildPersonaCircleText, buildPostgamePersonaFactText, injectCircleText, type PersonaBondInfo } from "./personaVisibility";
 
 const BINDINGS = [
   { seat: 1, name: "艾伦·耶格尔", appearance: "黑发锐利眼神，制服笔挺，压迫感强" },
@@ -135,6 +135,21 @@ describe("人格圈层增强（基本印象/互称指引/羁绊注入）", () =>
   });
 });
 
+describe("赛后人格出局对照", () => {
+  it("直接绑定座位、人格名和出局时间，并遵守人格可见度", () => {
+    const text = buildPostgamePersonaFactText(1, [
+      { seat: 1, name: "两面宿傩" },
+      { seat: 10, name: "夜神月" },
+      { seat: 11, name: "张雪峰" },
+    ], { 1: "第三日 · 被放逐", 10: "第三日 · 被放逐" }, "full", undefined);
+    expect(text).toContain("10号夜神月=第三日 · 被放逐");
+    expect(text).toContain("1号两面宿傩=第三日 · 被放逐");
+    expect(text).toContain("11号张雪峰=存活至对局结束");
+    const fog = buildPostgamePersonaFactText(1, [{ seat: 10, name: "夜神月" }], { 10: "第三日 · 被放逐" }, "none", undefined);
+    expect(fog).not.toContain("夜神月");
+  });
+});
+
 describe("injectCircleText（注入位铁律：必须落在【输出契约】之前）", () => {
   const BASE = "【对局状态】第1天\n【公开记录】1. 2号发言\n【输出契约】严格输出 JSON……";
   it("契约前注入：圈层文本不被人格管线的契约截断切断（对局 20260930001 回归）", () => {
@@ -146,5 +161,18 @@ describe("injectCircleText（注入位铁律：必须落在【输出契约】之
   it("无契约标记时回退尾部追加（兜底不丢内容）", () => {
     const out = injectCircleText("仅情境无契约", "【人格圈层】X");
     expect(out).toBe("仅情境无契约\n\n【人格圈层】X");
+  });
+});
+
+describe("关系方向铁律（2026-10-14 用户裁定）", () => {
+  it("人格只能知道自己对别人的感受，绝不能看到别人对自己的感受", () => {
+    // PersonaBondInfo 在 service 层按「观察者=感受持有方」组装（getSeatBonds 只取 personaId=观察者的行）；
+    // 本测试锁定渲染层：即便传入羁绊，文本也必须始终以「你→对方」陈述，绝无「对方→你」
+    const bonds: PersonaBondInfo[] = [
+      { seat: 3, name: "张雪峰", relation: "宿敌", affinity: -40, trust: 20, note: "首刀点我名" },
+    ];
+    const t = buildPersonaCircleText(1, BINDINGS, "full", undefined, bonds)!;
+    expect(t).toContain("【你与在场人格的羁绊】"); // 主语永远是你
+    expect(t).not.toMatch(/他对你|TA 对你|对你的(?:亲疏|信任|感受|评价)|眼中的你/); // 绝无反向视角措辞（「对你而言的迷雾」是合法固有措辞）
   });
 });

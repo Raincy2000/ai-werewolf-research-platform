@@ -31,11 +31,10 @@ export function netErrorMessage(err: Error): string {
   const hint =
     code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT"
       ? "模型服务长时间未响应（生成耗时过长或网络不畅），已自动重试仍失败——请稍后重试"
-      : code === "UND_ERR_CONNECT_TIMEOUT" ||
-          code === "ECONNREFUSED" ||
-          code === "ENOTFOUND" ||
-          code === "EAI_AGAIN"
-        ? "无法连接模型服务（网络不通或服务地址有误）——请检查网络与端点配置后重试"
+      : code === "ENOTFOUND" || code === "EAI_AGAIN"
+        ? "域名解析失败（服务地址拼写有误或本机 DNS 异常）——请核对端点地址逐字正确、无多余字符（建议整段手打重输）；地址无误仍报错请检查 DNS/代理设置"
+        : code === "UND_ERR_CONNECT_TIMEOUT" || code === "ECONNREFUSED"
+          ? "无法连接模型服务（网络不通或服务地址有误）——请检查网络与端点配置后重试"
         : code === "ECONNRESET" || code === "UND_ERR_SOCKET" || code === "EPIPE"
           ? "连接被服务方中断，已自动重试仍失败——请稍后重试"
           : "网络请求失败，已自动重试仍失败——请稍后重试";

@@ -1,13 +1,14 @@
 {
   "name": "werewolf-desktop",
   "private": true,
-  "version": "0.3.31",
+  "version": "0.3.147",
   "description": "AI模拟狼人杀研究平台 - 桌面客户端（本地 SQLite，对局数据不出本机）",
   "main": "main.mjs",
   "scripts": {
     "start": "electron .",
     "pack": "electron-builder --win portable",
-    "dist": "electron-builder --win nsis portable"
+    "dist": "electron-builder --win nsis portable",
+    "prune-releases": "node ../tools/prune-releases.mjs"
   },
   "devDependencies": {
     "electron": "^43.2.0",
@@ -20,7 +21,8 @@
       "output": "release"
     },
     "files": [
-      "main.mjs"
+      "main.mjs",
+      "dist/public/**"
     ],
     "extraResources": [
       {
@@ -30,7 +32,12 @@
     ],
     "win": {
       "target": [
-        "portable"
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "build/icon.png",
       "artifactName": "${productName}-${version}-portable.${ext}"
@@ -38,9 +45,11 @@
     "portable": {
       "artifactName": "${productName}-${version}-portable.${ext}"
     },
+    "compression": "normal",
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "differentialPackage": false,
       "artifactName": "${productName}-${version}-setup.${ext}"
     }
   }

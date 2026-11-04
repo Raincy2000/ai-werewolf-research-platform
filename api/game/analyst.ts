@@ -21,14 +21,16 @@ export const ANALYST_TIMEOUT_MS = 600_000; // 单次 AI 调用超时：复盘/�
 export const ANALYST_MAX_RETRIES = 2; // 长调用重试 2 次（质量优先）
 
 // ---------- 版型规则文本 ----------
-// 分析师侧此前从不告知本局规则，导致复盘/蒸馏沿用"女巫可自救"等泛化认知。
-// 统一由 BOARDS 契约派生一段规则文本，供分析 prompt 与版型蒸馏 prompt 注入。
-export function buildBoardRulesText(boardId: string): string {
+// 分析师侧此前从不告知本局规则，导致复盘/蒸馏沿用"女巫可自救"等泛化认知；
+// 2026-10-15 进一步实锤：分析师不知「最后一狼不开枪」，把神民必胜局评成狼人 100%。
+// 统一走 contracts 的 boardRulesText（官方规则全文：角色池/屠边/狼刀多数决/终局规则/警长/女巫/特殊角色），
+// 与对局注入玩家的规则文本同一事实源——系统全盘规则认知一致。
+import { boardRulesText } from "../../contracts/game";
+
+export function buildBoardRulesText(boardId: string, sheriffEnabled?: boolean): string {
   const board = BOARDS.find((b) => b.id === boardId);
   if (!board) return "规则未知（以该版型实际配置为准）";
-  const witch = board.witchSelfSave === "firstNight" ? "女巫仅首夜可自救" : "女巫全程不可自救";
-  const sheriff = board.sheriff ? "有警长" : "无警长";
-  return `${witch} · ${sheriff} · 屠边`;
+  return boardRulesText(board, sheriffEnabled ?? board.sheriff);
 }
 
 // ---------- 复盘分析 prompt ----------
@@ -36,10 +38,11 @@ export function buildAnalysisPrompt(
   snapshot: GameSnapshot,
   events: GameEvent[],
 ): { system: string; user: string } {
-  // 本局规则行：分析师此前不知本局规则，曾把"女巫可自救"的泛化认知当成合理策略写进报告
-  const board = BOARDS.find((b) => b.id === snapshot.boardId);
-  const rulesLine = board
-    ? `本局版型：${board.name}；${board.witchSelfSave === "firstNight" ? "女巫仅首夜可自救" : "女巫全程不可自救"}；${board.sheriff ? "有警长" : "无警长"}；屠边规则`
+  // 本局规则全文（官方规则：角色池/屠边/狼刀多数决/终局规则/警长/女巫/特殊角色要点）——
+  // 与注入玩家的规则文本同一事实源；分析师不知「最后一狼不开枪」曾把神民必胜局评成狼人 100%
+  const hasBoard = BOARDS.some((b) => b.id === snapshot.boardId);
+  const rulesLine = hasBoard
+    ? `本局版型与官方规则（以此为唯一规则准绳）：\n${buildBoardRulesText(snapshot.boardId)}`
     : `本局版型：${snapshot.boardName}；具体规则以摘要为准`;
 
   const system = [

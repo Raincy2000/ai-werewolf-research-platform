@@ -24,6 +24,8 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("../queries/games", () => ({
+  getDeadSeats: async () => new Set<number>(),
+  deathSeatsFromEvents: () => new Set<number>(),
   countGamesOnDate: async () => 0,
   insertGame: async (row: Record<string, unknown>) => {
     // 真实库会默认 createdAt；mock 补上，poll 组装快照时 toIso 才不炸
@@ -65,6 +67,12 @@ vi.mock("../queries/decisions", () => ({
       .sort((a, b) => (a.idx as number) - (b.idx as number)),
 }));
 
+vi.mock("../queries/personas", () => ({
+  getPersonaCardsInternal: async (ids: number[]) => ids.map((id) => ({ id, imageData: `data:image/png;base64,persona-${id}` })),
+  loadMemoryPool: async () => ({}),
+  getPersonaReportsForGame: async () => [],
+}));
+
 vi.mock("../queries/guide", () => ({
   countGuides: async () => 0,
   getAnalysis: async () => null,
@@ -76,11 +84,31 @@ vi.mock("../queries/guide", () => ({
   upsertAnalysis: async () => {},
 }));
 
+
+// 通用自动应答（托管抹消后，测试流必须由正常 AI 输出推进）：
+// 定序/退水/竞选特判；发言类按【你的任务】行判定（规则全文/契约里的「发言」字样会误中全文匹配）；
+// 必须行动类取【合法目标】首座；其余 skip
+function autoAnswer(user: string): string {
+  if (user.includes("升序发言")) return '{"thought":"t","targets":[1]}';
+  if (user.includes("退水抉择")) return '{"thought":"t","targets":[0]}';
+  if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
+  const taskLine = user.slice(user.indexOf("【你的任务】"));
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言|赛后讨论·聊天室/.test(taskLine)) {
+    return '{"thought":"t","speech":"测试发言"}';
+  }
+  const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));
+  if (needTarget) {
+    const m = user.match(/【合法目标】([0-9]+)/);
+    if (m) return `{"thought":"t","targets":[${m[1]}]}`;
+  }
+  return '{"thought":"t","skip":true}';
+}
+
 vi.mock("./ai/providers", () => ({
-  // AI 恒失败 → 全程启发式兜底：决策确定性（不依赖外部模型），且顺带压测兜底全类型合法性
-  callAi: async () => {
+  // AI 自动应答（托管抹消后由正常输出推进流程；失败场景由各用例经 h.aiCalls 专项构造）
+  callAi: async (_cfg: unknown, _system: string, user: string) => {
     h.aiCalls += 1;
-    return { ok: false, text: null, latencyMs: 1, error: "测试：AI 不可用 → 启发式兜底" };
+    return { ok: true, text: autoAnswer(user), latencyMs: 1, error: null };
   },
 }));
 
@@ -192,6 +220,42 @@ describe("对局断点可恢复", () => {
       .sort((a, b) => a - b);
     expect(idxs.length).toBeGreaterThan(before.decisionCount); // 续跑产生了新决策
     idxs.forEach((v, i) => expect(v).toBe(i));
+  }, 90_000);
+
+  it("规则演进废案容差：日志中混入新规则下不再产生的决策 → 恢复时探测跳过、状态精确重建", async () => {
+    const { gameService } = await import("./service");
+    const { gameId } = await gameService.createGame({
+      boardId: "standard12",
+      seats: makeSeats(12),
+      options: OPTS,
+    });
+    await gameService.control(gameId, "start");
+    await waitFor(() => decisionsOf(gameId).length >= 6, "至少 6 个决策落盘");
+    await gameService.control(gameId, "pause");
+    const rtBefore = registry.get(gameId)!;
+    await waitFor(() => !rtBefore.ticking, "tick 链停稳");
+    const snapBefore = rtBefore.engine.getSnapshot();
+    const aliveBefore = snapBefore.players.filter((p) => p.alive).map((p) => p.seat);
+    const beforeCount = decisionsOf(gameId).length;
+
+    // 注入「规则演进废案」：引擎在第三个决策后绝不会产生 exileSkill@2 待决（模拟旧规则日志）
+    h.decisions.push({
+      gameId,
+      idx: 2.5,
+      kind: "exileSkill",
+      seat: 2,
+      decision: { thought: "废案", skip: true },
+    } as never);
+
+    registry.delete(gameId);
+    const pollRes = await gameService.poll(gameId, 0);
+    const rtAfter = registry.get(gameId)!;
+    expect(rtAfter).toBeDefined();
+    expect(pollRes.snapshot!.status).toBe("paused");
+    const snapAfter = rtAfter.engine.getSnapshot();
+    expect(snapAfter.day).toBe(snapBefore.day);
+    expect(snapAfter.players.filter((p) => p.alive).map((p) => p.seat)).toEqual(aliveBefore);
+    await gameService.control(gameId, "terminate");
   }, 90_000);
 
   it("running 状态崩溃：恢复后立即自动补链续跑（无需人工 start）", async () => {
@@ -401,4 +465,74 @@ describe("对局断点可恢复", () => {
     const rt = registry.get(gameId)!;
     await waitFor(() => !rt.ticking, "tick 链停稳");
   }, 60_000);
+
+  it("已结束旧对局只读展示：不再重放，事件补齐天数、死因与警长", async () => {
+    const gameId = "legacy-finished-readonly";
+    const createdAt = new Date("2026-08-05T00:00:00.000Z");
+    h.games.set(gameId, {
+      id: gameId,
+      boardId: "standard12",
+      boardName: "12人标准场（预女猎白）",
+      status: "finished",
+      winner: "wolf",
+      dayCount: 0,
+      createdAt,
+      setup: {
+        seatRoles: STD12,
+        seatModels: STD12.map(() => "legacy-model"),
+        options: OPTS,
+        seatAIs: makeSeats(12),
+        seatPersonas: [{ seat: 1, personaId: 99, name: "测试人格" }],
+      },
+    });
+    h.decisions.push({ gameId, idx: 0, kind: "sheriffVote", seat: 1, decision: { thought: "", batchInputs: [] }, createdAt: createdAt.getTime() });
+    h.events.push(
+      { gameId, seq: 1, day: 1, phase: "game.start", type: "phase", actor: null, title: "游戏开始", content: "【游戏开始】", thought: null, meta: null, createdAt: createdAt.toISOString() },
+      { gameId, seq: 2, day: 1, phase: "day.sheriffVote", type: "system", actor: null, title: "警长落地", content: "3号玩家当选警长（归票位，1.5票）。", thought: null, meta: null, createdAt: createdAt.toISOString() },
+      { gameId, seq: 3, day: 2, phase: "day.speech", type: "death", actor: 2, title: "死亡公告", content: "2号玩家被放逐出局。", thought: null, meta: null, createdAt: createdAt.toISOString() },
+      { gameId, seq: 4, day: 3, phase: "game.over", type: "result", actor: null, title: "游戏结果", content: "狼人阵营胜利！", thought: null, meta: null, createdAt: createdAt.toISOString() },
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { gameService } = await import("./service");
+    const result = await gameService.poll(gameId, 0);
+    expect(warn).not.toHaveBeenCalled();
+    expect(result.snapshot!.status).toBe("finished");
+    expect(result.snapshot!.day).toBe(3);
+    expect(result.snapshot!.players.find((p) => p.seat === 2)?.deathInfo).toBe("第2天 · 被放逐出局");
+    expect(result.snapshot!.players.find((p) => p.seat === 3)?.sheriff).toBe(true);
+    expect(result.snapshot!.players.find((p) => p.seat === 1)?.personaImageData).toBe("data:image/png;base64,persona-99");
+    warn.mockRestore();
+  });
+
+  it("有人格快照的旧对局恢复时使用开局卡，不被研究站现卡覆盖", async () => {
+    const gameId = "persona-snapshot-readonly";
+    const createdAt = new Date("2026-08-05T00:00:00.000Z");
+    h.games.set(gameId, {
+      id: gameId,
+      boardId: "standard12",
+      boardName: "12人标准场（预女猎白）",
+      status: "finished",
+      winner: "wolf",
+      dayCount: 1,
+      createdAt,
+      setup: {
+        seatRoles: STD12,
+        seatModels: STD12.map(() => "legacy-model"),
+        options: OPTS,
+        seatAIs: makeSeats(12),
+        seatPersonas: [{ seat: 1, personaId: 99, name: "测试人格" }],
+        personaSnapshots: {
+          "1": {
+            card: { id: 99, name: "测试人格", imageData: "data:image/png;base64,opening-snapshot", profile: {}, params: {} },
+            memory: { items: [], relationships: [] },
+            version: "persona-context-v1:opening",
+          },
+        },
+      },
+    });
+    h.decisions.push({ gameId, idx: 0, kind: "sheriffVote", seat: 1, decision: { thought: "", batchInputs: [] }, createdAt: createdAt.getTime() });
+    const { gameService } = await import("./service");
+    const result = await gameService.poll(gameId, 0);
+    expect(result.snapshot!.players.find((p) => p.seat === 1)?.personaImageData).toBe("data:image/png;base64,opening-snapshot");
+  });
 });

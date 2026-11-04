@@ -32,6 +32,8 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("../../queries/games", () => ({
+  getDeadSeats: async () => new Set<number>(),
+  deathSeatsFromEvents: () => new Set<number>(),
   countGamesOnDate: async () => 0,
   insertGame: async (row: Record<string, unknown>) => {
     // 模拟 DB defaultNow：createdAt/updatedAt 由数据库填默认值
@@ -416,6 +418,19 @@ describe("buildLogDigest 确定性摘要", () => {
     expect(digest).toContain("狼队最终决定袭击");
   });
 
+  it("赛后讨论不挤占主对局摘要，白天发言不会被省略", () => {
+    const events = [
+      makeEvent({ day: 2, phase: "day.speech", type: "speech", actor: 6, actorLabel: "6号玩家", content: "夏油杰白天必须保留的关键发言" }),
+      ...Array.from({ length: 80 }, (_, i) => makeEvent({
+        day: 5, phase: "postgame.discuss", type: "speech", actor: (i % 12) + 1,
+        content: `赛后长讨论${i}`.repeat(80),
+      })),
+    ];
+    const digest = buildLogDigest(LONG_SNAPSHOT, events);
+    expect(digest).toContain("夏油杰白天必须保留的关键发言");
+    expect(digest).not.toContain("赛后长讨论");
+  });
+
   it("空对局不炸：仅有对局信息与身份表", () => {
     const digest = buildLogDigest(SNAPSHOT, []);
     expect(digest).toContain("【对局信息】");
@@ -482,10 +497,12 @@ describe("buildAnalysisPrompt 新架构", () => {
   it("system 注入本局规则行与规则认知校正指令（按 BOARDS 查版型定义）", () => {
     // 9人标准局：女巫仅首夜可自救、无警长
     const nine = buildAnalysisPrompt(SNAPSHOT, []);
-    expect(nine.system).toContain("本局版型：9人标准局（暗牌）");
-    expect(nine.system).toContain("女巫仅首夜可自救");
-    expect(nine.system).toContain("无警长");
+    expect(nine.system).toContain("本局版型与官方规则");
+    expect(nine.system).toContain("9人标准局（暗牌）");
+    expect(nine.system).toContain("仅首夜可以自救");
+    expect(nine.system).toContain("本局无警长");
     expect(nine.system).toContain("屠边");
+    expect(nine.system).toContain("最后一狼出局");
     // 认知校正指令：相悖认知是玩家的规则认知错误，不得当作合理策略采纳
     expect(nine.system).toContain("规则认知错误");
     expect(nine.system).toContain("绝不可将其当作合理策略采纳");
@@ -497,9 +514,9 @@ describe("buildAnalysisPrompt 新架构", () => {
       boardName: "12人标准场（预女猎白）",
     };
     const twelve = buildAnalysisPrompt(snap12, []);
-    expect(twelve.system).toContain("本局版型：12人标准场（预女猎白）");
-    expect(twelve.system).toContain("女巫全程不可自救");
-    expect(twelve.system).toContain("有警长");
+    expect(twelve.system).toContain("12人标准场（预女猎白）");
+    expect(twelve.system).toContain("全程不可自救");
+    expect(twelve.system).toContain("警长规则");
 
     // 未知版型：回退用快照里的版型名，不炸
     const unknown = buildAnalysisPrompt({ ...SNAPSHOT, boardId: "nope", boardName: "自定义局" }, []);
@@ -567,7 +584,7 @@ describe("buildBoardDistillPrompt 版型蒸馏 prompt", () => {
   const CTX = {
     boardName: "12人白狼王守卫",
     rolesSummary: "预女猎守 + 4民 vs 3狼+白狼王",
-    rulesText: "女巫全程不可自救 · 有警长 · 屠边",
+    rulesText: buildBoardRulesText("whiteWolfGuard12"),
   };
 
   it("含版型名/角色配置/旧指南/新报告，要求仅适用该版型，含长度与格式要求", () => {
@@ -585,7 +602,10 @@ describe("buildBoardDistillPrompt 版型蒸馏 prompt", () => {
   it("含【本版型规则】区块，并要求所有经验符合规则、严禁与规则相悖的建议", () => {
     const { user } = buildBoardDistillPrompt(CTX, null, "报告");
     // 本版型规则区块原样注入
-    expect(user).toContain("【本版型规则】女巫全程不可自救 · 有警长 · 屠边");
+    expect(user).toContain("【本版型规则】");
+    expect(user).toContain("全程不可自救");
+    expect(user).toContain("警长规则");
+    expect(user).toContain("最后一狼出局");
     // 蒸馏要求：符合规则 + 禁止相悖建议（女巫自救示例）+ 反面教训口径
     expect(user).toContain("所有经验必须符合【本版型规则】");
     expect(user).toContain("严禁输出与规则相悖的建议");
@@ -616,10 +636,19 @@ describe("buildBoardDistillPrompt 版型蒸馏 prompt", () => {
 });
 
 describe("buildBoardRulesText 版型规则文本", () => {
-  it("按 BOARDS 定义组装：女巫自救规则 + 警长 + 固定屠边后缀", () => {
-    expect(buildBoardRulesText("standard9")).toBe("女巫仅首夜可自救 · 无警长 · 屠边");
-    expect(buildBoardRulesText("standard12")).toBe("女巫全程不可自救 · 有警长 · 屠边");
-    expect(buildBoardRulesText("wolfKingGuard12")).toBe("女巫全程不可自救 · 有警长 · 屠边");
+  it("按 BOARDS 定义组装官方规则全文（与对局注入玩家的规则文本同一事实源）", () => {
+    const nine = buildBoardRulesText("standard9");
+    expect(nine).toContain("9人标准局（暗牌）");
+    expect(nine).toContain("仅首夜可以自救");
+    expect(nine).toContain("本局无警长");
+    expect(nine).toContain("屠边");
+    const twelve = buildBoardRulesText("standard12");
+    expect(twelve).toContain("12人标准场（预女猎白）");
+    expect(twelve).toContain("全程不可自救");
+    expect(twelve).toContain("警长规则");
+    expect(twelve).toContain("最后一狼出局");
+    expect(twelve).toContain("平票则狼刀空悬");
+    expect(buildBoardRulesText("wolfKingGuard12")).toContain("狼王");
   });
 
   it("未知版型回退占位文本，不抛错", () => {
@@ -732,8 +761,10 @@ describe("service.generateAnalysis 分段流水线", () => {
     expect(h.aiCalls[1].user).toContain("与具体版型角色配置无关的通用策略");
     expect(h.aiCalls[2].user).toContain("9人标准局（暗牌）");
     expect(h.aiCalls[2].user).toContain("经典入门版型，暗牌小局节奏明快");
-    // service 构造的 rulesText：standard9 → 女巫仅首夜可自救 · 无警长 · 屠边
-    expect(h.aiCalls[2].user).toContain("【本版型规则】女巫仅首夜可自救 · 无警长 · 屠边");
+    // service 构造的 rulesText：standard9 官方规则全文（与对局注入同一事实源）
+    expect(h.aiCalls[2].user).toContain("【本版型规则】");
+    expect(h.aiCalls[2].user).toContain("仅首夜可以自救");
+    expect(h.aiCalls[2].user).toContain("本局无警长");
 
     // guide() 返回 GuideOverview：common + boards
     const g = await gameService.guide(U1);

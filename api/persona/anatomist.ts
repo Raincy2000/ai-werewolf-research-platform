@@ -18,6 +18,7 @@ export function buildPsyCheckPrompt(opts: {
   outcome: string;
   digest: string;
   gameTitleNo?: string;
+  rulesText?: string; // 本局官方规则全文（2026-10-15 用户裁定：心理检查的规则认知必须与引擎一致）
 }): { system: string; user: string } {
   const { card, seat, roleName, outcome, digest } = opts;
   const system = [
@@ -26,7 +27,8 @@ export function buildPsyCheckPrompt(opts: {
     "铁律4：每个转折点必须同时输出【博弈论解释】与【人格动力学解释】，二者并列、不得互相替代。",
     "铁律6：还原撕裂——人格的真实不在结果里，在几组参数同时拉扯的过程里。",
     "你的分析必须有证据：引用摘要中「第几天、几号、具体发言/行动/心理活动」，禁止泛泛而谈。",
-  ].join("\n");
+    opts.rulesText ? `【本局官方规则】（以此为准绳评判每一步操作；玩家若表现出与规则相悖的认知，指出其规则认知错误，绝不可当作合理策略采纳）\n${opts.rulesText}` : "",
+  ].filter(Boolean).join("\n");
 
   const paramsSnapshot = [
     `大五：开放${card.params.bigFive.openness} 尽责${card.params.bigFive.conscientiousness} 外向${card.params.bigFive.extraversion} 宜人${card.params.bigFive.agreeableness} 神经质${card.params.bigFive.neuroticism}`,
@@ -36,6 +38,9 @@ export function buildPsyCheckPrompt(opts: {
 
   const user = [
     `【检查对象】${card.name}（本局 ${seat} 号 · ${roleName}）；本局结局：${outcome}`,
+    card.profile.gender
+      ? `【性别与人称】性别：${card.profile.gender}，人称使用「${card.profile.gender === "男" ? "他" : card.profile.gender === "女" ? "她" : "TA"}」。不得因角色名称推断或改变人物性别（女巫/猎人等仅是游戏身份）。`
+      : "",
     opts.gameTitleNo ? `【对局标题号】${opts.gameTitleNo}` : "",
     card.originName ? `【原型】${card.originName}${card.originSource ? ` · ${card.originSource}` : ""}` : "",
     "",
@@ -70,6 +75,7 @@ export async function runPsyCheck(
     outcome: string;
     digest: string;
     gameTitleNo?: string;
+    rulesText?: string;
   },
 ): Promise<string> {
   const prompt = buildPsyCheckPrompt(opts);

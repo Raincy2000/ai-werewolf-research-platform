@@ -91,6 +91,24 @@
 .seat-marquee {
   animation: seat-marquee-y 8s linear infinite;
 }
+/* 长人格名在头像等高的遮罩内上下循环；短名不挂此动画 */
+@keyframes persona-name-marquee-y {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-50%);
+  }
+}
+.persona-name-marquee {
+  animation: persona-name-marquee-y 10s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .seat-marquee,
+  .persona-name-marquee {
+    animation: none;
+  }
+}
 @font-face {
   font-family: 'ZCOOL QingKe HuangYou';
   font-style: normal;

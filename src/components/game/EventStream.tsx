@@ -36,9 +36,9 @@ const TYPE_BADGE_CLASS: Record<EventType, string> = {
 }
 
 /** 单条事件（memo 保证追加新事件时旧条目不重渲染） */
-const EventItem = memo(function EventItem({ event, t0, highlighted }: { event: GameEvent; t0?: number | null; highlighted?: boolean }) {
-  // 心理活动折叠块：默认展开
-  const [thoughtOpen, setThoughtOpen] = useState(true)
+const EventItem = memo(function EventItem({ event, t0, highlighted, thoughtCollapsed }: { event: GameEvent; t0?: number | null; highlighted?: boolean; thoughtCollapsed?: boolean }) {
+  // 心镜分析层折叠：默认跟随高级设置（收起时涌现/正文文字仍常显，与一般心理活动对齐）
+  const [detailOpen, setDetailOpen] = useState(!thoughtCollapsed)
   // 距对局开始的经过时间（小字数字时间，附在序号旁）
   const elapsed = elapsedLabel(t0, event.createdAt)
   // 狼人频道：狼队夜间私密讨论（meta.channel === "wolf"），仅观察者可见，
@@ -57,7 +57,7 @@ const EventItem = memo(function EventItem({ event, t0, highlighted }: { event: G
   // 托管原因（服务层兜底时落入 meta）：让观察者直接看到 AI 失败的真实根因
   const fallbackReason =
     typeof event.meta?.fallbackReason === 'string' ? event.meta.fallbackReason : null
-  // 人格研究库：该事件由人格座位产出时的人格注解（双视角/撕裂组，铁律4/6）
+  // 人格研究站：该事件由人格座位产出时的人格注解（双视角/撕裂组，铁律4/6）
   const personaMeta = (event.meta?.persona ?? null) as PersonaEventMeta | null
   return (
     <li
@@ -115,31 +115,40 @@ const EventItem = memo(function EventItem({ event, t0, highlighted }: { event: G
       ) : null}
 
       {event.thought ? (
-        <div className="mt-2 border-l-2 border-god/70 pl-2.5">
-          <button
-            type="button"
-            onClick={() => setThoughtOpen((v) => !v)}
-            aria-expanded={thoughtOpen}
-            className="flex items-center gap-1 text-xs font-medium text-god hover:underline underline-offset-2"
-          >
-            <Brain className="h-3.5 w-3.5" aria-hidden />
-            {personaMeta ? '心镜 · 人格状态报告（仅观察者可见）' : '心理活动（仅观察者可见）'}
-            <ChevronDown
-              className={cn('h-3 w-3 transition-transform', thoughtOpen && 'rotate-180')}
-              aria-hidden
-            />
-          </button>
-          {thoughtOpen ? (
-            <div className="mt-1">
-              {personaMeta ? (
-                <PersonaThought thought={event.thought} persona={personaMeta} />
-              ) : (
-                <p className="whitespace-pre-wrap break-words text-sm italic leading-6 text-god/90">
-                  {event.thought}
-                </p>
-              )}
-            </div>
-          ) : null}
+        /* 心理活动块：慕斯粉（#e0568a，与心理检查 Brain 图标同色）轻量卡片；
+           人格座位=涌现正文常显 + 心镜分析层可折叠（默认随高级设置）；
+           一般座位=正文常显（本身即轻量，无需折叠） */
+        <div className="mt-1.5 rounded-md border border-[#e0568a]/30 bg-[#e0568a]/[0.06] px-2.5 py-1.5">
+          {personaMeta ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setDetailOpen((v) => !v)}
+                aria-expanded={detailOpen}
+                className="flex items-center gap-1 text-[11px] font-medium text-[#e0568a] hover:underline underline-offset-2"
+              >
+                <Brain className="h-3 w-3" aria-hidden />
+                心镜 · 人格状态报告（仅观察者可见）
+                <ChevronDown
+                  className={cn('h-3 w-3 transition-transform', detailOpen && 'rotate-180')}
+                  aria-hidden
+                />
+              </button>
+              <div className="mt-1">
+                <PersonaThought thought={event.thought} persona={personaMeta} mode="emergence" />
+                {detailOpen ? (
+                  <div className="mt-1.5 border-t border-[#e0568a]/20 pt-1.5">
+                    <PersonaThought thought={event.thought} persona={personaMeta} mode="detail" />
+                  </div>
+                ) : null}
+              </div>
+            </>
+          ) : (
+            <p className="flex items-start gap-1.5 whitespace-pre-wrap break-words text-xs italic leading-5 text-[#d64d7f]">
+              <Brain className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+              <span>{event.thought}</span>
+            </p>
+          )}
           {fallbackReason ? (
             <p className="mt-1 text-[11px] text-muted-foreground">托管原因：{fallbackReason}</p>
           ) : null}
@@ -171,10 +180,12 @@ interface EventStreamProps {
   t0?: number | null
   /** 回放游标高亮：该 seq 事件加圈标出（回放推进的视觉锚点） */
   highlightSeq?: number | null
+  /** 心理活动默认收起（高级设置；收起时涌现/正文文字仍常显，只收心镜分析层） */
+  thoughtCollapsed?: boolean
 }
 
 // memo 包裹整体：父组件因选中玩家等原因重渲染时，若 events 引用未变则事件流完全不重渲染
-export const EventStream = memo(function EventStream({ events, className, live, currentDay, currentPhase, phaseBreaking, focusSessionKey, onFocusHandled, t0, highlightSeq }: EventStreamProps) {
+export const EventStream = memo(function EventStream({ events, className, live, currentDay, currentPhase, phaseBreaking, focusSessionKey, onFocusHandled, t0, highlightSeq, thoughtCollapsed }: EventStreamProps) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const getViewport = () =>
     wrapRef.current?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]') ?? null
@@ -305,7 +316,7 @@ export const EventStream = memo(function EventStream({ events, className, live, 
             ) : (
               <ul className="divide-y-0">
                 {activeSession?.events.map((event) => (
-                  <EventItem key={event.seq} event={event} t0={t0} highlighted={event.seq === highlightSeq} />
+                  <EventItem key={event.seq} event={event} t0={t0} highlighted={event.seq === highlightSeq} thoughtCollapsed={thoughtCollapsed} />
                 ))}
               </ul>
             )}

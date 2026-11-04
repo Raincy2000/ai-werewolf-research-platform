@@ -61,8 +61,28 @@ vi.mock("../queries/guide", () => ({
   upsertAnalysis: async () => {},
 }));
 
+
+// 通用自动应答（托管抹消后，测试流必须由正常 AI 输出推进）：
+// 定序/退水/竞选特判；发言类按【你的任务】行判定（规则全文/契约里的「发言」字样会误中全文匹配）；
+// 必须行动类取【合法目标】首座；其余 skip
+function autoAnswer(user: string): string {
+  if (user.includes("升序发言")) return '{"thought":"t","targets":[1]}';
+  if (user.includes("退水抉择")) return '{"thought":"t","targets":[0]}';
+  if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
+  const taskLine = user.slice(user.indexOf("【你的任务】"));
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言|赛后讨论·聊天室/.test(taskLine)) {
+    return '{"thought":"t","speech":"测试发言"}';
+  }
+  const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));
+  if (needTarget) {
+    const m = user.match(/【合法目标】([0-9]+)/);
+    if (m) return `{"thought":"t","targets":[${m[1]}]}`;
+  }
+  return '{"thought":"t","skip":true}';
+}
+
 vi.mock("./ai/providers", () => ({
-  callAi: async () => ({ ok: false, text: null, latencyMs: 1, error: "测试：AI 不可用 → 启发式兜底" }),
+  callAi: async (_cfg: unknown, _system: string, user: string) => ({ ok: true, text: autoAnswer(user), latencyMs: 1, error: null }),
 }));
 
 const OPTS: AdvancedOptions = {

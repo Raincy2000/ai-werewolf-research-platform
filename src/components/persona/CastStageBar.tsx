@@ -5,6 +5,7 @@
  * compact 模式用于人格卡列表里的「生成中」小卡。
  */
 
+import { memo } from 'react'
 import { Check } from 'lucide-react'
 
 const STAGES = ['搜集资料', '深读人格', '整合量化'] as const
@@ -17,7 +18,7 @@ export function stageFromLabel(label: string | null | undefined, fallback: numbe
   return 1
 }
 
-export function CastStageBar({
+export const CastStageBar = memo(function CastStageBar({
   label,
   fallbackStage = 1,
   done = false,
@@ -82,4 +83,4 @@ export function CastStageBar({
       })}
     </div>
   )
-}
+})

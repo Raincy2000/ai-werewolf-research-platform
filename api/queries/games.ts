@@ -164,3 +164,29 @@ export async function getMaxEventSeq(gameId: string): Promise<number> {
     .where(eq(gameEvents.gameId, gameId));
   return Number(rows[0]?.max ?? 0);
 }
+
+/** 从死亡事件推导死亡座位集合（行快照存活态的唯一事实源）：
+ * actor 非空=该座位死亡；夜亡公告（actor 为空）正文按「N号」提取 */
+export function deathSeatsFromEvents(
+  events: { type: string; actor: number | null; content: string }[],
+): Set<number> {
+  const dead = new Set<number>();
+  for (const e of events) {
+    if (e.type !== "death") continue;
+    if (e.actor != null) {
+      dead.add(e.actor);
+      continue;
+    }
+    for (const m of e.content.matchAll(/(\d+)号/g)) dead.add(Number(m[1]));
+  }
+  return dead;
+}
+
+/** 该对局当前已死亡座位（供无运行时的行快照还原存活态——杜绝「全员存活」假象） */
+export async function getDeadSeats(gameId: string): Promise<Set<number>> {
+  const rows = await getDb()
+    .select({ actor: gameEvents.actor, content: gameEvents.content })
+    .from(gameEvents)
+    .where(and(eq(gameEvents.gameId, gameId), eq(gameEvents.type, "death")));
+  return deathSeatsFromEvents(rows);
+}

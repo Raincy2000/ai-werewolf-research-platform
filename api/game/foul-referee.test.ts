@@ -216,6 +216,8 @@ describe("buildFoulCheckPrompt（裁判 prompt 要素）", () => {
     expect(p.user).toContain("AI身份泄露");
     expect(p.user).toContain("元游戏言论");
     expect(p.user).toContain("口头声称");
+    expect(p.user).toContain("正面朝下");
+    expect(p.user).toContain("不等于翻牌亮牌");
     expect(p.system).toContain("保守原则");
   });
 });
@@ -264,6 +266,28 @@ describe("犯规判罚集成（settleExternal 路径）", () => {
     expect(h.engine!.state.settled).toBeNull();
     // 裁判确实审查过这条发言
     expect(h.aiCalls.length).toBeGreaterThanOrEqual(1);
+    await gameService.control(gameId, "terminate");
+  });
+
+  it("正面朝下移动卡牌：即使裁判误判亮牌也必须驳回，不得终局", async () => {
+    h.aiQueue.push(
+      '{"foul":true,"type":"unauthorizedReveal","evidence":"（把手里的牌往桌上一撂，正面朝下）","verdict":"平民无翻牌权"}',
+    );
+    const gameId = await startGame("（把手里的牌往桌上一撂，正面朝下）12号。我的票压6号。");
+    await new Promise((r) => setTimeout(r, 800));
+    expect(h.games.get(gameId)!.status).toBe("running");
+    expect(h.events.some((e) => e.title === "犯规判罚")).toBe(false);
+    expect(h.decisions.some((d) => d.kind === "auditSettle")).toBe(false);
+    expect(h.engine!.state.settled).toBeNull();
+    await gameService.control(gameId, "terminate");
+  });
+
+  it("亮牌判罚缺少具体翻亮证据：保守不判", async () => {
+    h.aiQueue.push('{"foul":true,"type":"unauthorizedReveal","evidence":"","verdict":"看起来违规"}');
+    const gameId = await startGame("（把牌正过来放回桌面）一张民牌。");
+    await new Promise((r) => setTimeout(r, 800));
+    expect(h.games.get(gameId)!.status).toBe("running");
+    expect(h.decisions.some((d) => d.kind === "auditSettle")).toBe(false);
     await gameService.control(gameId, "terminate");
   });
 

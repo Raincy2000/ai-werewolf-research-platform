@@ -672,7 +672,7 @@ describe("专项：白天规则", () => {
     expect(pendings[pendings.length - 1].view.day).toBe(2);
   });
 
-  it("主动技能窗口（夜亡公告+竞选结果）：骑士与见面狼均被询问，默认按兵不动白天照常", () => {
+  it("主动技能窗口（夜亡公告+竞选结果）：见面狼被询问、骑士不在（2026-10-15 官方规则：决斗仅限放逐发言阶段），默认按兵不动白天照常", () => {
     const ROLES: RoleId[] = [
       "werewolf", "werewolf", "werewolf", "whiteWolfKing",
       "seer", "witch", "knight", "guard",
@@ -687,11 +687,11 @@ describe("专项：白天规则", () => {
       stop: (p) => p?.kind === "daySpeech", // 停在第1天首次发言前
     });
     // 首次发言前共有两轮权衡：夜亡公告（竞选报名之前）+ 竞选结果（竞选之后，此处无人上警→警徽流失）
-    // 均为 4只见面狼 + 骑士（7号）的并行批次（batch），phase 为 day.skill
+    // 均为 4 只见面狼的并行批次（骑士不在——决斗仅限放逐发言阶段），phase 为 day.skill
     const skills = pendings.filter((p) => p.kind === "daySkill" && p.view.day === 1);
     expect(skills.length).toBe(2);
     for (const sk of skills) {
-      expect(sk.batch!.map((p) => p.seat)).toEqual([1, 2, 3, 4, 7]);
+      expect(sk.batch!.map((p) => p.seat)).toEqual([1, 2, 3, 4]);
       expect(sk.batch!.every((p) => p.view.phase === "day.skill")).toBe(true);
       expect(sk.batch!.every((p) => p.allowSkip)).toBe(true);
     }
@@ -730,7 +730,7 @@ describe("专项：白天规则", () => {
     }
   });
 
-  it("开局权衡：夜亡公告后立即出现当天第一次技能权衡（早于警长竞选报名）", () => {
+  it("开局权衡：夜亡公告后立即出现当天第一次技能权衡（早于警长竞选报名；骑士不在——决斗仅限放逐发言阶段）", () => {
     const ROLES: RoleId[] = [
       "werewolf", "werewolf", "werewolf", "whiteWolfKing",
       "seer", "witch", "knight", "guard",
@@ -747,7 +747,7 @@ describe("专项：白天规则", () => {
     // 报名之前已经发生过一次夜亡公告后的并行权衡
     const skills = pendings.filter((p) => p.kind === "daySkill" && p.view.day === 1);
     expect(skills.length).toBe(1);
-    expect(skills[0].batch!.map((p) => p.seat)).toEqual([1, 2, 3, 4, 7]);
+    expect(skills[0].batch!.map((p) => p.seat)).toEqual([1, 2, 3, 4]);
   });
 
   it("瞬时权衡窗口不污染事件标签：任何事件的 phase 不得为 day.skill（发言/投票带宏观上下文标签）", () => {
@@ -842,17 +842,26 @@ describe("专项：白天规则", () => {
     expect(pendings[pendings.length - 1].view.day).toBe(2); // 直接入夜
   });
 
-  it("骑士在夜亡公告窗口决斗狼人：不进入发言，立即入夜", () => {
+  it("骑士在放逐发言窗口决斗狼人：狼出局立即入夜（夜亡公告等非发言窗口无权决斗）", () => {
     const ROLES: RoleId[] = [
       "werewolf", "werewolf", "werewolf", "whiteWolfKing",
       "seer", "witch", "knight", "guard",
       "villager", "villager", "villager", "villager",
     ];
+    let duelled = false;
     const { engine, pendings } = drive("whiteWolfKnight12", ROLES, (p) => {
       const thought = "t";
       if (p.kind === "wolfKill") return { thought, targets: [9] };
       if (p.kind === "seerCheck") return { thought, targets: [1] };
-      if (p.kind === "daySkill") return BATCH_WITH(p, 7, { duel: 1 });
+      if (p.kind === "daySkill") {
+        // 新规下骑士只出现在放逐发言阶段的权衡批次——首个含骑士的批次即决斗
+        const hasKnight = (p.batch ?? [p]).some((s) => s.seat === 7);
+        if (hasKnight && !duelled) {
+          duelled = true;
+          return BATCH_WITH(p, 7, { duel: 1 });
+        }
+        return QUICK(p);
+      }
       return QUICK(p);
     }, {
       stop: (p) => p?.kind === "wolfKill" && p.view.day === 2,
@@ -860,8 +869,9 @@ describe("专项：白天规则", () => {
     const snap = engine.getSnapshot();
     expect(snap.players.find((x) => x.seat === 1)!.alive).toBe(false); // 狼被决斗出局
     expect(snap.players.find((x) => x.seat === 7)!.alive).toBe(true); // 骑士存活
-    // 第1天没有发生任何白天发言（窗口决斗直接入夜）
-    expect(pendings.some((p) => p.kind === "daySpeech" && p.view.day === 1)).toBe(false);
+    // 决斗发生在白天发言之后（放逐发言阶段），决斗狼出局直接入夜：第1天无放逐投票
+    expect(pendings.some((p) => p.kind === "daySpeech" && p.view.day === 1)).toBe(true);
+    expect(pendings.some((p) => p.kind === "dayVote" && p.view.day === 1)).toBe(false);
     expect(pendings[pendings.length - 1].view.day).toBe(2);
   });
 
@@ -1123,6 +1133,49 @@ describe("专项：白天规则", () => {
     expect(snap.players.find((x) => x.seat === 5)!.sheriff).toBe(false);
     expect(events.some((e) => e.title === "警徽移交")).toBe(true);
     expect(events.some((e) => e.title === "警徽流失")).toBe(false);
+  });
+
+  it("警徽流：警长选择撕毁警徽（skip），本局再无警长", () => {
+    const { engine, pendings, events } = drive("standard12", STD12, (p) => {
+      const thought = "t";
+      const d = p.view.day;
+      if (p.kind === "sheriffRun")
+        return BATCH_MAP(p, (sub) => ({ thought, targets: [sub.seat === 5 ? 1 : 0] }));
+      if (p.kind === "wolfKill") return { thought, targets: [d === 1 ? 9 : 5] };
+      if (p.kind === "witchAction" || p.kind === "guardProtect") return { thought, skip: true };
+      if (p.kind === "badgePass") return { thought, skip: true }; // 撕毁警徽
+      return QUICK(p);
+    }, {
+      stop: (p) => p?.kind === "daySpeech" && p.view.day === 2,
+    });
+    expect(pendings.some((p) => p.kind === "badgePass" && p.seat === 5)).toBe(true);
+    expect(events.some((e) => e.title === "警徽流失")).toBe(true);
+    expect(events.some((e) => e.title === "警徽移交")).toBe(false);
+    expect(engine.getSnapshot().players.every((x) => !x.sheriff)).toBe(true);
+  });
+
+  it("狼刀多数决：2v2 平票狼刀空悬（当夜无人被刀），刀法台账回喂「我的票≠最终落刀」", () => {
+    const { pendings, events } = drive("standard12", STD12, (p) => {
+      const thought = "t";
+      if (p.kind === "wolfKill") {
+        const t = p.seat <= 2 ? 9 : 10; // 狼1/2 投9、狼3/4 投10 → 2:2 平票
+        return { thought, targets: [t] };
+      }
+      return QUICK(p);
+    }, {
+      stop: (p) => p?.kind === "wolfKill" && p.view.day === 2, // 停在第2夜狼刀（台账已回喂）
+    });
+    expect(events.some((e) => e.title === "狼刀空悬")).toBe(true);
+    expect(events.some((e) => e.title === "狼刀落定")).toBe(false);
+    // 女巫视图：今夜无人被刀（解药目标为空）
+    const witchAsk = pendings.find((p) => p.kind === "witchAction" && p.view.day === 1);
+    expect(witchAsk?.view.private?.witchVictimTonight ?? null).toBeNull();
+    // 次夜狼队视图：台账写明「平票空悬」，且区分我的票与最终结果
+    const wolfNext = pendings.find((p) => p.kind === "wolfKill" && p.view.day === 2);
+    const log = (wolfNext?.view.private?.wolfKnifeLog ?? []).join("\n");
+    expect(log).toContain("平票");
+    expect(log).toContain("无人被刀");
+    expect(log).toContain("你投刀9号");
   });
 
   it("警徽流时机：警长夜亡的警徽抉择推迟到白天公布夜亡之后（不连夜私下处置）", () => {
@@ -1544,11 +1597,13 @@ describe("专项：认知与流程修复", () => {
       (e) => e.type === "death" && e.title === "死亡公告" && e.content.includes("12号"),
     );
     expect(deathEvt).toBeDefined();
+    expect(deathEvt!.meta).toMatchObject({ deathInfoBySeat: { "12": "第一夜 · 被狼人袭击" } });
     // 首个 sheriffRun pending 的视图：12号已在 deadSeats（公告先于竞选）
     const firstRun = pendings[pendings.length - 1];
     expect(firstRun.kind).toBe("sheriffRun");
     expect(firstRun.view.deadSeats).toContain(12);
     expect(firstRun.view.aliveSeats).not.toContain(12);
+    expect(firstRun.view.deathTimeline?.[12]).toBe("第一夜 · 被狼人袭击");
   });
 
   it("③ 12人有警长版型第1夜狼队 pending 顺序：独立思考×4→讨论×4→投票落刀×4", () => {
@@ -1846,13 +1901,16 @@ describe("专项：赛后讨论", () => {
     expect(events.some((e) => e.type === "system" && e.title === "赛后讨论开始")).toBe(true);
     expect(events.some((e) => e.type === "system" && e.title === "赛后讨论结束")).toBe(true);
 
-    // 赛后发言事件：12 人 × 2 轮 = 24 条，全部挂在 postgame.discuss 阶段
+    // 赛后发言事件：12 人 × 2 轮 = 24 条实发言 + 第3轮 12 条沉默（2026-10-15 新规：沉默也上公屏），
+    // 全部挂在 postgame.discuss 阶段
     const pgSpeeches = events.filter((e) => e.type === "speech" && e.title === "赛后讨论");
-    expect(pgSpeeches.length).toBe(24);
+    expect(pgSpeeches.filter((e) => e.meta?.silent !== true).length).toBe(24);
+    expect(pgSpeeches.filter((e) => e.meta?.silent === true).length).toBe(12);
     expect(pgSpeeches.every((e) => e.phase === "postgame.discuss")).toBe(true);
-    // 每轮每人一条：轮次 meta 为 1/2，内容含座位与轮次
+    // 每轮每人一条：轮次 meta 为 1/2（第3轮沉默标记 round=3），内容含座位与轮次
     expect(pgSpeeches.filter((e) => e.meta?.round === 1).length).toBe(12);
     expect(pgSpeeches.filter((e) => e.meta?.round === 2).length).toBe(12);
+    expect(pgSpeeches.filter((e) => e.meta?.round === 3 && e.meta?.silent === true).length).toBe(12);
     expect(pgSpeeches.some((e) => e.content === "赛后感想S7R2")).toBe(true);
     // 顺序单问：3 轮 × 12 人 = 36 个独立 postgameSpeak 待决（非批次）
     const pgPendings = pendings.filter((p) => p.kind === "postgameSpeak");
@@ -1874,8 +1932,8 @@ describe("专项：赛后讨论", () => {
     const s7 = events.filter((e) => e.type === "speech" && e.title === "赛后讨论" && e.actor === 7);
     expect(s7.length).toBe(5);
     expect(s7.map((e) => e.meta?.remain)).toEqual([4, 3, 2, 1, 0]);
-    // 其余座位从未发言
-    expect(events.some((e) => e.type === "speech" && e.title === "赛后讨论" && e.actor !== 7)).toBe(false);
+    // 其余座位从未实发言（只有沉默事件——2026-10-15 新规：沉默上公屏但不算发言）
+    expect(events.some((e) => e.type === "speech" && e.title === "赛后讨论" && e.actor !== 7 && e.meta?.silent !== true)).toBe(false);
     // 7号恰好被问 5 次：5 次机会用尽后第 6 轮起不再有 7 号的 postgameSpeak 待决
     const pgPendings = pendings.filter((p) => p.kind === "postgameSpeak");
     expect(pgPendings.filter((p) => p.seat === 7).length).toBe(5);
@@ -2185,5 +2243,204 @@ describe("专项：放逐出局时点（放逐结果≠出局，技能结算后�
     expect(idxResult).toBeGreaterThan(-1);
     expect(idxDeath).toBeGreaterThan(idxResult);
     expect(events[idxResult]!.type).toBe("vote");
+  });
+});
+describe("专项：官方规则底层判定（2026-10-15 用户裁定：最后一狼/狼刀在先/骑士决斗时机）", () => {
+  const GUARD: RoleId[] = [
+    "werewolf", "werewolf", "werewolf", "wolfKing",
+    "seer", "witch", "hunter", "guard",
+    "villager", "villager", "villager", "villager",
+  ];
+
+  it("最后一狼狼王被放逐：遗言保留、技能询问与权衡整环跳过、直接宣判神民胜（2026-10-15 用户裁定）", () => {
+    const { engine, pendings, events } = drive("wolfKingGuard12", GUARD, (p) => {
+      const thought = "t";
+      const d = p.view.day;
+      if (p.kind === "wolfKill") return { thought, targets: [[5, 7, 8, 9][d - 1] ?? 9] }; // 夜刀 5/7/8（留女巫保神民两边都不灭绝）
+      if (p.kind === "witchAction" || p.kind === "guardProtect") return { thought, skip: true };
+      if (p.kind === "dayVote") return BATCH_MAP(p, (sub) => sub.kind === "dayVote" ? { thought, targets: [sub.seat === d ? 12 : d] } : QUICK(sub)); // 第d天放逐d号（1-3狼→4狼王；d号自己投12号免自投；混合批次防御）
+      if (p.kind === "exileSkill") return { thought, skip: true };
+      return QUICK(p);
+    });
+    // 遗言保留（遗言权是放逐者的正当权利，不因终局而剥夺）
+    expect(events.some((e) => e.title === "遗言" && e.actor === 4)).toBe(true);
+    // 技能询问与权衡整环跳过：不出现 4 号的放逐技能询问待决，也无放逐权衡事件（不再有「权衡中」环）
+    expect(pendings.some((p) => p.kind === "exileSkill" && p.seat === 4 && p.view.day === 4)).toBe(false);
+    expect(events.some((e) => e.title === "放逐权衡" && e.actor === 4)).toBe(false);
+    // 落「最后一狼规则」事件 + 无任何开枪事件；狼全灭 → 直接宣判神民胜
+    expect(events.some((e) => e.title === "最后一狼规则")).toBe(true);
+    expect(events.some((e) => e.title === "开枪" && e.actor === 4)).toBe(false);
+    expect(engine.getSnapshot().winner).toBe("good");
+  });
+
+  it("狼王非最后一狼被放逐：正常给开枪选项，开枪结算", () => {
+    const { pendings, events } = drive(
+      "wolfKingGuard12",
+      GUARD,
+      (p) => {
+        const thought = "t";
+        if (p.kind === "wolfKill") return { thought, targets: [9] };
+        if (p.kind === "witchAction" || p.kind === "guardProtect") return { thought, skip: true };
+        if (p.kind === "dayVote") return BATCH_MAP(p, (sub) => sub.kind === "dayVote" ? { thought, targets: [sub.seat === 4 ? 12 : 4] } : QUICK(sub)); // 首天放逐狼王（4号自己投12号免自投；混合批次防御）
+        if (p.kind === "exileSkill") return { thought, targets: [10] }; // 开枪带 10 号民
+        return QUICK(p);
+      },
+      { stop: (p) => p?.kind === "wolfKill" && p.view.day === 2 },
+    );
+    const ask = pendings.find((p) => p.kind === "exileSkill" && p.seat === 4);
+    expect(ask).toBeDefined();
+    expect(ask!.options.length).toBeGreaterThan(0); // 队友 1/2/3 存活：开枪资格在
+    expect(events.some((e) => e.title === "开枪" && e.actor === 4)).toBe(true);
+  });
+
+  it("白狼王作为最后一狼自爆：带人技能不发动（无 whiteWolfTake 询问），自爆即终局神民胜", () => {
+    const WWG: RoleId[] = [
+      "seer", "witch", "hunter", "guard",
+      "villager", "villager", "villager", "villager",
+      "werewolf", "werewolf", "werewolf", "whiteWolfKing",
+    ];
+    const { engine, pendings, events } = drive("whiteWolfGuard12", WWG, (p) => {
+      const thought = "t";
+      const d = p.view.day;
+      if (p.kind === "wolfKill") return { thought, targets: [[5, 6, 7, 4][d - 1] ?? 4] }; // 夜刀 5/6/7 民、第4夜刀4号守卫（留足民与神防屠边）
+      if (p.kind === "witchAction" || p.kind === "guardProtect") return { thought, skip: true };
+      if (p.kind === "dayVote") return BATCH_MAP(p, (sub) => sub.kind === "dayVote" ? { thought, targets: [sub.seat === 8 + d ? 8 : 8 + d] } : QUICK(sub)); // 第d天放逐 9/10/11 狼（当事狼投5号免自投；混合批次防御）
+      if (p.kind === "daySkill")
+        return BATCH_MAP(p, (sub) => {
+          if (sub.kind !== "daySkill") return QUICK(sub); // 混合批次里的发言等子决策按 QUICK 应答
+          return sub.seat === 12 && sub.view.day === 4 ? { thought, selfDestruct: true } : { thought, skip: true };
+        }); // 第4天白狼王（最后一狼）自爆
+      return QUICK(p);
+    });
+    expect(events.some((e) => e.title === "狼人自爆" && e.actor === 12)).toBe(true);
+    expect(events.some((e) => e.title === "最后一狼规则")).toBe(true);
+    expect(pendings.some((p) => p.kind === "whiteWolfTake")).toBe(false); // 带人询问根本没出现
+    expect(events.some((e) => e.title === "白狼王带人")).toBe(false);
+    expect(engine.getSnapshot().winner).toBe("good");
+  });
+
+  it("狼刀在先：同夜狼刀屠边+女巫毒死最后一狼 → 判狼胜（同时灭绝狼刀优先）", () => {
+    // 1狼 + 预言家+女巫双神 + 6民：第2夜狼刀女巫（预言家已死=屠神）与女巫毒死最后一狼同夜发生
+    const NINE: RoleId[] = [
+      "werewolf", "seer", "witch",
+      "villager", "villager", "villager", "villager", "villager", "villager",
+    ];
+    const { engine } = drive("standard9", NINE, (p) => {
+      const thought = "t";
+      const d = p.view.day;
+      if (p.kind === "wolfKill") return { thought, targets: [d === 1 ? 2 : 3] }; // 夜1刀预言家，夜2刀女巫
+      if (p.kind === "witchAction") {
+        if (d === 1) return { thought, skip: true }; // 不救预言家
+        return { thought, targets: [1] }; // 夜2毒死最后一狼（此时女巫中刀）
+      }
+      if (p.kind === "dayVote") return BATCH_MAP(p, (sub) => sub.kind === "dayVote" ? { thought, targets: [sub.seat === 4 ? 5 : 4] } : QUICK(sub)); // 白天放逐4号民（4号投5号免自投；混合批次防御）
+      if (p.kind === "exileSkill" || p.kind === "hunterShoot") return { thought, skip: true };
+      return QUICK(p);
+    });
+    expect(engine.getSnapshot().finished).toBe(true);
+    expect(engine.getSnapshot().winner).toBe("wolf"); // 狼刀在先：屠边先达成，毒死最后一狼不改判
+  });
+
+  it("骑士决斗仅在放逐发言阶段发起：警上/夜亡公告等节点无骑士权衡，白天发言后有", () => {
+    const KNIGHT: RoleId[] = [
+      "seer", "witch", "knight", "guard",
+      "villager", "villager", "villager", "villager",
+      "werewolf", "werewolf", "werewolf", "whiteWolfKing",
+    ];
+    const { pendings } = drive("whiteWolfKnight12", KNIGHT, (p) => QUICK(p), {
+      stop: (p) => p?.kind === "dayVote" && p.view.day === 1,
+    });
+    const hasSeat = (p: PendingDecision, seat: number) => (p.batch ?? [p]).some((s) => s.seat === seat);
+    const skillBatches = pendings.filter((p) => p.kind === "daySkill");
+    const firstSpeechIdx = pendings.findIndex((p) => p.kind === "daySpeech");
+    const before = skillBatches.filter((p) => pendings.indexOf(p) < firstSpeechIdx);
+    const after = skillBatches.filter((p) => pendings.indexOf(p) > firstSpeechIdx);
+    expect(before.length).toBeGreaterThan(0); // 警上/公告节点狼队自爆权衡存在（对照组）
+    expect(before.some((p) => hasSeat(p, 3))).toBe(false); // 但骑士（3号）不在其中——警上无决斗
+    expect(after.some((p) => hasSeat(p, 3))).toBe(true); // 放逐发言阶段骑士有权衡
+  });
+});
+
+describe("专项：赛后讨论沉默上公屏（2026-10-15 用户裁定）", () => {
+  it("玩家赛后选择沉默：落「（本轮选择沉默）」发言事件、附心理活动与 silent 标记，不消耗发言机会", () => {
+    const NINE: RoleId[] = [
+      "werewolf", "werewolf", "werewolf",
+      "seer", "witch", "hunter",
+      "villager", "villager", "villager",
+    ];
+    const { events } = drive("standard9", NINE, (p) => {
+      const thought = "t";
+      if (p.kind === "daySkill")
+        return BATCH_MAP(p, (sub) => {
+          if (sub.kind !== "daySkill") return QUICK(sub);
+          // 第1-3天各由对应座位狼自爆（狼全灭 → 神民胜 → 进入赛后讨论）
+          if (sub.seat === p.view.day && MEETING_WOLF_ROLES.includes(sub.view.role)) {
+            return { thought, selfDestruct: true };
+          }
+          return { thought, skip: true };
+        });
+      if (p.kind === "wolfKill") return { thought, targets: [Math.min(3 + p.view.day + 3, 9)] };
+      if (p.kind === "postgameSpeak") {
+        // 3号赛后选择沉默（skip）；其余发言
+        if (p.seat === 3) return { thought: "心里其实翻江倒海，但此刻不想说", skip: true };
+        return { thought: "复盘一下", speech: `SPEECH_S${p.seat}_POSTGAME` };
+      }
+      return QUICK(p);
+    }, { options: { postGameDiscuss: true } });
+    // 三狼自爆完 → 神民胜 → 赛后讨论
+    const silent = events.find((e) => e.phase.startsWith("postgame") && e.actor === 3);
+    expect(silent).toBeDefined();
+    expect(silent!.content).toContain("沉默");
+    expect(silent!.thought).toBe("心里其实翻江倒海，但此刻不想说"); // 心理活动附上（观察者可见）
+    expect(silent!.meta?.silent).toBe(true);
+    // 后面的座位照常发言（沉默不阻塞流程）
+    expect(events.some((e) => e.phase.startsWith("postgame") && e.actor === 4 && e.meta?.silent !== true)).toBe(true);
+  });
+});
+
+describe("专项：全员上警时必须先完成退水再处理警徽", () => {
+  const ROLES: RoleId[] = [
+    "seer", "witch", "hunter", "idiot",
+    "villager", "villager", "villager", "villager",
+    "werewolf", "werewolf", "werewolf", "werewolf",
+  ];
+  const runAllAndAnswer = (p: PendingDecision): DecisionInput => {
+    const thought = "t";
+    if (p.kind === "wolfKill") return { thought, targets: [p.options[0]] };
+    if (p.kind === "seerCheck") return { thought, targets: [2] };
+    if (p.kind === "witchAction") return { thought, skip: true };
+    if (p.kind === "sheriffRun") return BATCH_MAP(p, () => ({ thought, targets: [1] }));
+    if (p.kind === "sheriffWithdraw") {
+      return BATCH_MAP(p, (sub) => ({ thought, targets: [sub.seat === 3 ? 1 : 0] }));
+    }
+    if (p.kind === "sheriffVote") {
+      return p.batch
+        ? BATCH_MAP(p, (sub) => ({ thought, targets: [sub.options[0]] }))
+        : { thought, targets: [p.options[0]] };
+    }
+    return QUICK(p);
+  };
+
+  it("全员上警且有人退水：退水者转为警下投票，警长正常产生", () => {
+    const { engine, pendings, events } = drive("standard12", ROLES, runAllAndAnswer, {
+      stop: (p) => p?.kind === "sheriffOrder",
+    });
+    expect(pendings.some((p) => p.kind === "sheriffWithdraw")).toBe(true);
+    expect(events.some((e) => e.title === "退水" && e.actor === 3)).toBe(true);
+    expect(engine.getSnapshot().players.some((p) => p.sheriff)).toBe(true);
+    expect(events.some((e) => e.title === "警徽流失")).toBe(false);
+  });
+
+  it("全员上警且无人退水：不得提前流失，须先完成警上发言与退水", () => {
+    const { pendings, events } = drive("standard12", ROLES, (p) => {
+      if (p.kind === "sheriffWithdraw") return BATCH_MAP(p, () => ({ thought: "t", targets: [0] }));
+      return runAllAndAnswer(p);
+    }, {
+      stop: (p) => p?.kind === "daySpeech",
+    });
+    expect(pendings.some((p) => p.kind === "sheriffSpeech")).toBe(true);
+    expect(pendings.some((p) => p.kind === "sheriffWithdraw")).toBe(true);
+    const loss = events.find((e) => e.title === "警徽流失");
+    expect(loss?.content).toContain("警下无人投票");
   });
 });

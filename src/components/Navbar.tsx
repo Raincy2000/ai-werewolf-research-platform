@@ -88,7 +88,7 @@ export default function Navbar() {
               )
             }
           >
-            人格研究库
+            人格研究站
           </NavLink>
         </nav>
       </div>

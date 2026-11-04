@@ -1,16 +1,17 @@
 /**
- * 人格研究库 /personas —— 「数字人类心理学实验场」的人格参数卡管理页。
+ * 人格研究站 /personas —— 「数字人类心理学实验场」的人格参数卡管理页。
  * 铁律1「人格量化」：每个角色一张人格参数卡（大五/依恋/黑暗四/认知偏差/防御机制/情绪调节/SDT），
  * 全部 0-100 连续量化，禁止二选一。
  * P1 范围：手动建卡/编辑/详情/删除；AI 铸造（铸魂师）在 P2 接入。
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   Brain,
-  ChevronDown,
-  ChevronRight,
+  History,
+  Inbox,
+  NotebookPen,
   CircleAlert,
   Fingerprint,
   Loader2,
@@ -38,6 +39,7 @@ import type {
   PersonaTrashEntry,
 } from '@/lib/gameApi'
 import {
+  COGNITION_NOTE_ENABLED,
   COGNITIVE_BIAS_CATALOG,
   DEFENSE_MECHANISM_CATALOG,
   attachmentLabel,
@@ -46,6 +48,8 @@ import {
   useGameApi,
 } from '@/lib/gameApi'
 import { useAuth } from '@/providers/auth'
+import type { CanonRelationInput } from '@contracts/persona'
+import type { Nickname } from '@contracts/interpersonal'
 import { LoginRequiredCard } from '@/components/AuthDialog'
 import { isUnauthorizedError } from '@/lib/utils'
 import { cn } from '@/lib/utils'
@@ -78,6 +82,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Slider } from '@/components/ui/slider'
+import { Switch } from '@/components/ui/switch'
 import {
   Select,
   SelectContent,
@@ -88,6 +93,7 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { CastWizard } from '@/components/persona/CastWizard'
+import { CastTraceDialog } from '@/components/persona/CastTraceDialog'
 import { CastStageBar } from '@/components/persona/CastStageBar'
 import { MarkdownBoard } from '@/components/MarkdownBoard'
 
@@ -135,6 +141,13 @@ function formatTime(iso: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+/** 请求被取消（AbortController / tRPC abort）——不是真错误，不弹报错 */
+function isAbortError(e: unknown): boolean {
+  if (typeof DOMException !== 'undefined' && e instanceof DOMException) return e.name === 'AbortError'
+  if (e instanceof Error) return /abort/i.test(e.name + e.message)
+  return false
+}
+
 /** 编辑表单状态（quotes 以换行文本编辑，保存时拆分） */
 interface PersonaFormState {
   name: string
@@ -160,6 +173,13 @@ interface PersonaFormState {
   notes: string
   imageData: string | null
   params: PersonaParams
+  /**
+   * 铸造产出的结构化原作关系 / 自我别名 / 昵称库（§19）：
+   * 编辑表单本轮不展示，但必须原样透传——丢了这三项，铸造建关系网链路就断了。
+   */
+  canonRelations: CanonRelationInput[] | null
+  selfAliases: string[] | null
+  nicknames: Nickname[] | null
 }
 
 function formFromCard(card: PersonaCard): PersonaFormState {
@@ -188,6 +208,10 @@ function formFromCard(card: PersonaCard): PersonaFormState {
     notes: card.notes,
     imageData: card.imageData,
     params: card.params,
+    // ★ 结构化原作关系 / 自我别名 / 昵称库：编辑往返不能丢（P0-3 前端透传）
+    canonRelations: pr.canonRelations ?? null,
+    selfAliases: pr.selfAliases ?? null,
+    nicknames: pr.nicknames ?? null,
   }
 }
 
@@ -217,6 +241,9 @@ function blankForm(): PersonaFormState {
     notes: '',
     imageData: null,
     params: defaultPersonaParams(),
+    canonRelations: null,
+    selfAliases: null,
+    nicknames: null,
   }
 }
 
@@ -247,6 +274,10 @@ function formToInput(form: PersonaFormState): PersonaCardInput {
       essence: form.essence.trim(),
       aliveStatus: form.aliveStatus,
       specialAbilities: form.specialAbilities.trim(),
+      // ★ 不展示但必须透传：铸造建关系网（canon 边 / 别名库 / 昵称库）依赖这三项
+      canonRelations: form.canonRelations ?? null,
+      selfAliases: form.selfAliases ?? null,
+      nicknames: form.nicknames ?? null,
     },
     params: form.params,
     notes: form.notes.trim(),
@@ -365,30 +396,87 @@ export default function Personas() {
   const [destroyTarget, setDestroyTarget] = useState<PersonaTrashEntry | null>(null)
   // 铸造中卡片组（后台铸造任务透出：批量并发时逐卡显示姓名+进度+暂停/继续/终止；向导误关也不丢进度）
   const [activeCasts, setActiveCasts] = useState<CastProgressState[]>([])
-  // 关系沿革折叠栏展开状态（关系行 id 集合；人格锚点的关系可展开看逐局变迁）
-  const [expandedRels, setExpandedRels] = useState<Set<number>>(new Set())
+  // 详情页当前页签；旧状态若仍指向已移除的关系页签则回到人物档案
+  const [detailTab, setDetailTab] = useState('profile')
+  useEffect(() => {
+    if (detailTab === 'relations') setDetailTab('profile')
+  }, [detailTab])
+  // 指名打开的铸造任务（草稿箱/生成中卡片点入向导）：精确恢复，不串台
+  const [castTarget, setCastTarget] = useState<string | null>(null)
+  // 草稿箱删除确认（castId）：草稿是用户资产，只有主动删除才消失
+  const [draftDeleteConfirm, setDraftDeleteConfirm] = useState<string | null>(null)
+  // 草稿箱弹窗开关
+  const [draftBoxOpen, setDraftBoxOpen] = useState(false)
+  // 生成留痕查看器（进度标记点+阶段文本；生成卡与草稿箱共用）
+  const [traceCastId, setTraceCastId] = useState<string | null>(null)
+  // 记录认知对话框
+  const [cogOpen, setCogOpen] = useState(false)
+  const [cogPresetId, setCogPresetId] = useState<string>('')
+  const [cogIncludeReports, setCogIncludeReports] = useState(false) // 手动书写：读自己全部近期报告=深度自省，默认关（区别于赛后自动的本局报告自由查看权——那个默认开）
+  const [cogIncludeDrift, setCogIncludeDrift] = useState(false)
+  // 后台书写轮询（fire-and-forget 后盯着沿革直到新篇出现）
+  const [cogWriting, setCogWriting] = useState(false)
+  // 真 ref（旧实现每次渲染重建对象，伪 ref —— P2-23）
+  const cogBaselineRef = useRef(0)
+  // 详情请求取消：快速切换/关闭弹窗时丢弃过期响应（P2-23）
+  const detailReqRef = useRef(0)
+  const detailAbortRef = useRef<AbortController | null>(null)
+  // 当前详情卡 id（换卡时重置页签）
+  const detailCardIdRef = useRef<number | null>(null)
+  useEffect(() => {
+    return () => { detailAbortRef.current?.abort() }
+  }, [])
+  // 笔记行内编辑
+  const [cogEditId, setCogEditId] = useState<number | null>(null)
+  const [cogEditText, setCogEditText] = useState('')
+  // 笔记删除确认（noteId）
+  const [cogDeleteId, setCogDeleteId] = useState<number | null>(null)
+  // 赛后自动书写开关组（跟随详情卡的持久化设置初始化）
+  const [autoCog, setAutoCog] = useState<{ enabled: boolean; includeReports: boolean; includeDrift: boolean }>({
+    enabled: false,
+    includeReports: false,
+    includeDrift: false,
+  })
+  useEffect(() => {
+    const s = detail?.card.autoCognition
+    if (detail) {
+      setAutoCog({
+        enabled: s ? s.enabled : true, // 默认开启（未设置=开；显式关闭才停）
+        includeReports: s ? s.includeReports === true : true, // 报告自由查看权默认授予
+        includeDrift: s?.includeDrift === true,
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.card.id])
+
+  // ---------- 详情派生数据（useMemo：避免每次渲染重排 / 双重 filter，P2-23） ----------
+  const sortedMemories = useMemo(
+    () => (detail ? [...detail.memories].sort((a, b) => a.createdAt.localeCompare(b.createdAt)) : []),
+    [detail],
+  )
+  // 开关落库（即时保存）
+  async function saveAutoCog(next: { enabled: boolean; includeReports: boolean; includeDrift: boolean }) {
+    setAutoCog(next)
+    if (!detail) return
+    try {
+      await api.setAutoCognition({ personaId: detail.card.id, ...next })
+    } catch {
+      setError('自动书写设置保存失败，请重试')
+    }
+  }
+  // 草稿箱=生成进程全程镜像：所有条目都在（排队/生成中/暂停/中断/失败/铸成），
+  // 清库只有两路——用户主动删除、核对入库核销
+  const draftCasts = activeCasts
+  // 正在编辑器里核对的草稿 castId：保存成功才核销（编辑器中途关闭→草稿回草稿箱原位）
+  const [draftInEditor, setDraftInEditor] = useState<string | null>(null)
   // 终止生成确认（取消并删除整个铸造流程；记录待终止的 castId）
   const [cancelConfirm, setCancelConfirm] = useState<string | null>(null)
 
-  // 铸造任务轮询：进页找回全部进行中的铸造（进行中/已完成未取走都透出），每 2s 刷新
-  useEffect(() => {
-    let cancelled = false
-    const tick = async () => {
-      try {
-        const actives = await api.getCastActives()
-        if (!cancelled) setActiveCasts(actives)
-      } catch { /* 忽略，下轮再试 */ }
-    }
-    void tick()
-    const t = setInterval(() => void tick(), 2000)
-    return () => {
-      cancelled = true
-      clearInterval(t)
-    }
-  }, [api])
+
 
   /** 铸造控制：暂停/继续（乐观更新）/终止（取消并删除整个流程） */
   async function handleCastControl(castId: string, action: 'pause' | 'resume' | 'cancel') {
+    setCastWake((n) => n + 1)
     try {
       await api.controlCast(castId, action)
       if (action === 'cancel') setActiveCasts((prev) => prev.filter((c) => c.castId !== castId))
@@ -399,6 +487,47 @@ export default function Personas() {
   }
   // AI 铸造向导与存档库（向导「从存档导入」用）
   const [castOpen, setCastOpen] = useState(false)
+  // 铸造任务轮询：进页找回全部进行中的铸造（进行中/已完成未取走都透出）；
+  // 功耗纪律（2026-10-15 优化专项）：活跃期 2s 刷新；闲置（无铸造任务且向导/草稿箱/留痕都关着）
+  // 降为 15s 心跳；打开向导/启动铸造/断点续铸即时唤醒。递归 setTimeout 链（响应返回后才起算，防重叠）
+  const [castWake, setCastWake] = useState(0)
+  const activeCastsRef = useRef<CastProgressState[]>([])
+  useEffect(() => {
+    activeCastsRef.current = activeCasts
+  }, [activeCasts])
+  useEffect(() => {
+    let cancelled = false
+    let timer = 0
+    const loop = async () => {
+      const uiBusy = castOpen || draftBoxOpen || traceCastId !== null
+      try {
+        const actives = await api.getCastActives()
+        if (!cancelled) setActiveCasts(actives)
+      } catch { /* 忽略，下轮再试 */ }
+      // 认知书写徽标跟随服务端台账（与铸造同拍：活跃 2s / 闲置 15s）；
+      // 签名去重——id+updatedAt+书写旗帜不变则不触发列表重渲染
+      try {
+        const list = await api.listPersonas()
+        if (!cancelled) {
+          setCards((prev) => {
+            const sig = (l: typeof prev) =>
+              l.map((c) => `${c.id}:${c.updatedAt}:${c.cognitionWritingAt ?? ''}:${c.gameCount}`).join('|')
+            return sig(prev) === sig(list) ? prev : list
+          })
+        }
+      } catch { /* 忽略，下轮再试 */ }
+      if (cancelled) return
+      const active = activeCastsRef.current.length > 0 || uiBusy
+      timer = window.setTimeout(() => void loop(), active ? 2000 : 15000)
+    }
+    void loop()
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+    // castWake bump=外部唤醒（启动铸造/续铸后立即拉一轮）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, castOpen, draftBoxOpen, traceCastId !== null, castWake])
   const [presets, setPresets] = useState<ApiPreset[]>([])
   // 配图：从链接获取的状态（编辑器内）
   const [portraitUrl, setPortraitUrl] = useState('')
@@ -526,8 +655,26 @@ export default function Personas() {
     }
   }
 
+  /** 打开记录认知弹窗（顺带拉取存档库——2026-10-14 实锤：存档只在铸造向导打开时拉取，
+   *  直接开记录认知时列表为空、下拉无一可选，看起来像「无法交互」） */
+  async function openCognition() {
+    setCogOpen(true)
+    if (presets.length === 0) {
+      try {
+        setPresets(await api.listPresets())
+      } catch {
+        /* 存档拉取失败时弹窗提示沿用空态文案 */
+      }
+    }
+  }
+
   /** 铸造草稿送入编辑器：整卡预填（含推断项标记与肖像），保存时走 createCasted 入库 */
-  function handleDraftReady(draft: PersonaCardInput) {
+  function handleDraftReady(draft: PersonaCardInput, castId?: string | null) {
+    setDraftInEditor(castId ?? null)
+    // 草稿完整性兜底：缺损字段一律给默认（老同学反馈「送入编辑器点不动」——
+    // 任何字段缺失都不许让编辑器打开失败，草稿门永远能进）
+    draft.profile = { ...emptyPersonaProfile(), ...draft.profile }
+    draft.params = { ...defaultPersonaParams(), ...draft.params }
     setCastOpen(false)
     setEditor({
       id: null,
@@ -556,6 +703,10 @@ export default function Personas() {
         notes: draft.notes ?? '',
         imageData: draft.imageData ?? null,
         params: draft.params,
+        // ★ 铸造建关系网的三个隐藏产物：原样保留到保存（否则 §19 从铸造起建网断了）
+        canonRelations: draft.profile.canonRelations ?? null,
+        selfAliases: draft.profile.selfAliases ?? null,
+        nicknames: draft.profile.nicknames ?? null,
       },
     })
   }
@@ -579,6 +730,12 @@ export default function Personas() {
       } else {
         await api.updatePersona(editor.id, input)
       }
+      // 草稿核销点：编辑器保存成功 = 草稿正式入库，此时才从草稿箱取走
+      if (draftInEditor) {
+        void api.ackCast(draftInEditor)
+        setActiveCasts((prev) => prev.filter((x) => x.castId !== draftInEditor))
+        setDraftInEditor(null)
+      }
       await refreshList()
       setEditor(null)
     } catch (err) {
@@ -590,19 +747,83 @@ export default function Personas() {
 
   // ---------- 详情 ----------
 
+  // 记录认知：后台书写（立即返回，不阻塞——多人格可同时记录；完成品出现在沿革里）
+  async function handleWriteCognition() {
+    if (!detail) return
+    const preset = presets.find((x) => String(x.id) === cogPresetId) ?? presets[0]
+    if (!preset) {
+      setError('请先在「API 存档」里保存至少一个可用配置')
+      return
+    }
+    setError(null)
+    cogBaselineRef.current = detail.cognitionNotes.length
+    try {
+      await api.writeCognition({
+        personaId: detail.card.id,
+        cfg: { provider: preset.provider, baseUrl: preset.baseUrl, model: preset.model, apiKey: preset.apiKey },
+        includeReports: cogIncludeReports,
+        includeDrift: cogIncludeDrift,
+      })
+      setCogOpen(false)
+      setCogWriting(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '认知笔记启动失败，请重试')
+    }
+  }
+
+  // 书写轮询：本地发起（cogWriting）或服务端台账在写（cognitionWritingAt，页面重开也能找回）——
+  // 新篇出现即收敛；服务端旗帜熄灭（完成/失败）也收敛；4 分钟超时兜底
+  const cogActive = cogWriting || detail?.cognitionWritingAt != null
+  useEffect(() => {
+    if (!cogActive || !detail) return
+    const t0 = Date.now()
+    const timer = setInterval(() => {
+      if (Date.now() - t0 > 240_000) {
+        clearInterval(timer)
+        setCogWriting(false)
+        return
+      }
+      void openDetail(detail.card.id)
+    }, 4000)
+    return () => clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cogActive, detail?.card.id])
+  // 新篇出现即收敛
+  useEffect(() => {
+    if (cogWriting && detail && detail.cognitionNotes.length > cogBaselineRef.current) {
+      setCogWriting(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.cognitionNotes.length])
+
+  /** 详情请求带 reqId + AbortController：关闭弹窗后过期响应不再把弹窗重新打开（P2-23） */
   async function openDetail(id: number) {
+    const reqId = ++detailReqRef.current
+    detailAbortRef.current?.abort()
+    const ac = new AbortController()
+    detailAbortRef.current = ac
+    const switching = detailCardIdRef.current !== id
+    detailCardIdRef.current = id
+    if (switching) {
+      setDetailTab('profile')
+      setDetail(null)
+    }
     setDetailLoading(true)
     try {
-      const d = await api.getPersonaDetail(id)
+      const d = await api.getPersonaDetail(id, ac.signal)
+      if (reqId !== detailReqRef.current) return
       if (d) {
         setDetail(d)
         // 心理检查报告随详情一并拉取（心理检查师终局产出，可能为空）
-        setDetailReports(await api.listPersonaReports(id).catch(() => []))
+        const reports = await api.listPersonaReports(id).catch(() => [])
+        if (reqId !== detailReqRef.current) return
+        setDetailReports(reports)
       }
-    } catch {
-      setError('读取人格详情失败')
+    } catch (e) {
+      if (reqId !== detailReqRef.current) return
+      if (!isAbortError(e)) setError('读取人格详情失败')
     } finally {
-      setDetailLoading(false)
+      if (reqId === detailReqRef.current) setDetailLoading(false)
     }
   }
 
@@ -677,21 +898,26 @@ export default function Personas() {
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <Fingerprint className="h-6 w-6 text-foreground" aria-hidden />
         <div>
-          <h1 className="text-xl font-semibold text-foreground">人格研究库</h1>
+          <h1 className="text-xl font-semibold text-foreground">人格研究站</h1>
           <p className="text-sm text-muted-foreground">
             数字人类心理学实验场：把虚拟/现实人物铸造成可量化、有记忆、会变形、能跨对局成长的数字人格
           </p>
         </div>
         <div className="ml-auto flex items-center gap-2">
-          <Button variant="outline" onClick={() => void openTrash()}>
+          {/* 草稿箱（铸造产物入库前的安身之处：重启不丢，只有主动删除才消失） */}
+          <Button className="bg-primary text-primary-foreground hover:bg-primary/90" onClick={() => setDraftBoxOpen(true)}>
+            <Inbox className="h-4 w-4" aria-hidden />
+            草稿箱{draftCasts.length > 0 ? `（${draftCasts.length}）` : ''}
+          </Button>
+          <Button className="bg-primary text-primary-foreground hover:bg-primary/90" onClick={() => void openTrash()}>
             <Trash className="h-4 w-4" aria-hidden />
             回收站
           </Button>
-          <Button variant="outline" onClick={() => void openCast()}>
+          <Button className="bg-primary text-primary-foreground hover:bg-primary/90" onClick={() => void openCast()}>
             <Sparkles className="h-4 w-4" aria-hidden />
             AI 铸造
           </Button>
-          <Button onClick={openCreate} disabled={busy}>
+          <Button className="bg-primary text-primary-foreground hover:bg-primary/90" onClick={openCreate} disabled={busy}>
             <Plus className="h-4 w-4" aria-hidden />
             手动建卡
           </Button>
@@ -727,8 +953,9 @@ export default function Personas() {
             </p>
           ) : (
             <ul className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-              {/* 铸造中卡片组（始终在最前/最新位置）：批量并发时逐卡显示；姓名+进度+暂停/继续+终止 */}
-              {activeCasts.map((activeCast) => (
+              {/* 铸造中卡片组（始终在最前/最新位置）：批量并发时逐卡显示；姓名+进度+暂停/继续+终止；
+                  已核销入库（saved）的草稿不进主卡列表——它们只在草稿箱留痕 */}
+              {activeCasts.filter((c) => !c.saved).map((activeCast) => (
                 <li key={activeCast.castId} className="flex gap-3 rounded-xl border border-god/50 bg-god/5 p-3 transition-shadow duration-300 hover:shadow-md">
                   <span className="flex h-24 w-[72px] shrink-0 items-center justify-center rounded-md border border-god/40 bg-secondary">
                     {activeCast.done ? (
@@ -742,14 +969,19 @@ export default function Personas() {
                       <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
                         {activeCast.name ?? '新人格'}
                       </span>
-                      <Badge variant="default" className="px-1.5 text-[10px]">
+                      <Badge
+                        variant={activeCast.interrupted ? 'outline' : 'default'}
+                        className={`px-1.5 text-[10px] ${activeCast.interrupted ? 'border-amber-500/60 text-amber-600' : ''}`}
+                      >
                         {activeCast.done
                           ? activeCast.error
                             ? '铸造失败'
                             : '草稿已铸成'
-                          : activeCast.paused
-                            ? '已暂停'
-                            : '生成中'}
+                          : activeCast.interrupted
+                            ? '已中断'
+                            : activeCast.paused
+                              ? '已暂停'
+                              : '生成中'}
                       </Badge>
                     </div>
                     <p className="mb-1 truncate text-[11px] text-god">
@@ -765,22 +997,68 @@ export default function Personas() {
                     <div className="mt-auto flex items-center gap-1.5 pt-1">
                       {activeCast.done ? (
                         activeCast.error ? (
+                          <>
+                            <Button
+                              size="sm"
+                              className="h-7 px-2.5 text-xs"
+                              onClick={() => { setCastWake((n) => n + 1); void api.resumeCast(activeCast.castId) }}
+                            >
+                              <Play className="mr-1 h-3.5 w-3.5" aria-hidden />
+                              断点续铸
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 px-2 text-xs text-wolf hover:bg-wolf/10 hover:text-wolf"
+                              title="删除（放弃该生成进程的全部产物）"
+                              onClick={() => setDraftDeleteConfirm(activeCast.castId)}
+                            >
+                              <Trash2 className="h-3 w-3" aria-hidden />
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            <Button
+                              size="sm"
+                              className="h-7 px-2.5 text-xs"
+                              onClick={() => {
+                                setCastTarget(activeCast.castId)
+                                setCastOpen(true)
+                              }}
+                            >
+                              打开核对草稿
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 px-2 text-xs text-wolf hover:bg-wolf/10 hover:text-wolf"
+                              title="删除此草稿（不可恢复）"
+                              onClick={() => setDraftDeleteConfirm(activeCast.castId)}
+                            >
+                              <Trash2 className="h-3 w-3" aria-hidden />
+                            </Button>
+                          </>
+                        )
+                      ) : activeCast.interrupted ? (
+                        <>
+                          <Button
+                            size="sm"
+                            className="h-7 px-2.5 text-xs"
+                            onClick={() => { setCastWake((n) => n + 1); void api.resumeCast(activeCast.castId) }}
+                          >
+                            <Play className="mr-1 h-3.5 w-3.5" aria-hidden />
+                            继续铸造（断点续）
+                          </Button>
                           <Button
                             size="sm"
                             variant="ghost"
-                            className="h-7 px-2 text-xs"
-                            onClick={() => {
-                              void api.ackCast(activeCast.castId)
-                              setActiveCasts((prev) => prev.filter((x) => x.castId !== activeCast.castId))
-                            }}
+                            className="h-7 px-2 text-xs text-wolf hover:bg-wolf/10 hover:text-wolf"
+                            onClick={() => setCancelConfirm(activeCast.castId)}
                           >
-                            知道了
+                            <Square className="mr-1 h-3 w-3" aria-hidden />
+                            终止
                           </Button>
-                        ) : (
-                          <Button size="sm" className="h-7 px-2.5 text-xs" onClick={() => setCastOpen(true)}>
-                            打开核对草稿
-                          </Button>
-                        )
+                        </>
                       ) : (
                         <>
                           <Button
@@ -809,12 +1087,25 @@ export default function Personas() {
                             size="sm"
                             variant="ghost"
                             className="ml-auto h-7 px-2 text-xs text-muted-foreground"
-                            onClick={() => setCastOpen(true)}
+                            onClick={() => {
+                              setCastTarget(activeCast.castId)
+                              setCastOpen(true)
+                            }}
                           >
                             详情
                           </Button>
                         </>
                       )}
+                      {/* 留痕：查看生成进程各阶段已落库的研究文本（所有状态可看） */}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-xs text-muted-foreground"
+                        title="生成留痕（各阶段已生成的研究文本）"
+                        onClick={() => setTraceCastId(activeCast.castId)}
+                      >
+                        <History className="h-3.5 w-3.5" aria-hidden />
+                      </Button>
                     </div>
                   </div>
                 </li>
@@ -848,6 +1139,16 @@ export default function Personas() {
                           title="铸魂师资料不足时按心理学原型补全的参数数"
                         >
                           推断 {c.inferredCount}
+                        </Badge>
+                      ) : null}
+                      {COGNITION_NOTE_ENABLED && c.cognitionWritingAt ? (
+                        <Badge
+                          variant="outline"
+                          className="border-[#e0568a]/50 px-1.5 text-[10px] font-normal text-[#e0568a]"
+                          title="该人格正在书写自我认知笔记（完成后新篇出现在详情「认知笔记」页签）"
+                        >
+                          <Brain className="mr-1 h-3 w-3 animate-pulse" aria-hidden />
+                          认知书写中
                         </Badge>
                       ) : null}
                     </div>
@@ -1182,9 +1483,10 @@ export default function Personas() {
                     </div>
                   ))}
                 </div>
+                {COGNITION_NOTE_ENABLED ? (
                 <div className="space-y-1.5">
                   <Label>
-                    人格精粹
+                    自我认知笔记（第一人称）
                     <span className="ml-2 text-xs font-normal text-god">
                       对局注入专用（≤500 字行为指导）：完整档案再大，对局中驱动 TA 的就是这段
                     </span>
@@ -1201,6 +1503,7 @@ export default function Personas() {
                     心镜与涌现层只注入精粹与语气锚点，完整档案用于展示/心理检查/记事簿——保证信息量大但对局中不失效
                   </p>
                 </div>
+                ) : null}
               </section>
 
               {/* 参数：大五 */}
@@ -1353,7 +1656,19 @@ export default function Personas() {
       </Dialog>
 
       {/* ================= 详情弹窗 ================= */}
-      <Dialog open={detail !== null} onOpenChange={(open) => !open && setDetail(null)}>
+      <Dialog
+        open={detail !== null || detailLoading}
+        onOpenChange={(open) => {
+          if (!open) {
+            // 关闭弹窗即作废在途详情请求：慢响应不能再把弹窗"重新打开"（P2-23）
+            detailAbortRef.current?.abort()
+            detailReqRef.current += 1
+            detailCardIdRef.current = null
+            setDetailLoading(false)
+            setDetail(null)
+          }
+        }}
+      >
         <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-[min(1200px,94dvw)]">
           {detail ? (
             <>
@@ -1395,23 +1710,20 @@ export default function Personas() {
                 </div>
               </DialogHeader>
 
-              <Tabs defaultValue="profile">
+              <Tabs value={detailTab} onValueChange={setDetailTab}>
                 <TabsList>
                   <TabsTrigger value="profile">人物档案</TabsTrigger>
+                  {COGNITION_NOTE_ENABLED ? (
+                    <TabsTrigger value="cognition">认知笔记（{detail.cognitionNotes.length}）</TabsTrigger>
+                  ) : null}
                   <TabsTrigger value="params">人格参数</TabsTrigger>
                   <TabsTrigger value="memories">记忆（{detail.memories.length}）</TabsTrigger>
-                  <TabsTrigger value="relations">关系（{detail.relationships.length}）</TabsTrigger>
                   <TabsTrigger value="drift">漂移（{detail.drift.length}）</TabsTrigger>
                   <TabsTrigger value="reports">心理检查报告（{detailReports.length}）</TabsTrigger>
                 </TabsList>
 
                 <TabsContent value="profile" className="mt-4 space-y-3 text-sm">
-                  {detail.card.profile.essence ? (
-                    <div className="rounded-md border border-god/40 bg-god/5 p-3">
-                      <p className="mb-1 text-xs font-medium text-god">人格精粹（对局注入专用）</p>
-                      <p className="whitespace-pre-wrap leading-6">{detail.card.profile.essence}</p>
-                    </div>
-                  ) : null}
+
                   {(
                     [
                       ['性别', detail.card.profile.gender ? `${detail.card.profile.gender}（人称「${detail.card.profile.gender === '男' ? '他' : detail.card.profile.gender === '女' ? '她' : 'TA'}」）` : ''],
@@ -1458,6 +1770,112 @@ export default function Personas() {
                     </div>
                   ) : null}
                 </TabsContent>
+
+                {COGNITION_NOTE_ENABLED ? (
+                <TabsContent value="cognition" className="mt-4 space-y-4">
+                  {/* 现役自我认知（对局注入的唯一事实源）：最新笔记优先，无笔记时回落铸魂初稿 */}
+                  <div className="rounded-xl border border-god/40 bg-god/5 p-4">
+                    <p className="mb-1.5 flex items-center gap-2 text-[13px] font-semibold text-god">
+                      现役自我认知（对局以此为准）
+                      <Badge variant="outline" className="px-1.5 text-[10px] font-normal">第一人称</Badge>
+                      {cogWriting || detail.cognitionWritingAt != null ? (
+                        <Badge variant="outline" className="border-[#e0568a]/50 px-1.5 text-[10px] font-normal text-[#e0568a]">
+                          <Loader2 className="mr-1 h-3 w-3 animate-spin" aria-hidden />
+                          书写中…
+                        </Badge>
+                      ) : null}
+                      {detail.cognitionNotes.length > 0 ? (
+                        <span className="ml-auto flex gap-1">
+                          <Button
+                            size="sm" variant="ghost" className="h-6 px-2 text-[11px]"
+                            onClick={() => {
+                              setCogEditId(detail.cognitionNotes[0]!.id)
+                              setCogEditText(detail.cognitionNotes[0]!.content)
+                            }}
+                          >
+                            <Pencil className="mr-1 h-3 w-3" aria-hidden />编辑
+                          </Button>
+                          <Button
+                            size="sm" variant="ghost"
+                            className="h-6 px-2 text-[11px] text-wolf hover:bg-wolf/10"
+                            onClick={() => setCogDeleteId(detail.cognitionNotes[0]!.id)}
+                          >
+                            <Trash2 className="mr-1 h-3 w-3" aria-hidden />删除
+                          </Button>
+                        </span>
+                      ) : null}
+                    </p>
+                    {detail.cognitionNotes.length > 0 || detail.card.profile.essence ? (
+                      <p className="whitespace-pre-wrap text-sm leading-6">
+                        {detail.cognitionNotes[0]?.content ?? detail.card.profile.essence}
+                      </p>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        尚无自我认知笔记。人格将以铸魂档案参赛；点下方「记录认知」，让 TA 基于经历亲笔写下自我认知。
+                      </p>
+                    )}
+                  </div>
+                  {/* 赛后自动书写（不算对局内行为、不占状态环：心理检查完全结束后由参赛绑定模型自动开写） */}
+                  <div className="space-y-2.5 rounded-xl border border-border bg-secondary/20 p-3.5">
+                    <div className="flex items-center justify-between gap-3">
+                      <Label className="cursor-pointer text-xs font-normal leading-5 text-foreground">
+                        赛后自动书写（该人格心理检查完全结束后，由本局参赛绑定的 AI 模型亲笔开写）
+                      </Label>
+                      <Switch
+                        checked={autoCog.enabled}
+                        onCheckedChange={(v) => void saveAutoCog({ ...autoCog, enabled: v })}
+                      />
+                    </div>
+                    {autoCog.enabled ? (
+                      <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2">
+                        <Label className="cursor-pointer text-xs font-normal leading-5 text-muted-foreground">
+                          允许自由查看本局的心理检查报告（开=TA 自己决定翻不翻看；关=赛后只能在没看过报告的情况下书写）
+                        </Label>
+                        <Switch
+                          checked={autoCog.includeReports}
+                          onCheckedChange={(v) => void saveAutoCog({ ...autoCog, includeReports: v })}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs text-muted-foreground">
+                      书写时心理参数在后台塑形、绝不进文字（受影响而不自知）；旧篇沿革折叠保留
+                    </p>
+                    <Button size="sm" onClick={() => void openCognition()}>
+                      <NotebookPen className="h-4 w-4" aria-hidden />
+                      记录认知
+                    </Button>
+                  </div>
+                  {/* 沿革（新的在前；初稿=铸魂师代笔标注） */}
+                  {detail.cognitionNotes.length > 1 ? (
+                    <ul className="space-y-2 border-t border-border/60 pt-3">
+                      {detail.cognitionNotes.slice(1).map((n) => (
+                        <li key={n.id} className="rounded-xl border border-border p-3">
+                          <p className="mb-1 flex items-center text-[11px] text-muted-foreground">
+                            {formatTime(n.createdAt)} · 已参赛 {n.gameCount} 局时书写 · {n.model}
+                            {n.opts.includeReports || n.opts.includeDrift
+                              ? ` · 参考了${[n.opts.includeReports ? '心理检查报告' : '', n.opts.includeDrift ? '成长变化' : ''].filter(Boolean).join('与')}`
+                              : ''}
+                            <span className="ml-auto flex gap-1">
+                              <Button size="sm" variant="ghost" className="h-5 px-1.5 text-[10px]"
+                                onClick={() => { setCogEditId(n.id); setCogEditText(n.content) }}>
+                                <Pencil className="h-3 w-3" aria-hidden />
+                              </Button>
+                              <Button size="sm" variant="ghost"
+                                className="h-5 px-1.5 text-[10px] text-wolf hover:bg-wolf/10"
+                                onClick={() => setCogDeleteId(n.id)}>
+                                <Trash2 className="h-3 w-3" aria-hidden />
+                              </Button>
+                            </span>
+                          </p>
+                          <p className="whitespace-pre-wrap text-[13px] leading-6 text-muted-foreground">{n.content}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </TabsContent>
+                ) : null}
 
                 <TabsContent value="params" className="mt-4">
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -1543,9 +1961,7 @@ export default function Personas() {
                   ) : (
                     <ul className="space-y-2">
                       {/* 按记忆产生的时间先后排序（合乎人格变化的真实性），不按强度/刷新时间 */}
-                      {[...detail.memories]
-                        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-                        .map((m) => (
+                      {sortedMemories.map((m) => (
                         <li key={m.id} className="rounded-md border border-border p-3 text-sm">
                           <div className="mb-1 flex items-center gap-2">
                             <Badge variant={m.type === 'trauma' ? 'destructive' : 'outline'}>
@@ -1558,120 +1974,6 @@ export default function Personas() {
                           <p className="whitespace-pre-wrap leading-6">{m.content}</p>
                         </li>
                         ))}
-                    </ul>
-                  )}
-                </TabsContent>
-
-                <TabsContent value="relations" className="mt-4">
-                  {detail.relationships.length === 0 ? (
-                    <p className="py-8 text-center text-sm text-muted-foreground">
-                      暂无关系记录。人格在对局中与其他人格相遇后，关系图谱会自动生成并跨对局传递。
-                    </p>
-                  ) : (
-                    <ul className="space-y-2">
-                      {detail.relationships.map((r) => {
-                        // 人格锚点的关系才有沿革（无人格锚点每局一个锚点，本身就是逐局的）
-                        // 双向：我→TA（我的回写/补史）与 TA→我（对方的回写/补史）分组展示
-                        const history = r.targetPersonaId != null
-                          ? detail.relationshipHistory.filter(
-                              (h) => h.personaId === detail.card.id && h.targetName === r.targetName,
-                            )
-                          : []
-                        const incoming = r.targetPersonaId != null
-                          ? detail.relationshipHistory.filter(
-                              (h) => h.targetPersonaId === detail.card.id && h.personaId === r.targetPersonaId,
-                            )
-                          : []
-                        const incomingAgg = r.targetPersonaId != null
-                          ? detail.incomingRelationships.find((x) => x.personaId === r.targetPersonaId)
-                          : undefined
-                        const expandable = r.targetPersonaId != null
-                        const expanded = expandable && expandedRels.has(r.id)
-                        return (
-                          <li key={r.id} className="rounded-xl border border-border p-3 text-sm">
-                            <div
-                              className={cn(
-                                'flex items-center gap-2',
-                                expandable ? 'cursor-pointer select-none' : '',
-                                r.note || expanded ? 'mb-1' : '',
-                              )}
-                              onClick={() => {
-                                if (!expandable) return
-                                setExpandedRels((prev) => {
-                                  const next = new Set(prev)
-                                  if (next.has(r.id)) next.delete(r.id)
-                                  else next.add(r.id)
-                                  return next
-                                })
-                              }}
-                            >
-                              {expandable ? (
-                                expanded ? (
-                                  <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
-                                ) : (
-                                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
-                                )
-                              ) : null}
-                              <span className="font-medium">{r.targetName}</span>
-                              <Badge variant="outline">{r.relation || '未命名关系'}</Badge>
-                              <span className="text-xs text-muted-foreground">
-                                亲疏 {r.affinity} · 信任 {r.trust}
-                              </span>
-                              {expandable ? (
-                                <span className="ml-auto text-[11px] text-muted-foreground">
-                                  {history.length > 0 ? `沿革 ${history.length} 局` : '沿革从下一局开始记录'}
-                                </span>
-                              ) : null}
-                            </div>
-                            {r.note ? <p className="text-xs text-muted-foreground">{r.note}</p> : null}
-                            {expanded ? (
-                              <div className="mt-2 space-y-3 border-t border-border/60 pt-2">
-                                {(
-                                  [
-                                    ['我 → TA', history],
-                                    ['TA → 我', incoming],
-                                  ] as const
-                                ).map(([dirLabel, rows]) => (
-                                  <div key={dirLabel}>
-                                    <p className="mb-1 text-[11px] font-medium text-muted-foreground">
-                                      {dirLabel}
-                                      {dirLabel === 'TA → 我' && incomingAgg
-                                        ? `（现状：${incomingAgg.relation || '未命名'} · 亲疏 ${incomingAgg.affinity} · 信任 ${incomingAgg.trust}）`
-                                        : ''}
-                                    </p>
-                                    {rows.length === 0 ? (
-                                      <p className="py-0.5 text-xs text-muted-foreground/70">暂无记录</p>
-                                    ) : (
-                                      <ul className="space-y-1.5">
-                                        {rows.map((h) => (
-                                          <li key={h.id} className="rounded-md bg-secondary/40 px-2.5 py-1.5 text-xs">
-                                            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                                              <span className="font-mono text-muted-foreground">{h.titleNo || h.gameId?.slice(0, 8)}</span>
-                                              {h.backfill ? (
-                                                <Badge variant="secondary" className="px-1 text-[10px] font-normal" title="追溯回填：由历史对局日志事后蒸馏补史">
-                                                  溯
-                                                </Badge>
-                                              ) : null}
-                                              <Badge variant="outline" className="px-1 text-[10px] font-normal">
-                                                {h.relation || '未命名'}
-                                              </Badge>
-                                              <span className="text-muted-foreground">
-                                                亲疏 {h.affinityDelta >= 0 ? '+' : ''}{h.affinityDelta} → {h.affinity}
-                                                {' · '}信任 {h.trustDelta >= 0 ? '+' : ''}{h.trustDelta} → {h.trust}
-                                              </span>
-                                            </div>
-                                            {h.note ? <p className="mt-0.5 leading-5 text-muted-foreground">{h.note}</p> : null}
-                                          </li>
-                                        ))}
-                                      </ul>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            ) : null}
-                          </li>
-                        )
-                      })}
                     </ul>
                   )}
                 </TabsContent>
@@ -1736,6 +2038,11 @@ export default function Personas() {
                 </TabsContent>
               </Tabs>
             </>
+          ) : detailLoading ? (
+            <div className="flex min-h-[46vh] flex-col items-center justify-center gap-3 py-16 text-center">
+              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" aria-hidden />
+              <p className="text-sm text-muted-foreground">正在装载人格详情…</p>
+            </div>
           ) : null}
         </DialogContent>
       </Dialog>
@@ -1758,9 +2065,13 @@ export default function Personas() {
       {/* AI 铸造向导（铸魂师） */}
       <CastWizard
         open={castOpen}
-        onOpenChange={setCastOpen}
+        onOpenChange={(o) => {
+          setCastOpen(o)
+          if (!o) setCastTarget(null)
+        }}
         presets={presets}
         onDraftReady={handleDraftReady}
+        targetCastId={castTarget}
       />
 
       {/* 删除确认（软删入回收站） */}
@@ -1887,6 +2198,270 @@ export default function Personas() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* 草稿箱删除确认（草稿是用户资产：只有这里主动删除才会消失；持久化在草稿箱，重启/超时都不丢） */}
+      <AlertDialog open={draftDeleteConfirm !== null} onOpenChange={(open) => !open && setDraftDeleteConfirm(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              删除「{activeCasts.find((c) => c.castId === draftDeleteConfirm)?.name ?? '新人格'}」的生成进程与草稿？
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              该人格的生成进程、检查点、草稿与全部生成留痕将从草稿箱永久删除，不可恢复；已入库的人格卡不受影响。草稿箱只有这一种清空方式：你主动删除并确认——核对入库不会移除草稿，只会留下留痕。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>保留草稿</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-wolf text-white hover:bg-wolf/90"
+              onClick={() => {
+                if (draftDeleteConfirm) {
+                  void api.discardCastDraft(draftDeleteConfirm)
+                  setActiveCasts((prev) => prev.filter((x) => x.castId !== draftDeleteConfirm))
+                }
+                setDraftDeleteConfirm(null)
+              }}
+            >
+              删除草稿
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* 草稿箱（铸造产物的安身之处：逐条核对入库或删除；只有主动删除才消失） */}
+      <Dialog open={draftBoxOpen} onOpenChange={setDraftBoxOpen}>
+        <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Inbox className="h-5 w-5 text-god" aria-hidden />
+              草稿箱
+            </DialogTitle>
+            <DialogDescription>
+              生成进程的全程镜像在此驻留（排队/生成中/中断/失败/铸成/已入库），每步研究文本都可经「留痕」回看。
+              清库只有一个通道：你主动删除并确认——核对入库不再移除草稿。
+            </DialogDescription>
+          </DialogHeader>
+          {draftCasts.length === 0 ? (
+            <p className="py-8 text-center text-sm text-muted-foreground">
+              草稿箱是空的。生成进程从一开始就在此驻留（排队/生成中/中断/失败/铸成/已入库）——只有你主动删除并确认，才会移除。
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {draftCasts.map((c) => {
+                const st = c.saved
+                  ? 'saved' as const
+                  : c.done && c.result
+                  ? 'done' as const
+                  : c.interrupted
+                    ? 'interrupted' as const
+                    : c.done && c.error
+                      ? 'failed' as const
+                      : 'running' as const
+                return (
+                  <li key={c.castId} className="flex items-center gap-3 rounded-xl border border-god/40 bg-god/5 p-3">
+                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-god/40 bg-secondary">
+                      {st === 'done' || st === 'saved' ? (
+                        <Sparkles className="h-5 w-5 text-god" aria-hidden />
+                      ) : st === 'running' ? (
+                        <Loader2 className={`h-5 w-5 text-god ${c.paused ? '' : 'animate-spin'}`} aria-hidden />
+                      ) : (
+                        <CircleAlert className="h-5 w-5 text-amber-600" aria-hidden />
+                      )}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="flex items-center gap-2 truncate text-sm font-medium text-foreground">
+                        {c.name ?? '新人格'}
+                        <Badge variant="outline" className={`px-1 text-[10px] font-normal ${st === 'interrupted' || st === 'failed' ? 'border-amber-500/60 text-amber-600' : ''}`}>
+                          {st === 'done' ? '草稿已铸成' : st === 'saved' ? '已入库' : st === 'interrupted' ? '已中断' : st === 'failed' ? '失败' : c.paused ? '已暂停' : '生成中'}
+                        </Badge>
+                      </p>
+                      <p className="truncate text-[11px] text-muted-foreground">
+                        {st === 'done' ? `铸成于 ${formatTime(new Date(c.updatedAt).toISOString())}` : st === 'saved' ? c.label : (c.error ?? c.label)}
+                      </p>
+                    </div>
+                    {/* 留痕：所有状态都可回看各阶段已落库的研究文本 */}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs text-muted-foreground"
+                      title="生成留痕（各阶段已生成的研究文本）"
+                      onClick={() => setTraceCastId(c.castId)}
+                    >
+                      <History className="h-3.5 w-3.5" aria-hidden />
+                    </Button>
+                    {st === 'done' ? (
+                      <Button
+                        size="sm"
+                        className="h-7 px-2.5 text-xs"
+                        onClick={() => {
+                          setDraftBoxOpen(false)
+                          setCastTarget(c.castId)
+                          setCastOpen(true)
+                        }}
+                      >
+                        核对草稿
+                      </Button>
+                    ) : st === 'running' ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 px-2.5 text-xs"
+                        onClick={() => {
+                          setDraftBoxOpen(false)
+                          setCastTarget(c.castId)
+                          setCastOpen(true)
+                        }}
+                      >
+                        查看进度
+                      </Button>
+                    ) : st === 'saved' ? null : (
+                      <Button
+                        size="sm"
+                        className="h-7 px-2.5 text-xs"
+                        onClick={() => { setCastWake((n) => n + 1); void api.resumeCast(c.castId) }}
+                      >
+                        <Play className="mr-1 h-3.5 w-3.5" aria-hidden />
+                        断点续铸
+                      </Button>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs text-wolf hover:bg-wolf/10 hover:text-wolf"
+                      title="删除（放弃该进程的全部产物）"
+                      onClick={() => setDraftDeleteConfirm(c.castId)}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                    </Button>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* 生成留痕查看器（进度标记点+阶段文本；生成卡与草稿箱共用入口） */}
+      <CastTraceDialog castId={traceCastId} onClose={() => setTraceCastId(null)} />
+
+      {/* 记录认知（自我认知笔记书写）：API 存档选择 + 可见性开关（参数永远不可见） */}
+      {COGNITION_NOTE_ENABLED ? (
+      <Dialog open={cogOpen} onOpenChange={setCogOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <NotebookPen className="h-5 w-5 text-god" aria-hidden />
+              记录认知——「{detail?.card.name}」的自我认知笔记
+            </DialogTitle>
+            <DialogDescription className="leading-6">
+              TA 将以第一人称亲笔书写：基于档案、记忆与关系（不含数值），心理参数在后台塑形但绝不进文字。
+              不是谁都会自省乃至去看心理医生——可见性开关决定 TA 书写时能读到多少"成文的反馈"。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label>书写所用 AI（来自 API 存档）</Label>
+              <Select value={cogPresetId} onValueChange={setCogPresetId}>
+                <SelectTrigger className="h-9">
+                  <SelectValue placeholder="选择存档（默认第一个）" />
+                </SelectTrigger>
+                <SelectContent>
+                  {presets.map((pr) => (
+                    <SelectItem key={pr.id} value={String(pr.id)}>
+                      {pr.name}（{pr.model}）
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2.5 rounded-lg border border-border bg-card p-3.5">
+              <div className="flex items-center justify-between gap-3">
+                <Label className="cursor-pointer text-xs font-normal leading-5 text-muted-foreground">
+                  允许 TA 读自己的心理检查报告（不限本局的深度自省，默认关）
+                </Label>
+                <Switch checked={cogIncludeReports} onCheckedChange={setCogIncludeReports} />
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <Label className="cursor-pointer text-xs font-normal leading-5 text-muted-foreground">
+                  允许 TA 读到自己的成长变化记录（人话版漂移，无数值）
+                </Label>
+                <Switch checked={cogIncludeDrift} onCheckedChange={setCogIncludeDrift} />
+              </div>
+              <p className="border-t border-border/60 pt-2 text-[11px] leading-4 text-muted-foreground">
+                心理参数数值永远不可见——TA 只会受其影响，不会意识到其存在。
+              </p>
+            </div>
+            <div className="flex justify-end">
+              <Button onClick={() => void handleWriteCognition()} disabled={presets.length === 0}>
+                <NotebookPen className="h-4 w-4" aria-hidden />
+                开始书写（后台进行，可多人格并行）
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+      ) : null}
+
+      {/* 认知笔记编辑（就地文本；最新篇被编辑时现役认知同步） */}
+      {COGNITION_NOTE_ENABLED ? (
+      <Dialog open={cogEditId !== null} onOpenChange={(o) => !o && setCogEditId(null)}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>编辑认知笔记</DialogTitle>
+            <DialogDescription>直接修订文字；若这是最新一篇，现役自我认知会同步更新。</DialogDescription>
+          </DialogHeader>
+          <Textarea
+            rows={10}
+            value={cogEditText}
+            onChange={(e) => setCogEditText(e.target.value)}
+          />
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setCogEditId(null)}>取消</Button>
+            <Button
+              disabled={!cogEditText.trim()}
+              onClick={() => {
+                if (!detail || cogEditId === null) return
+                void api
+                  .updateCognitionNote({ noteId: cogEditId, personaId: detail.card.id, content: cogEditText.trim() })
+                  .then(() => openDetail(detail.card.id))
+                setCogEditId(null)
+              }}
+            >
+              保存
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      ) : null}
+
+      {/* 认知笔记删除确认（最新篇被删则现役认知回退到新的最新篇） */}
+      {COGNITION_NOTE_ENABLED ? (
+      <AlertDialog open={cogDeleteId !== null} onOpenChange={(o) => !o && setCogDeleteId(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除这篇认知笔记？</AlertDialogTitle>
+            <AlertDialogDescription>
+              删除后不可恢复；若删的是最新一篇，现役自我认知将回退到剩余的最新一篇（一篇不剩则保留现状文本）。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-wolf text-white hover:bg-wolf/90"
+              onClick={() => {
+                if (!detail || cogDeleteId === null) return
+                void api
+                  .deleteCognitionNote({ noteId: cogDeleteId, personaId: detail.card.id })
+                  .then(() => openDetail(detail.card.id))
+                setCogDeleteId(null)
+              }}
+            >
+              删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      ) : null}
     </div>
   )
 }

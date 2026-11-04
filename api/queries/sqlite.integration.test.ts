@@ -50,6 +50,9 @@ beforeEach(async () => {
     tbl.personaReports,
     tbl.personaDriftLog,
     tbl.personaRelationshipHistory,
+    tbl.personaCastDrafts,
+    tbl.personaCognitionNotes,
+    tbl.personaCastCheckpoints,
     tbl.personaRelationships,
     tbl.personaMemories,
     tbl.personas,
@@ -303,7 +306,7 @@ describe("SQLite 方言：图书馆与赛前学习笔记", () => {
   });
 });
 
-describe("SQLite 方言：人格研究库", () => {  const personaInput = () => ({
+describe("SQLite 方言：人格研究站", () => {  const personaInput = () => ({
     name: "曹操",
     originName: "曹操",
     originSource: "《三国演义》",
@@ -321,8 +324,19 @@ describe("SQLite 方言：人格研究库", () => {  const personaInput = () => 
 
   it("create/get/list/update/remove 全链路（profile/params JSON 往返、按用户隔离）", async () => {
     await seedUser();
-    const created = await personasQ.createPersona(UID, personaInput());
+    const input = personaInput();
+    input.profile.canonRelations = [{ name: "刘备", kind: "rival", positivity: 0, negativity: 70, trust: 10 }];
+    input.profile.selfAliases = ["孟德"];
+    input.profile.nicknames = [{ text: "阿瞒", layer: "public", awareness: "all", usage: "all" }];
+    const created = await personasQ.createPersona(UID, input);
     expect(created.id).toBeGreaterThan(0);
+    const db = getDb();
+    const relations = await db.select().from(tbl.personaRelations);
+    const aliases = await db.select().from(tbl.personaAliases);
+    const nicknames = await db.select().from(tbl.personaNicknameIndex);
+    expect(relations).toHaveLength(0);
+    expect(aliases).toHaveLength(0);
+    expect(nicknames).toHaveLength(0);
     expect(created.profile.summary).toContain("多疑善谋");
     expect(created.params.bigFive.neuroticism).toBe(50);
     expect(created.params.inferred).toEqual(["bigFive.agreeableness"]);
@@ -364,6 +378,12 @@ describe("SQLite 方言：人格研究库", () => {  const personaInput = () => 
       personaId: created.id, targetPersonaId: null, targetName: "刘备",
       relation: "宿怨", affinity: -70, trust: 10, note: "被其连环计所害", gameId: "g-x",
     });
+    // 2026-10-22 单一事实源：详情关系读取新表 persona_relations
+    await db.insert(tbl.personaRelations).values({
+      fromPersonaId: created.id, toPersonaId: 0, toName: "刘备", layer: "vale", kind: "nemesis", form: "EM",
+      positivity: 0, negativity: 70, trust: 10, basis: "被其连环计所害", status: "active", originModule: "migration",
+      createdAt: new Date(), updatedAt: new Date(),
+    } as never);
     await db.insert(tbl.personaDriftLog).values({
       personaId: created.id, gameId: "g-x",
       changes: [{ path: "attachment.anxiety", from: 30, to: 45, reason: "被盟友背叛" }], note: "首局后漂移",
@@ -407,6 +427,7 @@ describe("SQLite 方言：人格研究库", () => {  const personaInput = () => 
     expect(await personasQ.destroyPersona(created.id, UID)).toBe(true);
     expect((await db.select().from(tbl.personaMemories)).length).toBe(0);
     expect((await db.select().from(tbl.personaRelationships)).length).toBe(0);
+    expect((await db.select().from(tbl.personaRelations)).length).toBe(0);
     expect((await db.select().from(tbl.personaDriftLog)).length).toBe(0);
     expect((await db.select().from(tbl.personas)).length).toBe(0);
     expect((await db.select().from(tbl.personaReports)).length).toBe(1);
@@ -549,10 +570,13 @@ describe("persona_relationship_history（关系沿革：追加写+正序读）",
     });
 
     // 汇总行：累计值（亲和 -30+10=-20；信任 50-20+15=45）
-    const rels = await personasQ.listPersonaRelationships(pid, u!.id);
-    expect(rels!.length).toBe(1);
-    expect(rels![0]!.affinity).toBe(-20);
-    expect(rels![0]!.trust).toBe(45);
+    // 2026-10-22：旧表仅作为过渡投影（notebook 双写），详情页改读 persona_relations；
+    // 这里直接查旧表验证 upsertPersonaRelationship 的投影语义。
+    const db = getDb();
+    const summaryRows: any[] = await db.select().from(tbl.personaRelationships);
+    expect(summaryRows.length).toBe(1);
+    expect(summaryRows[0]!.affinity).toBe(-20);
+    expect(summaryRows[0]!.trust).toBe(45);
 
     // 历史行：两条、正序、快照与汇总结算值一致
     const hist = await personasQ.listPersonaRelationshipHistory(pid, u!.id);
@@ -564,5 +588,79 @@ describe("persona_relationship_history（关系沿革：追加写+正序读）",
     expect(hist![1]!.trust).toBe(45);
     expect(hist![0]!.backfill).toBe(false); // 赛后实时回写
     expect(hist![1]!.backfill).toBe(true); // 追溯回填标记
+  });
+});
+
+describe("persona_cast_drafts（草稿箱：落库/水合列表/取走删除）", () => {
+  it("草稿落库 → 列表可取 → 删除即消失（幂等覆盖同 castId）", async () => {
+    const draft = { draft: { name: "五条悟" } };
+    await personasQ.upsertPersonaCastDraft({ castId: "c1", userId: "u1", name: "五条悟", result: draft });
+    await personasQ.upsertPersonaCastDraft({ castId: "c1", userId: "u1", name: "五条悟·改", result: draft });
+    let rows = await personasQ.listPersonaCastDrafts();
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.name).toBe("五条悟·改"); // 幂等覆盖
+    expect((rows[0]!.result as { draft: { name: string } }).draft.name).toBe("五条悟");
+    await personasQ.deletePersonaCastDraft("c1");
+    rows = await personasQ.listPersonaCastDrafts();
+    expect(rows.length).toBe(0);
+  });
+});
+
+describe("personas.auto_cognition（赛后自动书写设置）", () => {
+  it("设置写入/读回/关闭", async () => {
+    await users.insertUser({ id: "autocog-u", email: "ac@example.com", username: "自动书写", avatar: "", passwordHash: await hashPassword("password123"), settings: null });
+    const c = await personasQ.createPersona(
+      "autocog-u",
+      { name: "测试人格", params: defaultPersonaParams(), profile: emptyPersonaProfile() },
+      "manual",
+    );
+    expect(c.autoCognition ?? null).toBeNull(); // 默认关闭
+    await personasQ.setPersonaAutoCognition(c.id, "autocog-u", { enabled: true, includeReports: true, includeDrift: false });
+    let got = await personasQ.getPersona(c.id, "autocog-u");
+    expect(got!.autoCognition).toEqual({ enabled: true, includeReports: true, includeDrift: false });
+    await personasQ.setPersonaAutoCognition(c.id, "autocog-u", null);
+    got = await personasQ.getPersona(c.id, "autocog-u");
+    expect(got!.autoCognition ?? null).toBeNull();
+  });
+});
+
+describe("persona_cast_checkpoints（铸造检查点：中断续铸的地基）", () => {
+  it("逐阶段落盘/覆盖/读取/清除", async () => {
+    await personasQ.upsertCastCheckpoint("c1", "params", { name: "曹操" });
+    await personasQ.upsertCastCheckpoint("c1", "dossier", { dossier: "档案正文" });
+    await personasQ.upsertCastCheckpoint("c1", "params", { name: "曹操·改" }); // 覆盖
+    const ck = await personasQ.listCastCheckpoints("c1");
+    expect((ck.params as { name: string }).name).toBe("曹操·改");
+    expect((ck.dossier as { dossier: string }).dossier).toBe("档案正文");
+    const all = await personasQ.listAllCastCheckpointParams();
+    expect(all.get("c1")).toBeTruthy();
+    await personasQ.deleteCastCheckpoints("c1");
+    expect(Object.keys(await personasQ.listCastCheckpoints("c1"))).toHaveLength(0);
+    expect((await personasQ.listAllCastCheckpointParams()).has("c1")).toBe(false);
+  });
+});
+
+describe("persona_cast_drafts（草稿箱：进程镜像与清库唯一通道）", () => {
+  it("upsert 落库 → setCastDraftStatus 状态推进 → saved 保留 → 删除连清", async () => {
+    await personasQ.upsertPersonaCastDraft({
+      castId: "d1", userId: "u1", name: "探针人格", result: { draft: { name: "探针人格" } }, status: "done",
+    });
+    let rows = await personasQ.listPersonaCastDrafts();
+    expect(rows.find((r) => r.castId === "d1")?.status).toBe("done");
+
+    // 核销语义：状态转 saved（草稿与 result 保留，绝不删除）
+    await personasQ.setCastDraftStatus("d1", "saved");
+    rows = await personasQ.listPersonaCastDrafts();
+    const saved = rows.find((r) => r.castId === "d1");
+    expect(saved?.status).toBe("saved");
+    expect((saved?.result as { draft: { name: string } }).draft.name).toBe("探针人格");
+
+    // 状态推进幂等可逆（排队→生成中→完成→已入库各态都能写）
+    await personasQ.setCastDraftStatus("d1", "running");
+    expect((await personasQ.listPersonaCastDrafts()).find((r) => r.castId === "d1")?.status).toBe("running");
+
+    // 用户主动删除=唯一清库口
+    await personasQ.deletePersonaCastDraft("d1");
+    expect((await personasQ.listPersonaCastDrafts()).find((r) => r.castId === "d1")).toBeUndefined();
   });
 });

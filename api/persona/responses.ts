@@ -66,13 +66,23 @@ export function extractResponsesText(data: unknown): string {
 
 /** 累加 Responses API 的 SSE 流：response.output_text.delta 拼接正文；
  * response.completed 的完整对象优先（含全部 output）；response.failed/error 事件抛错 */
+export interface ResponsesStreamResult {
+  text: string;
+  /** ★ 服务端是否真的执行了 web_search（由流事件实证，不靠调用方假设）*/
+  searched: boolean;
+  /** 搜索调用次数 */
+  searchCount: number;
+}
+
 export async function accumulateResponsesStream(
   res: Response,
   onText?: (accumulated: string) => void,
-): Promise<string> {
+): Promise<ResponsesStreamResult> {
   let text = "";
   let finalObj: unknown = null;
   let errMsg: string | null = null;
+  let searched = false;
+  let searchCount = 0;
   for await (const data of iterSseData(res)) {
     if (data === "[DONE]") break;
     let json: Record<string, unknown>;
@@ -81,7 +91,13 @@ export async function accumulateResponsesStream(
     } catch {
       continue;
     }
-    const type = json?.type;
+    const type = String(json?.type ?? "");
+    // ★ 关键：Responses API 的联网检索会发 web_search_call.* 事件。
+    //   此前完全没监听，导致「是否联网」全靠调用方猜——DeepSeek 明明没搜也被标成 webSearched: true。
+    if (type.includes("web_search_call")) {
+      searched = true;
+      if (type.includes("completed") || type === "response.web_search_call") searchCount++;
+    }
     if (type === "response.output_text.delta" && typeof json.delta === "string" && json.delta) {
       text += json.delta;
       onText?.(text);
@@ -97,11 +113,26 @@ export async function accumulateResponsesStream(
     }
   }
   if (errMsg) throw new Error(errMsg);
+  // 兜底：completed 对象里也可能带 web_search_call（非流式场景）
+  if (finalObj && !searched) {
+    const out = (finalObj as { output?: { type?: string }[] }).output;
+    if (Array.isArray(out) && out.some((o) => String(o?.type ?? "").includes("web_search_call"))) {
+      searched = true;
+      searchCount = Math.max(1, searchCount);
+    }
+  }
   if (finalObj) {
     const full = extractResponsesText(finalObj);
-    if (full) return full;
+    if (full) return { text: full, searched, searchCount };
   }
-  return text.trim();
+  return { text: text.trim(), searched, searchCount };
+}
+
+export interface ResponsesResult {
+  text: string;
+  /** ★ 服务端是否真的执行了网页搜索（实证值，不是假设）*/
+  searched: boolean;
+  searchCount: number;
 }
 
 /** 调用 Responses API（可选挂 web_search 服务端工具） */
@@ -109,15 +140,17 @@ export async function callResponsesApi(
   cfg: AiTestInput,
   system: string,
   user: string,
-  opts?: { webSearch?: boolean },
-): Promise<string> {
+  opts?: { webSearch?: boolean; maxOutputTokens?: number },
+): Promise<ResponsesResult> {
   await castCheckpoint(); // 暂停/终止控制点
   const url = `${cfg.baseUrl.replace(/\/+$/, "")}/responses`;
   const body: Record<string, unknown> = {
     model: cfg.model,
     instructions: system,
     input: user,
-    max_output_tokens: 4096,
+    // ★ 穷举「全部关系事件」时 4096 远远不够——输出 JSON 会被截断成空。
+    //   默认提到 16384；调用方可显式指定。
+    max_output_tokens: opts?.maxOutputTokens ?? 16384,
     stream: true,
     // 不传 temperature：部分 Responses 模型（gpt-5 系/思考态）拒绝该参数
     ...(opts?.webSearch
@@ -129,7 +162,7 @@ export async function callResponsesApi(
     status: number;
     data: unknown;
     raw: string;
-    streamText: string | null;
+    stream: ResponsesStreamResult | null;
   }> => {
     const res = await fetchWithRetryPersona(url, {
       method: "POST",
@@ -138,7 +171,7 @@ export async function callResponsesApi(
     });
     const ct = res.headers.get("content-type") ?? "";
     if (res.status >= 200 && res.status < 300 && body.stream === true && ct.includes("text/event-stream")) {
-      return { status: res.status, data: null, raw: "", streamText: await accumulateResponsesStream(res, chars) };
+      return { status: res.status, data: null, raw: "", stream: await accumulateResponsesStream(res, chars) };
     }
     const raw = await res.text();
     let data: unknown = raw;
@@ -147,13 +180,13 @@ export async function callResponsesApi(
     } catch {
       /* 保留原文 */
     }
-    return { status: res.status, data, raw, streamText: null };
+    return { status: res.status, data, raw, stream: null };
   };
-  let { status, data, raw, streamText } = await post();
+  let { status, data, raw, stream } = await post();
   // 端点不支持 SSE 流式：400 时去掉 stream 重试
   if (status === 400 && body.stream === true) {
     delete body.stream;
-    ({ status, data, raw, streamText } = await post());
+    ({ status, data, raw, stream } = await post());
   }
   if (status < 200 || status >= 300) {
     const msg =
@@ -166,7 +199,15 @@ export async function callResponsesApi(
         : `HTTP ${status}: ${String(msg).slice(0, 200)}`,
     );
   }
-  const text = streamText ?? extractResponsesText(data);
-  if (!text) throw new Error("Responses API 返回内容为空");
-  return text;
+  const text = stream?.text ?? extractResponsesText(data);
+  const searched = stream?.searched ?? false;
+  const searchCount = stream?.searchCount ?? 0;
+  if (!text) {
+    // 把「是否搜索过」带进错误信息，便于区分「没联网所以空」和「联网了但没输出」
+    throw new Error(
+      (searched ? "联网已执行但模型未产出正文" : "模型未调用联网工具且未产出正文") +
+        "（Responses API 返回空）",
+    );
+  }
+  return { text, searched, searchCount };
 }

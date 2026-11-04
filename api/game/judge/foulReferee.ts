@@ -12,7 +12,7 @@
 // ============================================================
 
 import type { RoleId, SeatAiConfig } from "../../../contracts/game";
-import { ROLE_META } from "../../../contracts/game";
+import { BOARDS, ROLE_META, boardRulesText } from "../../../contracts/game";
 import type { EngineEvent } from "../engine/api";
 import { appendDecision } from "../../queries/decisions";
 import { callAi } from "../ai/providers";
@@ -75,6 +75,7 @@ export function buildFoulCheckPrompt(opts: {
   eventTitle: string;
   day: number;
   speech: string;
+  rulesText?: string; // 本局官方规则全文（裁判的规则认知与引擎同一事实源）
 }): { system: string; user: string } {
   const system = [
     "你是狼人杀对局的裁判，负责审查玩家公开发言是否触犯规则红线。你只输出 JSON，禁止任何其他文字。",
@@ -82,6 +83,7 @@ export function buildFoulCheckPrompt(opts: {
   ].join("\n");
   const user = [
     `【发言者】${opts.seat}号玩家（真实身份：${opts.roleName}——裁判专用，绝不外泄）`,
+    opts.rulesText ? `【本局官方规则】（判罚的规则准绳；玩家对规则的错误认知本身不等于犯规，犯规仅以下列标准判定）\n${opts.rulesText}` : "",
     `【发言场景】第${opts.day}天 · ${opts.eventTitle}`,
     `【发言内容】${opts.speech.slice(0, 900)}`,
     "",
@@ -89,12 +91,15 @@ export function buildFoulCheckPrompt(opts: {
     "1. 违规亮牌自证（unauthorizedReveal）：没有翻牌权的玩家，在公开发言中翻开、亮出、展示自己的真实身份底牌以自证（如「我把牌翻开给大家看，是民牌」「（把底牌亮出来）」）。",
     "   有翻牌权、不算犯规的情形：白痴被放逐时翻牌免死；骑士翻牌决斗；猎人/狼王出局开枪亮身份；白狼王自爆带人；狼人自爆。",
     "   关键区分：口头声称「我是平民/我是预言家」是正常发言，不是亮牌——只有「翻牌/亮牌/展示底牌」这一动作描写才算违规。",
+    "   正面朝下、背面朝上、反面朝上、扣牌，以及仅移动/撂动卡牌都不等于翻牌亮牌；必须能引用身份牌面变得公开可见的具体动作才可判，证据不足一律不判。",
     "2. AI身份泄露（aiLeak）：自称或暗示自己是 AI、人工智能、语言模型、程序、机器人。",
     "3. 元游戏言论（metaGaming）：提及提示词、系统指令、状态报告、模拟实验、开发者等游戏世界外的存在。",
     "",
     "【输出契约】严格输出 JSON：",
     '{"foul":false} 或 {"foul":true,"type":"unauthorizedReveal|aiLeak|metaGaming","evidence":"犯规原句（≤50字）","verdict":"判罚理由一句"}',
-  ].join("\n");
+  ]
+    .filter((x) => x !== "")
+    .join("\n");
   return { system, user };
 }
 
@@ -116,6 +121,20 @@ export function parseFoulVerdict(text: string): FoulVerdict | null {
     evidence: String(o.evidence ?? "").trim().slice(0, 80),
     verdict: String(o.verdict ?? "").trim().slice(0, 120),
   };
+}
+
+const CONCEALED_CARD_RE = /(?:正面|牌面|底牌|卡面)朝下|背面朝上|反面朝上|牌背朝上|扣(?:在|到|于)?桌/;
+const REVEAL_ACTION_RE = /翻开|翻起|亮出|亮牌|展示.{0,8}(?:底牌|身份牌|卡牌|牌面)|正面朝上|牌面朝上|底牌朝上|正过来/;
+
+/** 亮牌判罚的证据闸门：AI 裁决也必须被原句支持，隐瞒面动作不得解释为公开亮牌。 */
+export function isFoulVerdictApplicable(verdict: FoulVerdict, speech: string): boolean {
+  if (!verdict.foul) return false;
+  if (verdict.type !== "unauthorizedReveal") return true;
+  // 全文只有扣牌/背面动作时，即使裁判给出笼统“亮牌”结论也不得成立。
+  if (CONCEALED_CARD_RE.test(speech) && !REVEAL_ACTION_RE.test(speech)) return false;
+  const evidence = verdict.evidence?.trim() ?? "";
+  if (!evidence || CONCEALED_CARD_RE.test(evidence)) return false;
+  return REVEAL_ACTION_RE.test(evidence);
 }
 
 /** 公开发言事件落盘后触发犯规审查（非阻塞）：在飞则排队，判罚落定前逐条审查 */
@@ -158,19 +177,21 @@ async function runFoulQueue(gameId: string, rt: GameRuntime): Promise<void> {
     const roleName =
       ROLE_META[rt.engine.getSnapshot().players.find((p) => p.seat === ev.actor)?.role as RoleId]
         ?.name ?? "未知身份";
+    const foulBoard = BOARDS.find((b) => b.id === rt.boardId);
     const prompt = buildFoulCheckPrompt({
       seat: ev.actor!,
       roleName,
       eventTitle: ev.title,
       day: ev.day,
       speech: ev.content,
+      rulesText: foulBoard ? boardRulesText(foulBoard, rt.options.sheriffEnabled) : undefined,
     });
     const res = await callAi(cfg, prompt.system, prompt.user, {
       timeoutMs: FOUL_CHECK_TIMEOUT_MS,
       maxRetries: 0,
     }).catch(() => null);
     const verdict = res?.ok && res.text ? parseFoulVerdict(res.text) : null;
-    if (verdict?.foul) {
+    if (verdict && isFoulVerdictApplicable(verdict, ev.content)) {
       await settleFoul(gameId, rt, ev, verdict);
       rt.foulQueue = [];
       return;

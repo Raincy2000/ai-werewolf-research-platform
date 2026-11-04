@@ -13,12 +13,22 @@ export function serveStaticFiles(app: App) {
   //   · 开发：vite dev 直接加载 api/lib/vite.ts（import.meta.dirname = <root>/api/lib）
   // 以「存在 index.html」为准多候选探测，绝不依赖单一布局假设。
   const candidates = [
+    // 生产（打包后）：boot.js 在 <resources>/dist，前端在 <resources>/dist/public
+    path.resolve(import.meta.dirname, "../dist/public"),
+    // 兜底：portable 自解压异常时 resourcesPath 仍指向同一处
+    ...((process as unknown as { resourcesPath?: string }).resourcesPath
+      ? [path.resolve((process as unknown as { resourcesPath: string }).resourcesPath, "dist/public")]
+      : []),
+    // 开发/直接 node 运行
     path.resolve(process.cwd(), "dist/public"),
     path.resolve(import.meta.dirname, "../../dist/public"),
-    path.resolve(import.meta.dirname, "../dist/public"),
   ];
-  const distPath =
-    candidates.find((p) => fs.existsSync(path.join(p, "index.html"))) ?? candidates[0];
+  const found = candidates.find((p) => fs.existsSync(path.join(p, "index.html")));
+  const distPath = found ?? candidates[0];
+  if (!found) {
+    // 便于排障：把实际探测过的路径打到 desktop.log（stderr 会被主进程转发）
+    console.error("[serveStatic] 未找到前端产物，已探测：", candidates.join(" | "));
+  }
 
   // 带内容 hash 的构建产物（/assets/*.js|css）：长效缓存，二次访问秒开（移动端弱网收益最大）
   app.use("/assets/*", async (c, next) => {

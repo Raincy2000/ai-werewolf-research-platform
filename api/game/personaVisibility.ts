@@ -103,6 +103,26 @@ export function buildPersonaCircleText(
   return lines.join("\n");
 }
 
+/** 赛后把人格名与权威出局时间直接绑定，避免模型只做间接的座位关联。 */
+export function buildPostgamePersonaFactText(
+  seat: number,
+  bindings: PersonaCircleBinding[],
+  deathTimeline: Record<number, string> | undefined,
+  visibility: PersonaVisibility | undefined,
+  fogSeats: number[] | undefined,
+): string {
+  void seat;
+  const vis = visibility ?? "full";
+  if (vis === "none") return "";
+  const fog = new Set(vis === "partial" ? (fogSeats ?? []) : []);
+  const lines = bindings
+    .filter((b) => !fog.has(b.seat))
+    .sort((a, b) => a.seat - b.seat)
+    .map((b) => `${b.seat}号${b.name}=${deathTimeline?.[b.seat] ?? "存活至对局结束"}`);
+  if (lines.length === 0) return "";
+  return `【赛后人格出局对照】${lines.join("；")}`;
+}
+
 /** 把圈层文本注入基础 prompt 的 user 段——必须落在【输出契约】之前：
  *  人格管线（单/双程）会截断契约之后的部分另接人格契约，尾部追加会被静默切断
  *  （对局 20260930001 实锤：圈层文本全程未达 AI，人格玩家互不认识）。 */

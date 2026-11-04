@@ -136,7 +136,7 @@ describe("批量并发铸造编排", () => {
     });
     expect(items).toHaveLength(3);
 
-    // 闸门观测：进行中任务数峰值
+    // 闸门观测：进行中任务数峰值（队列化后：排队中条目不占并发窗，不计入 running）
     let maxRunning = 0;
     const deadline = Date.now() + 30_000;
     const doneSet = new Set<string>();
@@ -144,7 +144,7 @@ describe("批量并发铸造编排", () => {
       let running = 0;
       for (const it of items) {
         const p = getCastProgress(it.castId, "u-batch");
-        if (p && !p.done) running++;
+        if (p && !p.done && !p.label.startsWith("排队中")) running++;
         if (p?.done) doneSet.add(it.castId);
       }
       maxRunning = Math.max(maxRunning, running);

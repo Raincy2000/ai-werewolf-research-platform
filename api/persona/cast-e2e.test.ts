@@ -191,7 +191,8 @@ describe("铸魂师铸造全链路 E2E（异步任务 + 流式 mock 端点）", 
     expect(result.draft.params.attachment.avoidance).toBe(45);
     expect(result.draft.params.defenseMechanisms).toHaveLength(2);
     expect(result.draft.profile.quotes).toEqual(["少说，多做。"]);
-    expect(result.draft.profile.essence).toContain("想靠近却先推开");
+    // 认知笔记已下线：铸造不再产出该字段（恒为空串）
+    expect(result.draft.profile.essence).toBe("");
     // 未联网 → 全部参数标推断（客户端编辑器可据此提示核对）
     expect(result.draft.params.inferred.length).toBeGreaterThan(10);
 

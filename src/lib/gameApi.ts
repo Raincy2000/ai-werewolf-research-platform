@@ -26,11 +26,13 @@ import type {
   GuideOverview,
   GuideVersionSummary,
   PollResult,
+  RoleId,
 } from '@contracts/game'
 import { PROVIDER_PRESETS, ROLE_META } from '@contracts/game'
 import type {
   CastJobStart,
   CastProgressState,
+  CastTrace,
   PersonaCard,
   PersonaCardInput,
   PersonaCardSummary,
@@ -38,15 +40,21 @@ import type {
   PersonaMemory,
   PersonaRelationship,
   PersonaRelationshipHistory,
+  PersonaCognitionNote,
   PersonaReport,
   PersonaResearchResult,
   PersonaTrashEntry,
 } from '@contracts/persona'
+import { COGNITION_NOTE_ENABLED } from '@contracts/persona'
 import { trpc } from '@/providers/trpc'
+import type { RsqBatteryLevel, RsqItemsView, RsqSubmitPayload } from '@/lib/rsqClient'
 
 // ---------------------------------------------------------------------------
 // 契约类型 re-export（页面层统一从这里取，避免散落 import 路径）
 // ---------------------------------------------------------------------------
+
+/** 机制开关再导出：页面层统一从本模块取（见 @contracts/persona 注释） */
+export { COGNITION_NOTE_ENABLED }
 
 export type {
   AdvancedOptions,
@@ -79,7 +87,16 @@ export type {
 
 export { PROVIDER_PRESETS, ROLE_META } from '@contracts/game'
 
-// 人格研究库契约 re-export（页面层统一从这里取）
+// RSQ 视图模型 re-export（报告/问卷统一从 gameApi 或 rsqClient 取）
+export type {
+  RsqBatteryLevel,
+  RsqItemView,
+  RsqItemsView,
+  RsqSubmitPayload,
+  RSQReportData,
+} from '@/lib/rsqClient'
+
+// 人格研究站契约 re-export（页面层统一从这里取）
 export type {
   BigFiveParams,
   CastJobStart,
@@ -118,6 +135,8 @@ export interface PersonaDetail {
   drift: PersonaDriftEntry[]
   relationshipHistory: PersonaRelationshipHistory[] // 人格锚点关系的逐局沿革（折叠栏；双向）
   incomingRelationships: (PersonaRelationship & { sourceName: string })[] // TA 对我（反向汇总）
+  cognitionNotes: PersonaCognitionNote[] // 自我认知笔记沿革（新的在前）
+  cognitionWritingAt?: string | null // 认知笔记书写中的开始时刻（ISO）；null=无在飞书写
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +384,148 @@ export interface AnalysisResult {
   jobError: string | null
 }
 
+/** RSQ 雷达数据点（与后端 toRadarData 同构）*/
+export interface RadarDatumView { axis: string; label: string; value: number }
+
+/** RSQ 维度分（39 维，全部 0–100）*/
+export interface RSQDimensionsView {
+  companionship: number; conflict: number; instrumentalAid: number; antagonism: number
+  emotionalSupport: number; nurturance: number; relativePower: number; intimateDisclosure: number
+  reliableAlliance: number; affection: number; admiration: number; reassuranceOfWorth: number
+  satisfactionNRI: number; intimacy: number; passion: number; commitmentTLS: number
+  attachmentAnxiety: number; attachmentAvoidance: number; predictability: number; dependability: number
+  faith: number; satisfactionIMS: number; alternatives: number; investment: number; commitment: number
+  conflictReasoning: number; conflictVerbal: number; conflictAvoidance: number; closeness: number
+  metaWorth: number; metaAbility: number; metaDefensiveness: number; metaDisclosure: number
+  metaCertainty: number; metaMismatch: number; jealousy: number; ipcAgency: number; ipcAffiliation: number
+  equityBalance: number; indebtedness: number; grievance: number
+  forgiveness: number; revenge: number; avoidance: number; benevolence: number
+}
+
+export interface RSQResultView {
+  dims: RSQDimensionsView
+  derived: { involvement: number; ambivalence: number; netAffect: number; powerBalance: number; perceivedGap: number; forgiveGap: number; equityStrain: number }
+  validity: {
+    consistency: number; socialDesirability: number; lieScale: number; darkTriad: number
+    behavioralGap: number; experienceConsistency: number; overall: number
+    verdict: 'reliable' | 'questionable' | 'likely-deceptive'
+    flags: string[]
+  }
+  feedback: unknown | null
+  selfSummary: string | null
+  raw: Record<string, number>
+  itemsVersion: string
+}
+
+export interface RSQRecordView extends RSQResultView {
+  id: number
+  fromPersonaId: number
+  toPersonaId: number
+  gameId: string | null
+  batteryLevel: string
+  model: string | null
+  answeredAt: string | Date
+  createdAt: string | Date
+  radar: RadarDatumView[]
+}
+
+export interface ValleyItemView {
+  id: number
+  titleNo: string
+  era: string
+  relation: string
+  affinityDelta: number
+  trustDelta: number
+  affinity: number
+  trust: number
+  note: string | null
+  gameId: string | null
+}
+
+/** 关系补完进度（与后端 completionStatus.progress 同构） */
+export interface CompletionProgressView {
+  phase?: string
+  total?: number
+  done?: number
+  current?: string
+  written?: number
+  webSearched?: number
+  log?: string[]
+  /** 后端可能补充的真实统计（stats JSON 摊平后） */
+  corrected?: number
+  generated?: number
+  verified?: number
+  rejected?: number
+}
+
+/** 关系补完真实统计（后端 job.stats / statsRaw 解析后；P1-16） */
+export interface CompletionStats {
+  written?: number
+  webSearched?: number
+  corrected?: number
+  generated?: number
+  verified?: number
+  rejected?: number
+  reason?: string
+}
+
+/** 补完任务 scope（后端 job.scope JSON：resume 自恢复用） */
+export interface CompletionJobScopeView {
+  personaIds?: number[]
+  apiPresetId?: number | null
+}
+
+/** 关系补完任务台账（network.listCompletionJobs / completionStatus 行） */
+export interface CompletionJobView {
+  id: number
+  status: string
+  /** 后端原始 scope：对象 {personaIds, apiPresetId}（老数据可能是字符串） */
+  scope?: CompletionJobScopeView | string | null
+  progress?: CompletionProgressView | null
+  progressRaw?: string | null
+  /** 后端 job.stats 解析结果（真实 written/webSearched 等） */
+  stats?: Record<string, unknown> | null
+  statsRaw?: string | null
+  createdAt?: string | Date | null
+  finishedAt?: string | Date | null
+}
+
+/** 现实层补完任务台账（network.backfillJobs 行） */
+export interface BackfillJobView {
+  id?: number
+  personaId?: number
+  aboutPersonaId?: number
+  status?: string
+  itemCount?: number
+  error?: string | null
+  createdAt?: string | Date | null
+  finishedAt?: string | Date | null
+}
+
+export interface CanonItemView {
+  id: number
+  personaId: number
+  aboutPersonaId: number
+  seq: number
+  /** 手动排序位（null=按时代时间线排序；拖动排序后写入） */
+  sortOrder?: number | null
+  era: string
+  age: number | null
+  place: string | null
+  /** 时间依据（原作明载 / 推定链）——P2-24 契约漂移补齐 */
+  eraBasis: string | null
+  eventText: string
+  feeling: string
+  impact: string | null
+  certainty: string
+  sourceRef: string | null
+  sourceCount: number
+  sources: Array<{ title: string; url: string; tier: string; reason: string; quote?: string }>
+  verification: string
+  origin: string
+  createdAt: string | Date
+}
+
 export interface GameApi {
   /** 全部可用版型（game.boards） */
   listBoards(): Promise<BoardDef[]>
@@ -377,7 +538,7 @@ export interface GameApi {
   /** 增量轮询（game.poll）：返回最新快照 + seq > afterSeq 的事件；afterWinRateId 为胜率推测游标 */
   pollGame(gameId: string, afterSeq: number, lastSig?: string, afterWinRateId?: number): Promise<PollResult>
   /** 启动/暂停/终止（game.control） */
-  controlGame(gameId: string, action: 'start' | 'pause' | 'terminate' | 'stopPostGame'): Promise<{ ok: boolean }>
+  controlGame(gameId: string, action: 'start' | 'pause' | 'terminate' | 'stopPostGame', seatRoles?: RoleId[]): Promise<{ ok: boolean }>
   /** 已结束对局补开赛后讨论（game.startPostGame）；started=false 时 reason 给出原因（幂等） */
   startPostGame(gameId: string): Promise<{ started: boolean; reason?: string }>
   /** 开始心理检查（game.startPsyCheck）：分出胜负即可；可续跑（已完成座位不重跑）；
@@ -398,6 +559,116 @@ export interface GameApi {
   /** 异步启动分析（game.generateAnalysis），返回 {started}；analystAi 可省略（后端复用座位 agent 配置） */
   generateAnalysis(gameId: string, analystAi?: AnalystAiConfig): Promise<{ started: boolean }>
   /** API 存档列表（preset.list） */
+  // ---- 关系网（§29/§30）----
+  /** 关系网图数据（network.graph） */
+  relationGraph(input?: { layer?: "canon" | "vale" | "all" }): Promise<{
+    edges: { id: number; from: number; to: number; toName: string | null; kind: string; form: string; layer: string; positivity: number; negativity: number; trust: number; involvement: number; ambivalence: number; closeness: number; dependence: number; reciprocity: number; powerBalance: number; formality: number; commitment: number; dangling: boolean }[]
+    nodes: { id: number; name: string; source: string; image: string | null }[]
+    nodeIds: number[]
+  }>
+  /** 启动关系补完（network.startCompletion） */
+  startRelationCompletion(input: { personaIds?: number[]; apiPresetId?: number | null }): Promise<{
+    jobId: number
+    error?: string
+  }>
+  /** 暂停补完（network.pauseCompletion）*/
+  pauseCompletion(input: { jobId: number }): Promise<{ ok: boolean }>
+  /** 恢复已暂停/失败的任务（network.resumeCompletion，从 job.scope 自恢复）*/
+  resumeCompletion(input: { jobId: number }): Promise<{ ok: boolean; started?: boolean; jobId?: number; error?: string }>
+  /** 终止补完（network.cancelCompletion）*/
+  cancelCompletion(input: { jobId: number }): Promise<{ ok: boolean }>
+  /** 全部补完任务台账（network.listCompletionJobs，后端新增；打开弹窗时恢复现场） */
+  listCompletionJobs(): Promise<CompletionJobView[]>
+  /** 补完任务进度（network.completionStatus；轮询用） */
+  relationCompletionStatus(jobId: number): Promise<CompletionJobView | null>
+
+  // ---- L2 主观层：RSQ 关系测评 ----
+  /** 按 batteryLevel 拉取题库（network.rsqItems，后端新增） */
+  rsqItems(input: { level: RsqBatteryLevel }): Promise<RsqItemsView>
+  /** 提交答卷 → 计分 → 落库（network.submitRSQ） */
+  submitRSQ(input: RsqSubmitPayload): Promise<{ id: number; result: RSQResultView; radar: RadarDatumView[] }>
+  /** 最新测评（含雷达） */
+  latestRSQ(input: { fromPersonaId: number; toPersonaId: number }): Promise<RSQRecordView | null>
+  /** 历史答卷（时间轴） */
+  rsqHistory(input: { fromPersonaId: number; toPersonaId: number; order?: 'asc' | 'desc'; limit?: number }): Promise<RSQRecordView[]>
+  /** 某人格对所有人的最新认知 */
+  rsqLatestFor(input: { fromPersonaId: number }): Promise<RSQRecordView[]>
+  /** 测评覆盖率 */
+  rsqCoverage(): Promise<{ pairs: number; total: number }>
+
+  // ---- L1 现实层：单视角关系记忆 ----
+  /** 山谷层关系变动时间线（现实层兜底）*/
+  valleyHistory(input: { personaId: number; aboutPersonaId: number }): Promise<ValleyItemView[]>
+  /** 某人格对某对象的全部记忆 */
+  canonLog(input: { personaId: number; aboutPersonaId: number; order?: 'asc' | 'desc' }): Promise<CanonItemView[]>
+  /** 手动补充一条记忆 */
+  addCanonEvent(input: {
+    personaId: number; aboutPersonaId: number
+    era: string; eventText: string; feeling: string
+    impact?: string | null; age?: number | null; place?: string | null
+  }): Promise<number>
+  /** 编辑一条记忆 */
+  updateCanonEvent(input: { id: number; patch: Partial<{ era: string; eventText: string; feeling: string; impact: string | null; age: number | null; place: string | null }> }): Promise<{ ok: boolean }>
+  /** 软删一条记忆 */
+  deleteCanonEvent(input: { id: number }): Promise<{ ok: boolean }>
+  /** 详情页拖动排序：按 orderedIds 重写该视角下全部现实层事件的排序位 */
+  reorderCanonEvents(input: { personaId: number; aboutPersonaId: number; orderedIds: number[] }): Promise<{ updated: number }>
+  /** 手动新建关系（原世界层） */
+  createManualRelation(input: {
+    fromPersonaId: number
+    toPersonaId: number
+    kind: string
+    form?: string
+    basis?: string | null
+  }): Promise<{ relationId: number; created: boolean }>
+  /** 手动编辑关系（kind/form 校正留痕；basis 直改） */
+  updateManualRelation(input: {
+    relationId: number
+    patch: { kind?: string; form?: string; basis?: string | null }
+  }): Promise<{ ok: boolean; relationId: number }>
+  /** 某人格发出的原始关系行（详情页编辑用，含 kind/form/dims 原始值） */
+  listPersonaRelationRows(personaId: number): Promise<Array<{
+    id: number
+    fromPersonaId: number
+    toPersonaId: number
+    toName: string | null
+    layer: string
+    form: string
+    kind: string
+    positivity: number
+    negativity: number
+    trust: number
+    closeness: number
+    dependence: number
+    reciprocity: number
+    powerBalance: number
+    formality: number
+    commitment: number
+    basis: string | null
+  }>>
+  /** 现实层覆盖率 */
+  canonCoverage(input?: { personaId?: number }): Promise<{ pairs: number; items: number }>
+  /** 补完任务台账 */
+  backfillJobs(input?: { personaId?: number }): Promise<BackfillJobView[]>
+  /** 启动现实层补完（异步：立即返回，后台跑）*/
+  startBackfillCanon(input: { personaId: number; aboutPersonaId: number; apiPresetId?: number | null; force?: boolean }): Promise<{ started: boolean; error?: string }>
+  /** 现实层补完任务状态（轮询用）*/
+  backfillCanonStatus(input: { personaId: number; aboutPersonaId: number }): Promise<{ status: string; itemCount: number; error: string | null }>
+  /** 启动现实层补完（同步执行，含全量核查） */
+  backfillCanon(input: { personaId: number; aboutPersonaId: number; apiPresetId?: number | null; force?: boolean }): Promise<{
+    jobId: number
+    generated: number
+    verified: number
+    rejected: number
+    written: number
+    /** 是否真的联网（API 实证）*/
+    webSearched?: boolean
+    /** 无联网时的警告 */
+    webWarning?: string
+    skipped?: boolean
+    error?: string
+  }>
+
   listPresets(): Promise<ApiPreset[]>
   /** 新建 API 存档（preset.create） */
   createPreset(input: ApiPresetInput): Promise<ApiPreset>
@@ -417,8 +688,8 @@ export interface GameApi {
   getStudyNotes(gameId: string): Promise<{ seat: number; notes: string }[]>
   /** 人格卡列表（persona.list，摘要行） */
   listPersonas(): Promise<PersonaCardSummary[]>
-  /** 人格卡详情一屏数据（persona.detail：卡 + 记忆 + 关系 + 漂移） */
-  getPersonaDetail(id: number): Promise<PersonaDetail | null>
+  /** 人格卡详情一屏数据（persona.detail：卡 + 记忆 + 关系 + 漂移）；可传 signal 取消过期请求 */
+  getPersonaDetail(id: number, signal?: AbortSignal): Promise<PersonaDetail | null>
   /** 手动创建人格卡（persona.create） */
   createPersona(input: PersonaCardInput): Promise<PersonaCard>
   /** 更新人格卡（persona.update，覆盖写回） */
@@ -460,8 +731,32 @@ export interface GameApi {
     web?: { stage1?: boolean; stage2?: boolean; stage3?: boolean }
     deepRead?: { segmented?: boolean; selfCritique?: boolean }
   }): Promise<{ items: { castId: string; name: string }[] }>
-  /** 取走/放弃草稿后确认（persona.castAck，条目清除不再恢复） */
+  /** 核对入库核销（persona.castAck）：草稿转 saved 留痕保留（不删除） */
   ackCast(castId: string): Promise<{ ok: boolean }>
+  /** 用户主动删除草稿（persona.castDraftDiscard）：清库唯一通道——条目+草稿+检查点全清 */
+  discardCastDraft(castId: string): Promise<{ ok: boolean }>
+  /** 生成留痕（persona.castTrace）：进度标记点 + 各阶段已落盘研究文本（服务端脱敏） */
+  getCastTrace(castId: string): Promise<CastTrace | null>
+  /** 赛后自动书写开关（persona.setAutoCognition）：心理检查完后由参赛绑定模型自动书写 */
+  setAutoCognition(input: {
+    personaId: number
+    enabled: boolean
+    includeReports?: boolean
+    includeDrift?: boolean
+  }): Promise<{ ok: boolean }>
+  /** 记录认知（persona.writeCognition）：人格以第一人称书写自我认知笔记（两程管线；同步等待） */
+  writeCognition(input: {
+    personaId: number
+    cfg: { provider: AiProvider; baseUrl: string; model: string; apiKey: string }
+    includeReports?: boolean
+    includeDrift?: boolean
+  }): Promise<{ started: boolean }>
+  /** 编辑认知笔记（persona.updateCognitionNote；最新篇被编辑时现役认知同步） */
+  updateCognitionNote(input: { noteId: number; personaId: number; content: string }): Promise<{ ok: boolean }>
+  /** 删除认知笔记（persona.deleteCognitionNote；最新篇被删时现役认知回退） */
+  deleteCognitionNote(input: { noteId: number; personaId: number }): Promise<{ ok: boolean }>
+  /** 断点续铸（persona.resumeCast）：中断条目从检查点恢复继续铸造 */
+  resumeCast(castId: string): Promise<{ ok: boolean }>
   /** 铸造控制（persona.castControl）：暂停/继续/终止（终止=取消并删除整个铸造流程） */
   controlCast(castId: string, action: 'pause' | 'resume' | 'cancel'): Promise<{ ok: boolean }>
   /** 从链接抓取肖像（persona.fetchPortrait；图片/页面链接均可，服务端转 data URL） */
@@ -492,14 +787,49 @@ export interface LibraryDocMeta {
   createdAt: string
 }
 
+// 保留的关系模块仍参与主仓与 preview 类型检查，但 network 后端已经移除。
+// 用这一处显式、类型安全的禁用实现替代所有 client.network 调用；生产人格页不会触达这些方法。
+const relationNetworkRemoved = (): Promise<never> =>
+  Promise.reject(new Error('关系网功能已移除'))
+
+const disabledRelationNetworkApi = {
+  relationGraph: relationNetworkRemoved,
+  startRelationCompletion: relationNetworkRemoved,
+  pauseCompletion: relationNetworkRemoved,
+  resumeCompletion: relationNetworkRemoved,
+  cancelCompletion: relationNetworkRemoved,
+  listCompletionJobs: relationNetworkRemoved,
+  relationCompletionStatus: relationNetworkRemoved,
+  rsqItems: relationNetworkRemoved,
+  submitRSQ: relationNetworkRemoved,
+  latestRSQ: relationNetworkRemoved,
+  rsqHistory: relationNetworkRemoved,
+  rsqLatestFor: relationNetworkRemoved,
+  rsqCoverage: relationNetworkRemoved,
+  valleyHistory: relationNetworkRemoved,
+  canonLog: relationNetworkRemoved,
+  addCanonEvent: relationNetworkRemoved,
+  updateCanonEvent: relationNetworkRemoved,
+  deleteCanonEvent: relationNetworkRemoved,
+  reorderCanonEvents: relationNetworkRemoved,
+  createManualRelation: relationNetworkRemoved,
+  updateManualRelation: relationNetworkRemoved,
+  listPersonaRelationRows: relationNetworkRemoved,
+  canonCoverage: relationNetworkRemoved,
+  backfillJobs: relationNetworkRemoved,
+  startBackfillCanon: relationNetworkRemoved,
+  backfillCanonStatus: relationNetworkRemoved,
+  backfillCanon: relationNetworkRemoved,
+}
+
 /**
  * 获取命令式 GameApi。内部复用 trpc provider 的单例 client，
  * 返回对象引用稳定（client 不变时不重建），可安全放入 useEffect 依赖。
  */
 export function useGameApi(): GameApi {
   const client = trpc.useUtils().client
-  return useMemo<GameApi>(
-    () => ({
+  return useMemo<GameApi>(() => {
+    return {
       listBoards: () => client.game.boards.query(),
       listGames: async () => {
         // 历史对局不限数量：后端全量返回，前端不再截取
@@ -513,7 +843,7 @@ export function useGameApi(): GameApi {
           { gameId, afterSeq, lastSig, afterWinRateId },
           { signal: AbortSignal.timeout(12_000) },
         ),
-      controlGame: (gameId, action) => client.game.control.mutate({ gameId, action }),
+      controlGame: (gameId, action, seatRoles) => client.game.control.mutate({ gameId, action, seatRoles }),
       startPostGame: (gameId) => client.game.startPostGame.mutate({ gameId }),
       startPsyCheck: (gameId, analystAi) => client.game.startPsyCheck.mutate({ gameId, analystAi }),
       exportGame: async (gameId) => {
@@ -527,6 +857,7 @@ export function useGameApi(): GameApi {
       getAnalysis: (gameId) => client.game.analysis.query({ gameId }),
       generateAnalysis: (gameId, analystAi) =>
         client.game.generateAnalysis.mutate({ gameId, analystAi }),
+      ...disabledRelationNetworkApi,
       listPresets: () => client.preset.list.query(),
       createPreset: (input) => client.preset.create.mutate(input),
       updatePreset: (id, patch) => client.preset.update.mutate({ id, patch }),
@@ -537,7 +868,7 @@ export function useGameApi(): GameApi {
       removeLibraryDoc: (id) => client.library.remove.mutate({ id }),
       getStudyNotes: (gameId) => client.game.studyNotes.query({ gameId }),
       listPersonas: () => client.persona.list.query(),
-      getPersonaDetail: (id) => client.persona.detail.query({ id }),
+      getPersonaDetail: (id, signal) => client.persona.detail.query({ id }, { signal }),
       createPersona: (input) => client.persona.create.mutate(input),
       updatePersona: (id, patch) => client.persona.update.mutate({ id, patch }),
       deletePersona: (id) => client.persona.remove.mutate({ id }),
@@ -551,12 +882,20 @@ export function useGameApi(): GameApi {
       getCastActives: () => client.persona.castActives.query(),
       castPersonaBatch: (input) => client.persona.castBatch.mutate(input),
       ackCast: (castId) => client.persona.castAck.mutate({ castId }),
+      discardCastDraft: (castId) => client.persona.castDraftDiscard.mutate({ castId }),
+      getCastTrace: (castId) => client.persona.castTrace.query({ castId }),
+      writeCognition: (input) => client.persona.writeCognition.mutate(input),
+      updateCognitionNote: (input: { noteId: number; personaId: number; content: string }) =>
+        client.persona.updateCognitionNote.mutate(input),
+      deleteCognitionNote: (input: { noteId: number; personaId: number }) =>
+        client.persona.deleteCognitionNote.mutate(input),
+      setAutoCognition: (input) => client.persona.setAutoCognition.mutate(input),
+      resumeCast: (castId) => client.persona.resumeCast.mutate({ castId }),
       controlCast: (castId, action) => client.persona.castControl.mutate({ castId, action }),
       fetchPortrait: (url) => client.persona.fetchPortrait.mutate({ url }),
       createCastedPersona: (input) => client.persona.createCasted.mutate(input),
       listPersonaReports: (id) => client.persona.reports.query({ id }),
       getGamePersonaReports: (gameId) => client.game.personaReports.query({ gameId }),
-    }),
-    [client],
-  )
+    }
+  }, [client])
 }

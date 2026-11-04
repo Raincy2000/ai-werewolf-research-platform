@@ -154,6 +154,28 @@ describe("双/单程自适应与 prompt 组装", () => {
     expect(user).toContain('"pressures"');
     expect(user).toContain("bodyTrace");
   });
+
+  it("完整人格与语言资料进入心镜和表达层，不做数百字截断", () => {
+    const card = makeCard();
+    card.profile.speechStyle = "克制短句。" + "独有措辞节奏。".repeat(100);
+    card.profile.quotes = ["一", "二", "三", "四", "五"];
+    card.profile.values = "完整价值观".repeat(100);
+    card.profile.essence = "完整自我认知".repeat(100);
+    const mirrorPrompt = buildMirrorPrompt(card, null, makePending());
+    const emergePrompt = buildEmergencePrompt(card, mirrorFallbackReport(card, makePending()), null, buildPrompt(makePending(), {}));
+    expect(mirrorPrompt.user).toContain(card.profile.values);
+    expect(emergePrompt.system).toContain(card.profile.speechStyle);
+    expect(emergePrompt.system).toContain("一／二／三／四／五");
+    expect(emergePrompt.system).toContain(card.profile.essence);
+  });
+
+  it("双程表达层不接收可自述的原始参数报告", () => {
+    const card = makeCard();
+    const { user } = buildEmergencePrompt(card, mirrorFallbackReport(card, makePending()), null, buildPrompt(makePending(), {}));
+    expect(user).not.toContain('"pressures"');
+    expect(user).not.toContain("bigFive.neuroticism");
+    expect(user).toContain("【隐性行为倾向】");
+  });
 });
 
 describe("paramValueOf / paramLabel", () => {
@@ -181,8 +203,10 @@ describe("米勒山谷穿越认知注入（涌现 system）", () => {
     };
     const mirror = mirrorFallbackReport(card, pending);
     const { system } = buildEmergencePrompt(card, mirror, null, base);
-    expect(system).toContain("你已经死过一次");
-    expect(system).toContain("穿越到了米勒山谷的村庄小镇");
+    // 分身降临设定（2026-10-15 用户裁定）：原世界生命最后一刻分出的分身降临米勒山谷
+    expect(system).toContain("生命的最后一刻");
+    expect(system).toContain("米勒山谷的村庄小镇");
+    expect(system).toContain("分身");
     expect(system).toContain("出局不等于死亡");
     expect(system).toContain("巨人之力");
     expect(system).toContain("全部失效");
@@ -192,7 +216,9 @@ describe("米勒山谷穿越认知注入（涌现 system）", () => {
     const alive = makeCard();
     alive.profile = { ...alive.profile, aliveStatus: "alive" };
     const m1 = mirrorFallbackReport(alive, pending);
-    expect(buildEmergencePrompt(alive, m1, null, base).system).toContain("忽然穿越到了米勒山谷");
+    const s1 = buildEmergencePrompt(alive, m1, null, base).system;
+    expect(s1).toContain("米勒山谷的村庄小镇");
+    expect(s1).toContain("分身");
 
     const original = makeCard({ source: "manual" });
     original.profile = { ...original.profile, specialAbilities: "言灵" };

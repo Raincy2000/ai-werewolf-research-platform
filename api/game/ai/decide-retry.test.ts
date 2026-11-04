@@ -245,19 +245,20 @@ describe("tick 循环：decide 校验抛错处理", () => {
     expect(h.games.get(gameId)!.status).toBe("finished");
   });
 
-  it("重试仍非法 → 启发式兜底（thought=[AI输出非法，系统托管]），对局不暂停", async () => {
+  it("重试仍非法 → AI 连续输出非法即暂停（托管抹消，2026-10-15 用户裁定），决策不消费", async () => {
     h.engine = makeFakeEngine((d) => (d.targets?.includes(5) ? "该目标不合法" : null));
     h.aiQueue.push('{"thought":"毒5号","targets":[5]}', '{"thought":"还毒5号","targets":[5]}');
 
     const gameId = await startGame();
-    await waitStatus(gameId, "finished");
+    await waitStatus(gameId, "paused");
 
-    expect(h.aiCalls.length).toBe(2);
-    const last = h.engine!.state.decided.at(-1)!;
-    expect(last.skip).toBe(true); // witchAction 托管 = 保守放弃用药
-    expect(last.thought).toBe("[AI输出非法，系统托管]");
-    expect(h.games.get(gameId)!.status).toBe("finished");
-    expect(h.events.some((e) => e.thought === "[AI输出非法，系统托管]")).toBe(true);
+    expect(h.aiCalls.length).toBe(2); // 首发+带原因重试各一次
+    const { registry } = await import("../service");
+    expect(registry.get(gameId)!.pauseReason).toContain("连续输出非法");
+    // 暂停而非托管：引擎没有消费任何兜底决策，进度原地待续
+    expect(h.engine!.state.decided.length).toBe(0);
+    expect(h.events.some((e) => e.thought === "[AI输出非法，系统托管]")).toBe(false);
+    await gameService.control(gameId, "terminate");
   });
 
   it("解药耗尽仍 witchSave → 意图保留式修正（不托管、不重试、thought 保留、meta.repaired 标注）", async () => {
@@ -287,41 +288,46 @@ describe("tick 循环：decide 校验抛错处理", () => {
     witchPending.view.private.witchPotions = { save: true, poison: true };
   });
 
-  it("AI 连续无响应 → 启发式兜底（thought=[AI连续无响应，系统托管]）", async () => {
+  it("AI 连续无响应 → 立即暂停（托管抹消），决策不消费、提示含恢复指引", async () => {
     h.engine = makeFakeEngine(() => null);
     // aiQueue 留空 → callAi 返回 ok:false
 
     const gameId = await startGame();
-    await waitStatus(gameId, "finished");
+    await waitStatus(gameId, "paused");
 
-    const last = h.engine!.state.decided.at(-1)!;
-    expect(last.thought).toBe("[AI连续无响应，系统托管]");
-    expect(h.games.get(gameId)!.status).toBe("finished");
+    expect(h.engine!.state.decided.length).toBe(0); // 无兜底决策被消费
+    const { registry } = await import("../service");
+    expect(registry.get(gameId)!.pauseReason).toContain("连续无响应");
+    expect(registry.get(gameId)!.pauseReason).toContain("继续");
+    await gameService.control(gameId, "terminate");
   });
 
-  it("AI 提供方悬挂超预算 → 决策点总预算耗尽立即托管，对局不被卡死", async () => {
+  it("AI 提供方悬挂超预算 → 预算耗尽立即暂停（不托管），对局不被卡死也不被垃圾发言污染", async () => {
     // 总预算 400ms：旧行为下单决策点最坏静默 ~9 分钟（2 次尝试 × 3 次重试 × 90s）；
-    // 预算制下耗尽即启发式托管（线上事故：提供方故障时对局假死 8.5 分钟被手动终止）
+    // 预算制+2026-10-15 新规：预算耗尽=该模型实质无响应，单点即暂停等用户处置（不塞兜底发言）
     process.env.AI_DECISION_DEADLINE_MS = "400";
     try {
       h.engine = makeFakeEngine(() => null);
       h.aiSlow = true; // 每次调用吃满单次超时后失败
       const t0 = Date.now();
       const gameId = await startGame();
-      await waitStatus(gameId, "finished", 15_000);
+      await waitStatus(gameId, "paused", 15_000);
       const elapsed = Date.now() - t0;
 
-      const last = h.engine!.state.decided.at(-1)!;
-      expect(last.thought).toBe("[AI连续无响应，系统托管]");
-      expect(h.games.get(gameId)!.status).toBe("finished");
-      // 秒级内兜底（单次调用下限 3s + 预算守卫短路第二次尝试），绝不出现分钟级静默
+      // 暂停而非托管：引擎没有消费任何兜底决策，对局原地待续
+      expect(h.engine!.state.decided.length).toBe(0);
+      const { registry } = await import("../service");
+      expect(registry.get(gameId)!.pauseReason).toContain("AI 服务连续无响应");
+      expect(h.events.some((e) => e.title === "AI 服务中断")).toBe(true);
+      // 秒级内暂停（单次调用下限 3s + 预算守卫短路第二次尝试），绝不出现分钟级静默
       expect(elapsed).toBeLessThan(10_000);
+      await gameService.control(gameId, "terminate");
     } finally {
       delete process.env.AI_DECISION_DEADLINE_MS;
     }
   }, 20_000);
 
-  it("连合法兜底都被引擎拒绝 → 判定引擎内部异常，置 paused 并记录错误事件", async () => {
+  it("引擎持续拒绝一切决策 → 暂停并透出校验原因（托管抹消后不再有兜底决策可被拒）", async () => {
     h.engine = makeFakeEngine(() => "engine exploded"); // 任何输入都抛错
     h.aiQueue.push('{"thought":"毒1号","targets":[1]}');
 
@@ -329,9 +335,10 @@ describe("tick 循环：decide 校验抛错处理", () => {
     await waitStatus(gameId, "paused");
 
     expect(h.games.get(gameId)!.status).toBe("paused");
-    const errEvent = h.events.find((e) => e.title === "系统错误");
-    expect(errEvent).toBeDefined();
-    expect(String(errEvent!.content)).toContain("引擎内部异常");
+    const { registry } = await import("../service");
+    expect(registry.get(gameId)!.pauseReason).toContain("engine exploded");
+    expect(h.events.some((e) => e.title === "AI 服务中断")).toBe(true);
+    await gameService.control(gameId, "terminate");
   });
 });
 

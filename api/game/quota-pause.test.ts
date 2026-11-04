@@ -113,7 +113,7 @@ function makeEngine() {
 }
 
 const { gameService, AiQuotaExhaustedError } = await import("./service");
-const { isQuotaErrorText } = await import("./ai/quota");
+const { isQuotaErrorText, isBudgetErrorText } = await import("./ai/quota");
 
 async function waitStatus(gameId: string, want: string, timeoutMs = 3000): Promise<void> {
   const t0 = Date.now();
@@ -184,6 +184,44 @@ describe("额度耗尽 → 立即暂停（不托管、不垃圾发言）", () =>
   });
 });
 
+describe("预算耗尽 → 单点即暂停（不托管——20261014001 第5天 10号发言托管实锤）", () => {
+  it("「预算耗尽」文案命中；额度/普通超时不误伤", () => {
+    expect(isBudgetErrorText("AI响应总预算耗尽，转入托管")).toBe(true);
+    expect(isBudgetErrorText("HTTP 402: Insufficient Balance")).toBe(false);
+    expect(isBudgetErrorText("请求超时（150s）")).toBe(false);
+    expect(isBudgetErrorText(null)).toBe(false);
+  });
+
+  it("决策预算内全数落空：立即暂停、专属事件落盘、决策未被兜底消费", async () => {
+    h.aiError = "AI响应总预算耗尽，转入托管"; // 预算内所有重试均落空（模拟路径：错误文本直达判定）
+    h.defaultFail = true;
+    h.engine = makeEngine();
+
+    const seats = Array.from({ length: 9 }, (_, i) => ({
+      seat: i + 1,
+      provider: "deepseek" as const,
+      baseUrl: "http://mock.local/v1",
+      model: "deepseek-v4-pro",
+      apiKey: "sk-mock",
+    }));
+    const { gameId } = await gameService.createGame({
+      boardId: "standard9",
+      seats,
+      options: { stepDelayMs: 5, sheriffEnabled: false, allowSelfDestruct: true, speechRoundsLimit: 2 },
+    });
+    await gameService.control(gameId, "start");
+    await waitStatus(gameId, "paused");
+
+    const { registry } = await import("./service");
+    expect(registry.get(gameId)!.pauseReason).toContain("AI 服务连续无响应");
+    expect(registry.get(gameId)!.pauseReason).toContain("deepseek-v4-pro");
+    expect(h.events.some((e) => e.title === "AI 服务中断")).toBe(true);
+    // 关键：单点预算耗尽即暂停，绝不托管产出垃圾发言
+    expect(h.decisions.length).toBe(0);
+    await gameService.control(gameId, "terminate");
+  });
+});
+
 describe("AI 连续失效熔断（断电/休眠后连接假死的防线，20261011003 实锤）", () => {
   async function startTestGame(): Promise<string> {
     h.engine = makeEngine();
@@ -203,7 +241,7 @@ describe("AI 连续失效熔断（断电/休眠后连接假死的防线，202610
     return gameId;
   }
 
-  it("连续 3 次调用层故障 → 暂停并透出「AI 服务中断」；额度错误仍立即暂停", async () => {
+  it("首次调用层故障 → 立即暂停并透出「AI 服务中断」（托管抹消，不再有三次容忍）", async () => {
     h.aiError = "请求超时（150s）"; // 调用层故障（非额度）
     h.defaultFail = true;
     const gameId = await startTestGame();
@@ -211,31 +249,34 @@ describe("AI 连续失效熔断（断电/休眠后连接假死的防线，202610
     const { registry } = await import("./service");
     const rt = registry.get(gameId)!;
     expect(rt.pauseReason).toContain("AI 服务连续无响应");
-    expect(rt.aiOutageStreak).toBeGreaterThanOrEqual(3);
     expect(h.events.some((e) => e.title === "AI 服务中断")).toBe(true);
-    // 熔断前的 2 次故障按托管容忍（设计如此），第 3 次触发暂停、此后停摆
-    expect(h.decisions.filter((d) => d.gameId === gameId).length).toBe(2);
+    // 托管抹消（2026-10-15 用户裁定）：第一次调用层故障即暂停，决策零消费
+    expect(h.decisions.filter((d) => d.gameId === gameId).length).toBe(0);
     await gameService.control(gameId, "terminate");
   });
 
-  it("偶发两次故障 + 一次成功 → 计数清零不熔断", async () => {
-    // 失败、失败、成功、失败、失败（不足连续 3）——循环期间不暂停
+  it("首次故障即暂停；恢复后转成功则对局照常续跑（无熔断计数依赖）", async () => {
+    // 第一次失败即暂停（托管抹消）；随后恢复且 AI 转成功 → 对局推进不卡死
     h.aiError = "请求超时（150s）";
-    h.aiPlan = ["fail", "fail", "ok", "fail", "fail", "ok"]; // 之后默认成功（defaultFail=false）
+    h.aiPlan = ["fail", "ok"]; // 之后默认成功（defaultFail=false）
     const gameId = await startTestGame();
-    await new Promise((r) => setTimeout(r, 600));
-    expect(h.games.get(gameId)!.status).toBe("running"); // 未暂停
+    await waitStatus(gameId, "paused"); // 第一次失败即停
+    await gameService.control(gameId, "start"); // 恢复：AI 已转成功
+    await new Promise((r) => setTimeout(r, 800));
     const { registry } = await import("./service");
-    expect(registry.get(gameId)!.aiOutageStreak ?? 0).toBeLessThan(3);
+    expect(registry.get(gameId)!.status).not.toBe("paused"); // 续跑中或已推进
+    expect(h.decisions.filter((d) => d.gameId === gameId).length).toBeGreaterThan(0);
     await gameService.control(gameId, "terminate");
   });
 
-  it("输出非法（模型行为）不计入熔断", async () => {
-    h.aiError = "涌现输出无法解析"; // 解析失败不匹配调用层故障特征
+  it("输出无法解析（模型行为异常）→ 即停并透出原因（托管抹消：任何阻碍流程的失败一律即停）", async () => {
+    h.aiError = "涌现输出无法解析"; // 解析失败不匹配调用层故障特征（不走无响应熔断文案）
     h.defaultFail = true;
     const gameId = await startTestGame();
-    await new Promise((r) => setTimeout(r, 600));
-    expect(h.games.get(gameId)!.status).toBe("running"); // 不熔断（启发式兜底继续）
+    await waitStatus(gameId, "paused");
+    const { registry } = await import("./service");
+    expect(registry.get(gameId)!.pauseReason).toContain("涌现输出无法解析");
+    expect(h.decisions.filter((d) => d.gameId === gameId).length).toBe(0); // 决策零消费
     await gameService.control(gameId, "terminate");
   });
 });

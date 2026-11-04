@@ -8,11 +8,12 @@
  */
 
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowDownWideNarrow, ArrowUpNarrowWide, BookOpen, Brain, Eye, Hourglass, Loader2 } from 'lucide-react'
+import { ArrowDownWideNarrow, ArrowUpNarrowWide, BookOpen, Brain, ChevronDown, Eye, Hourglass, Loader2 } from 'lucide-react'
 import { SheriffBadge } from '@/components/icons/SheriffBadge'
 import type { Camp, GameEvent, PlayerSnapshot } from '@contracts/game'
 import { CAMP_LABEL, elapsedLabel } from '@/lib/gameLabels'
 import { cn } from '@/lib/utils'
+import { PersonaThought } from '@/components/game/PersonaThought'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -24,11 +25,14 @@ const CAMP_TEXT_CLASS: Record<Camp, string> = {
 }
 
 /** 单条「心路历程与交互记录」：一条交互（内容）+ 其心理活动（如出同炉）。
- * memo：轮询追加事件时旧行不重渲染——选中玩家后页面不再随对局推进而卡顿的关键 */
-const JourneyRow = memo(function JourneyRow({ event, t0 }: { event: GameEvent; t0?: number | null }) {
+ * memo：轮询追加事件时旧行不重渲染——选中玩家后页面不再随对局推进而卡顿的关键；
+ * 心理活动与对局记录同款慕斯粉卡片+心镜层折叠（跟随高级设置 thoughtCollapsed） */
+const JourneyRow = memo(function JourneyRow({ event, t0, thoughtCollapsed }: { event: GameEvent; t0?: number | null; thoughtCollapsed?: boolean }) {
   const fired = event.meta?.channel === 'skillFired'
   const isWolf = event.meta?.channel === 'wolf'
   const elapsed = elapsedLabel(t0, event.createdAt)
+  const personaMeta = (event.meta?.persona ?? null) as import('@contracts/persona').PersonaEventMeta | null
+  const [detailOpen, setDetailOpen] = useState(!thoughtCollapsed)
   return (
     <li
       className={cn(
@@ -56,14 +60,36 @@ const JourneyRow = memo(function JourneyRow({ event, t0 }: { event: GameEvent; t
         </p>
       ) : null}
       {event.thought ? (
-        <p
-          className={cn(
-            'mt-1 whitespace-pre-wrap break-words border-l-2 pl-2 text-xs italic leading-5',
-            fired ? 'border-wolf/70 font-bold text-wolf' : 'border-god/70 text-god/90',
-          )}
-        >
-          {event.thought}
-        </p>
+        fired ? (
+          <p className="mt-1 whitespace-pre-wrap break-words rounded-r border-l-2 border-wolf/70 py-0.5 pl-2 text-xs font-bold leading-5 text-wolf">
+            {event.thought}
+          </p>
+        ) : personaMeta ? (
+          <div className="mt-1 rounded-md border border-[#e0568a]/30 bg-[#e0568a]/[0.06] px-2 py-1.5">
+            <button
+              type="button"
+              onClick={() => setDetailOpen((v) => !v)}
+              aria-expanded={detailOpen}
+              className="flex items-center gap-1 text-[11px] font-medium text-[#e0568a] hover:underline underline-offset-2"
+            >
+              <Brain className="h-3 w-3" aria-hidden />
+              心镜 · 人格状态报告（仅观察者可见）
+              <ChevronDown className={cn('h-3 w-3 transition-transform', detailOpen && 'rotate-180')} aria-hidden />
+            </button>
+            <div className="mt-1">
+              <PersonaThought thought={event.thought} persona={personaMeta} mode="emergence" />
+              {detailOpen ? (
+                <div className="mt-1.5 border-t border-[#e0568a]/20 pt-1.5">
+                  <PersonaThought thought={event.thought} persona={personaMeta} mode="detail" />
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : (
+          <p className="mt-1 whitespace-pre-wrap break-words rounded-md border border-[#e0568a]/30 bg-[#e0568a]/[0.06] px-2 py-1.5 text-xs italic leading-5 text-[#d64d7f]">
+            {event.thought}
+          </p>
+        )
       ) : null}
     </li>
   )
@@ -82,10 +108,12 @@ interface PlayerPanelProps {
   studying?: boolean
   /** 对局总计时起点（epoch ms）：每条记录旁附距开始的经过时间 */
   t0?: number | null
+  /** 心理活动默认收起（高级设置；收起时涌现正文仍常显，只收心镜分析层） */
+  thoughtCollapsed?: boolean
   className?: string
 }
 
-export const PlayerPanel = memo(function PlayerPanel({ player, events, pendingActs, studyNote, studying, t0, className }: PlayerPanelProps) {
+export const PlayerPanel = memo(function PlayerPanel({ player, events, pendingActs, studyNote, studying, t0, thoughtCollapsed, className }: PlayerPanelProps) {
   /** 排序：false=倒序（默认，最新在上）；true=正序（最早在上） */
   const [asc, setAsc] = useState(false)
   const selectedSeat = player?.seat ?? null
@@ -225,7 +253,7 @@ export const PlayerPanel = memo(function PlayerPanel({ player, events, pendingAc
             ) : (
               <ul>
                 {journey.map((e) => (
-                  <JourneyRow key={e.seq} event={e} t0={t0} />
+                  <JourneyRow key={e.seq} event={e} t0={t0} thoughtCollapsed={thoughtCollapsed} />
                 ))}
               </ul>
             )}
