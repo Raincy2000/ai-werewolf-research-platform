@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check-test-build:
+    runs-on: windows-latest
+    env:
+      NODE_OPTIONS: --experimental-sqlite
+      APP_ID: ci
+      APP_SECRET: ci-secret
+      PRESET_SECRET: ci-preset-secret
+      VITE_APP_ID: ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build

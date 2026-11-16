@@ -1,7 +1,7 @@
 // 回溯手术验证：在桌面库副本上重放决策日志，校验与事件流一致
-// 用法：app-clone 目录下 SQLITE_PATH=../../tmp-audit/rollback-verify.db npx tsx ../tmp-audit/verify-rollback.ts
+// 用法（工作区根目录）：SQLITE_PATH=./cache/rollback-verify.db npx tsx dev/scripts/verify-rollback.ts
 process.env.DB_DIALECT = "sqlite";
-process.env.SQLITE_PATH = process.env.SQLITE_PATH ?? "../../tmp-audit/rollback-verify.db";
+process.env.SQLITE_PATH = process.env.SQLITE_PATH ?? "./cache/rollback-verify.db";
 
 const { getGame, getAllEvents } = await import("../api/queries/games");
 const { getDecisions } = await import("../api/queries/decisions");

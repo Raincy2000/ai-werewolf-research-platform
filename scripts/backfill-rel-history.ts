@@ -1,5 +1,5 @@
 // 关系沿革追溯回填执行器（桌面库一次性补史，幂等可重跑）
-// 用法（app-clone 目录下）：
+// 用法（dev 目录下）：
 //   set DB_DIALECT=sqlite && set SQLITE_PATH=<库路径> && set PRESET_SECRET=<桌面配置> && npx tsx scripts/backfill-rel-history.ts [--dry]
 // 复盘/治理脚本，不随开源发布（维护工具）。
 import { readFileSync } from "node:fs";

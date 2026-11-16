@@ -1,5 +1,5 @@
 // 存量人格精粹 → 第一人称自我认知笔记（一次性迁移脚本，幂等可重跑）
-// 用法（app-clone 目录）：set DB_DIALECT=sqlite && set SQLITE_PATH=<库> && npx tsx scripts/rewrite-essence-firstperson.ts [--dry]
+// 用法（dev 目录）：set DB_DIALECT=sqlite && set SQLITE_PATH=<库> && npx tsx scripts/rewrite-essence-firstperson.ts [--dry]
 // 规则：AI 改写保持原意；写成后同步 essence（对局注入）+ 记入认知笔记沿革首篇；
 // 已是第一人称（含「我」密度达标）的跳过。
 import { readFileSync } from "node:fs";

@@ -29,3 +29,5 @@ desktop/electron-dist/
 desktop/patch-*.cjs
 # 本地临时数据
 tmp/
+# 发布凭据
+.publish.env

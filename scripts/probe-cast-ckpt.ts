@@ -1,5 +1,5 @@
 // 探针：直接调 router 的 persona.cast  mutation，验证 params 检查点是否落盘
-// 用法：app-clone 下 npx tsx scripts/probe-cast-ckpt.ts
+// 用法：dev 下 npx tsx scripts/probe-cast-ckpt.ts
 process.env.DB_DIALECT = "sqlite";
 process.env.SQLITE_PATH = ":memory:";
 process.env.PRESET_SECRET = process.env.PRESET_SECRET ?? "a".repeat(64);
