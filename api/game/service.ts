@@ -50,11 +50,12 @@ import {
   listGuideScopes,
   listGuideVersions,
 } from "../queries/guide";
-import { appendDecision } from "../queries/decisions";
+import { appendDecision, getDecisions } from "../queries/decisions";
 import { getAllLibraryContents, upsertStudyNote, getStudyNotes } from "../queries/library";
 import { getLatestWinRate, getWinRatesAfter } from "../queries/winrates";
 import { buildStudyPrompt, buildStudyPickPrompt, buildChapterPickPrompt, buildHistoryPickPrompt, buildHistoryRefPrompt, splitDocChapters } from "./analyst";
 import { buildLogDigest } from "./logDigest";
+import { runVictoryAiAudit } from "./victory-ai-audit";
 import { createEngine, MEETING_WOLVES } from "./engine/index";
 import type {
   DecisionInput,
@@ -68,8 +69,9 @@ import { callAi } from "./ai/providers";
 import { isQuotaErrorText, isOutageErrorText, isBudgetErrorText } from "./ai/quota";
 import { defaultCallTimeoutMs, isThinkingModel } from "./ai/modelCaps";
 import { buildPrompt, modelContextTokens } from "./ai/prompts";
+import { buildLiveCognition, type LiveCognition } from "./evidence";
 import { parseDecision } from "./ai/parse";
-import { buildPersonaCircleText, buildPostgamePersonaFactText, injectCircleText } from "./personaVisibility";
+import { buildPersonaCircleText, buildPostgamePersonaFactText, injectCircleText, personaGenderFromSetup, assertPersonaCircleCoverage } from "./personaVisibility";
 import { deathInfoBySeatFromEvents, deathSeatsFromEvent, finalSurvivorsFromEvents } from "../../src/lib/playerEventState";
 import type { PersonaCard, PersonaEventMeta, PersonaSeatInfo } from "../../contracts/persona";
 import {
@@ -83,6 +85,7 @@ import {
 } from "../queries/personas";
 import { runPersonaPipeline, shouldUseDualPipeline } from "../persona/pipeline";
 import { createPersonaSnapshot, type PersonaSnapshot } from "../persona/context";
+import { buildSituationSignature } from "../persona/memory";
 import { withTimeout, DB_TIMEOUT_MS } from "./runtime/timing";
 import {
   elapsedAt,
@@ -147,6 +150,8 @@ export interface GameRuntime {
   timer: ReturnType<typeof setTimeout> | null;
   pending: PendingDecision | null;
   options: AdvancedOptions;
+  /** 开局冻结的指南资料；未选择指南来源时为空，赛后蒸馏不得改写当前局。 */
+  guideTextSnapshot: string;
   /** 手动角色是否已提交并持久化；后续赛前学习/暂停续跑复用，不重复要求 seatRoles */
   manualRolesAssigned?: boolean;
   ticking: boolean; // tick 执行锁，防止重入
@@ -206,7 +211,7 @@ export interface GameRuntime {
   // 玩家对局笔记：座位 → 最近 N 条「行动+想法」紧凑记录（对局笔记知识库，注入该座位 prompt）
   seatNotes?: Map<number, string[]>;
   // 带真实对局编号（#seq）的公开记录缓存：maxSeq 与 rt.seq 一致即命中，新事件落盘后失效重建
-  pubLogCache?: { maxSeq: number; lines: string[] } | null;
+  pubLogCache?: { maxSeq: number; lines: string[]; events: GameEvent[] } | null;
   // 赛前图书馆学习：座位 → 学习心得；studyDoneSeats 完成计数；studying/studyDone 状态
   studyNotes?: Map<number, string>;
   studyDoneSeats?: Set<number>;
@@ -239,19 +244,25 @@ export interface GameRuntime {
   foulSettled?: boolean;     // 本局已判罚（一局至多一次判罚结算，防止重复落定）
 }
 
-  /** 当前处境签名（编码特异性检索键，§4.10.4）：game:<阵营>。
-   *  依据 Tulving & Thomson 1973：提取线索须与编码情境重合。
-   *  ⚠️ 情境是**加权**而非硬过滤（memory.ts），故历史无签名的记忆仍会参与排序。 */
-  function memorySignatureOf(rt: GameRuntime, seat: number): string {
-    // 角色阵营由引擎快照给出（权威事实，恢复后同样可得）
+  /** 当前处境包含阵营与具体决策类型；检索只作认知联想，不生成战术建议。 */
+  function memorySignatureOf(rt: GameRuntime, seat: number, pending: PendingDecision): string {
     const camp = rt.engine.getSnapshot().players.find((p) => p.seat === seat)?.camp ?? "good";
-    return `game:${camp}`;
+    return buildSituationSignature({ scenarioKind: "game", phase: pending.kind, role: camp });
   }
 
-  /** 每回合现算注入文本：记忆池 × 当前情境 → 文本（无内容返回 null） */
-  function memorySignatureText(rt: GameRuntime, seat: number): string | null {
+  /** 每回合现算注入文本：被动联想 + 主体当前任务 + 在场关系。 */
+  function memorySignatureText(rt: GameRuntime, seat: number, pending: PendingDecision): string | null {
+    const fog = new Set(rt.options.personaFogSeats ?? []);
+    const visibility = rt.options.personaVisibility ?? "full";
+    const presentNames = visibility === "none"
+      ? []
+      : (rt.seatPersonas ?? [])
+          .filter((b) => b.seat !== seat && !(visibility === "partial" && fog.has(b.seat)))
+          .map((b) => b.name);
     const text = renderMemoryText(rt.personaMemory?.get(seat), {
-      signature: memorySignatureOf(rt, seat),
+      signature: memorySignatureOf(rt, seat, pending),
+      concerns: [pending.hint],
+      presentNames,
     });
     return text.trim() ? text : null;
   }
@@ -269,7 +280,7 @@ export { parseWinRateOutput } from "./winrate";
 import { createRecovery, seatAIsOfSetup, partOfPhase } from "./recovery";
 import { describeActionForNote, SEAT_NOTE_CHARS, SEAT_NOTE_MAX } from "./seat-notes";
 // 胜率集群已迁入 api/game/winrate.ts（与 recovery 同法：依赖注入杜绝环引用）
-const { maybeWinRateTick, startWinRateLoop, runWinRateAnalysis } = createWinRate({ getCachedGuideText });
+const { maybeWinRateTick, startWinRateLoop } = createWinRate({ getCachedGuideText });
 const { recoverGame, buildRuntimeFromStore } = createRecovery({
   registry,
   scheduleTick,
@@ -391,6 +402,8 @@ export interface StoredSetup {
   manualRolesAssigned?: boolean;
   seatModels: string[];
   options: AdvancedOptions;
+  /** 开局冻结的指南资料；旧对局缺省时按无资料处理。 */
+  guideTextSnapshot?: string;
   // 断点恢复需要完整 AI 配置（含 key）：账户体系后以 AES-GCM 密文存 seatAIsEnc；
   // 旧对局的明文 seatAIs 仅作兼容回退；更老的对局两者皆无 → 不可自动恢复（仅可查看事件）
   seatAIs?: SeatAiConfig[];
@@ -550,13 +563,18 @@ function recordSeatNotes(rt: GameRuntime, pending: PendingDecision, input: Decis
 // 恢复重放后重建笔记：以决策日志为准（与引擎状态同源）
 /** 人格事件富化：把本决策点涌现管线产出的人格注解合并进该座位的发言/行动/投票事件
  * （event.meta.persona：双视角解释 + 撕裂组摘要，观察者双栏展示；富化后即清空防串用） */
-function enrichPersonaEvents(rt: GameRuntime, events: EngineEvent[]): void {
+export function enrichPersonaEvents(rt: GameRuntime, events: EngineEvent[]): void {
   if (!rt.personaEventMeta || rt.personaEventMeta.size === 0) return;
   for (const ev of events) {
     if (ev.actor == null) continue;
     const meta = rt.personaEventMeta.get(ev.actor);
-    if (meta && (ev.type === "speech" || ev.type === "action" || ev.type === "vote")) {
+    // 警长定序同时产出权衡事件与公开事件：两侧都展示同一份标准心镜，
+    // 但公开事实仍只取 content，观察者心理不会写入其他玩家的公开记录。
+    const publicSheriffOrder = ev.type === "system" && ev.title === "警长定序" && ev.meta?.channel !== "skillThink";
+    if (meta && (ev.type === "speech" || ev.type === "action" || ev.type === "vote" || ev.meta?.channel === "skillThink" || publicSheriffOrder)) {
       ev.meta = { ...(ev.meta ?? {}), persona: meta };
+      // 展示层才使用观察模板；决策日志与座位笔记在此之前已保存主体原文。
+      if (meta.observerThought) ev.thought = meta.observerThought;
     }
   }
   rt.personaEventMeta.clear();
@@ -698,12 +716,28 @@ async function askAiOnce(
   gameId?: string,
 ): Promise<{ decision: DecisionInput | null; error: string | null }> {
   try {
+    let cognition: LiveCognition | undefined;
     // 公开记录换用带真实对局编号（#seq）的事件流重建（行号与公屏对不上的事故根治，
     // 2026-10-15 实锤：玩家引用「第136条」而公屏已是 [358]）——失败保持引擎 pub 口径
     if (gameId) {
       const seqLog = await seqPublicLog(gameId, rt);
       if (seqLog) {
         pending = { ...pending, view: { ...pending.view, publicLog: seqLog } };
+        const events = rt.pubLogCache?.maxSeq === rt.seq ? rt.pubLogCache.events : undefined;
+        if (events) {
+          let decisions;
+          try {
+            decisions = await getDecisions(gameId);
+          } catch {
+            decisions = undefined; // 决策日志读取失败回退既有提示，绝不注入其他座位记录。
+          }
+          cognition = buildLiveCognition(gameId, pending.seat, events, {
+            wolfTeam: pending.view.private?.wolfTeammates !== undefined,
+            postgame: pending.kind === "postgameSpeak",
+            targetSeats: pending.options,
+            decisions,
+          });
+        }
       }
     }
     // 总预算守卫：剩余预算不足一次最短调用时直接判失败（调用方走兜底）
@@ -715,7 +749,7 @@ async function askAiOnce(
     // 基础博弈情境仍由 buildPrompt 单一事实源生成（信息壁垒铁律不破）
     const personaCard = rt.personaCards?.get(pending.seat);
     if (personaCard) {
-      const personaGuide = await getCachedGuideText(rt.userId, rt.boardId);
+      const personaGuide = rt.guideTextSnapshot;
       const personaModelContext = modelContextTokens(cfg.model);
       const base = buildPrompt(pending, {
         retryNote: retryNote ?? undefined,
@@ -723,6 +757,7 @@ async function askAiOnce(
         guide: personaGuide,
         notes: rt.seatNotes?.get(pending.seat),
         studyNote: rt.studyNotes?.get(pending.seat),
+        cognition,
         timeLimitSec: rt.options.aiTimeLimitSec,
         modelContext: personaModelContext,
       });
@@ -752,6 +787,7 @@ async function askAiOnce(
         // 注入位铁律：必须落在【输出契约】之前——人格管线会截断契约后的部分
         //（对局 20260930001 实锤：尾部追加被静默切断，人格玩家全程互不认识）
         base.user = injectCircleText(base.user, circleText);
+        assertPersonaCircleCoverage(base.user, circleText);
       }
       if (pending.kind === "postgameSpeak") {
         const factText = buildPostgamePersonaFactText(
@@ -766,7 +802,7 @@ async function askAiOnce(
       const personaRes = await runPersonaPipeline({
         cfg,
         card: personaCard,
-        memoryText: memorySignatureText(rt, pending.seat),
+        memoryText: memorySignatureText(rt, pending.seat, pending),
         pending,
         base,
         modelContext: personaModelContext,
@@ -781,8 +817,8 @@ async function askAiOnce(
       }
       return { decision: personaRes.decision, error: personaRes.error };
     }
-    // 接线2：每次 buildPrompt 前取经验指南（共通+本版型拼接，60s 内存缓存，不每步查库）
-    const guide = await getCachedGuideText(rt.userId, rt.boardId);
+    // 只使用开局冻结的指南；未选择指南来源时为空，赛后蒸馏不回流当前局。
+    const guide = rt.guideTextSnapshot;
     const { system, user } = buildPrompt(pending, {
       retryNote: retryNote ?? undefined,
       resumeNote: resumeNote ?? undefined,
@@ -791,18 +827,18 @@ async function askAiOnce(
       notes: rt.seatNotes?.get(pending.seat),
       // 赛前图书馆学习心得（开启图书馆且该座位已完成学习时注入）
       studyNote: rt.studyNotes?.get(pending.seat),
+      cognition,
       // 决策总时限（用户设置时告知 AI 快速决断）
       timeLimitSec: rt.options.aiTimeLimitSec,
       // 按座位模型上下文动态分配公开记录/指南注入预算（防小上下文模型后期被撑爆）
       modelContext: modelContextTokens(cfg.model),
     });
     // 单次调用超时按模型能力画像分流（思考型 150s / 常规 90s，AI_TIMEOUT_MS 可全覆盖），
-    // 且不超过剩余预算；预算紧张时压缩 callAi 内部重试次数；
+    // 且不超过剩余预算；普通决策与人格管线共用 providers 默认退避重试。
     // deadlineAt 透传进 callAi——重试循环内逐次按剩余预算截断，预算真正具有约束力
     const cfgTimeoutMs = defaultCallTimeoutMs(cfg);
     const res = await callAi(cfg, system, user, {
       timeoutMs: Math.max(3_000, Math.min(cfgTimeoutMs, remaining - 500)),
-      maxRetries: remaining > 100_000 ? 2 : remaining > 40_000 ? 1 : 0,
       deadlineAt,
     });
     if (res.ok && res.text) {
@@ -887,95 +923,44 @@ class SuspendDecision extends Error {
   }
 }
 
-// AI 输出意图保留式修正（engine.decide 硬校验之前）：
-// 把「意图明确但触犯规则」的输出修正为最接近的合法等价——
-// 典型事故（2026-08-02 线上实锤）：女巫解药首夜已用，第2/3夜仍输出 witchSave=true
-// （引擎拒"解药已用完"→重试仍犯→整轮降级"[AI输出非法，系统托管]"，思考量全丢）；
-// 白狼王带人时输出 selfDestruct（引擎拒"当前阶段不能自爆"）。
-// 修正保住 AI 的思考与合法意图；实在无可保留才交给重试/兜底。修正说明写入事件 meta.repaired 供观测。
+// 动作主权边界：不做语义修复，不替主体把非法意图改成另一个合法动作。
+// 返回原始输入交引擎校验；非法时由现有流程带原因重问，仍非法则暂停。
 export function repairDecision(
   pending: PendingDecision,
   inp: DecisionInput,
 ): { input: DecisionInput; notes: string[] } {
-  const notes: string[] = [];
-  const out: DecisionInput = { ...inp };
-  const kind = pending.kind;
-
-  // 1) 目标合法性：剔除不在可选范围的目标（options 为空表示任意存活者，不过滤）
-  if (out.targets?.length && pending.options.length) {
-    const bad = out.targets.filter((t) => !pending.options.includes(t));
-    if (bad.length) {
-      notes.push(`目标${bad.join("/")}不在可选范围，已剔除`);
-      const valid = out.targets.filter((t) => pending.options.includes(t));
-      out.targets = valid.length ? valid : undefined;
-    }
-  }
-
-  // 2) 女巫用药规则（引擎校验所需事实全部在 view 中可得，与引擎同源）
-  if (kind === "witchAction") {
-    const potions = pending.view.private.witchPotions;
-    const victim = pending.view.private.witchVictimTonight ?? null;
-    const selfSaveAllowed =
-      pending.view.rules?.witchSelfSave === "firstNight" && pending.view.day === 1;
-    if (out.witchSave) {
-      if (potions && !potions.save) {
-        notes.push("解药已用完，忽略解药");
-        out.witchSave = undefined;
-      } else if (victim == null) {
-        notes.push("今夜无人被刀，忽略解药");
-        out.witchSave = undefined;
-      } else if (victim === pending.seat && !selfSaveAllowed) {
-        notes.push("本版型女巫不能自救，忽略解药");
-        out.witchSave = undefined;
-      }
-    }
-    if (!out.skip && out.targets?.length && potions && !potions.poison) {
-      notes.push("毒药已用完，忽略毒药");
-      out.targets = undefined;
-    }
-    // 互斥：同一晚只能用一瓶药——优先保留解药（防御性意图），弃毒药
-    if (out.witchSave && !out.skip && out.targets?.length) {
-      notes.push("同一晚只能用一瓶药，保留解药、忽略毒药");
-      out.targets = undefined;
-    }
-    // 修正后无任何有效动作 → 按不用药处理
-    if (!out.witchSave && !out.targets?.length && !out.skip) {
-      notes.push("无有效用药动作，按不用药处理");
-      out.skip = true;
-    }
-  }
-
-  // 3) 带人/开枪类：剥离不适用的技能字段（selfDestruct/duel 等仅白天技能窗口可用）
-  if (kind === "whiteWolfTake" || kind === "hunterShoot") {
-    for (const f of ["selfDestruct", "surrender", "declareVictory", "duel"] as const) {
-      const v = out[f];
-      if (v != null && v !== false) {
-        notes.push(`${kind} 不可使用 ${f}，已忽略`);
-        out[f] = undefined as never;
-      }
-    }
-    if (out.skip && !pending.allowSkip) {
-      notes.push("该决策不允许跳过，忽略 skip");
-      out.skip = undefined;
-    }
-  }
-
-  return { input: out, notes };
+  void pending;
+  return { input: { ...inp }, notes: [] };
 }
 
 // 并行批次子决策清洗：保证合并后的批量决策必被引擎接受（批量结算不做整批重试，单点非法不应拖垮同轮其他人）。
 // 分流规则：
-// - daySkill 权衡子项：仅保留合法的 duel/selfDestruct，其余降级为按兵不动（保留 thought）
+// - daySkill 权衡子项：合法技能原样保留；非法技能意图打退回标记，由调用方暂停，绝不静默改成按兵不动
 // - 其他批次（上警报名/警徽投票/放逐投票等）：AI 的合法选择（targets 落在 options 内、
 //   或允许跳过时的 skip）原样保留；只有真正非法的输出才回退启发式兜底（保证该类型合法），
 //   绝不把合法选择篡改为 skip——否则不允许跳过的类型（如报名）会被引擎整批拒绝
-export function sanitizeBatchInput(sub: PendingDecision, inp: DecisionInput): DecisionInput {
+function sanitizeBatchInputAction(sub: PendingDecision, inp: DecisionInput): DecisionInput {
   if (sub.kind === "daySkill") {
-    if (inp.selfDestruct && MEETING_WOLVES.has(sub.role)) return { thought: inp.thought, selfDestruct: true };
-    if (inp.surrender && MEETING_WOLVES.has(sub.role)) return { thought: inp.thought, surrender: true };
-    if (inp.declareVictory && MEETING_WOLVES.has(sub.role)) return { thought: inp.thought, declareVictory: true };
-    if (inp.duel != null && sub.role === "knight" && sub.options.includes(inp.duel))
-      return { thought: inp.thought, duel: inp.duel };
+    if (inp.selfDestruct) {
+      return MEETING_WOLVES.has(sub.role)
+        ? { thought: inp.thought, selfDestruct: true }
+        : heuristicDecision(sub, "[AI输出非法，系统托管]");
+    }
+    if (inp.surrender) {
+      return MEETING_WOLVES.has(sub.role)
+        ? { thought: inp.thought, surrender: true }
+        : heuristicDecision(sub, "[AI输出非法，系统托管]");
+    }
+    if (inp.declareVictory) {
+      return MEETING_WOLVES.has(sub.role)
+        ? { thought: inp.thought, declareVictory: true }
+        : heuristicDecision(sub, "[AI输出非法，系统托管]");
+    }
+    if (inp.duel != null) {
+      return sub.role === "knight" && sub.options.includes(inp.duel)
+        ? { thought: inp.thought, duel: inp.duel }
+        : heuristicDecision(sub, "[AI输出非法，系统托管]");
+    }
     return { thought: inp.thought, skip: true };
   }
   // 发言类子项（发言与权衡并行后的合并批次会内嵌发言）：speech 即有效动作——
@@ -1024,6 +1009,12 @@ export function sanitizeBatchInput(sub: PendingDecision, inp: DecisionInput): De
   // 清洗后仍无任何有效动作（目标全非法且不可跳过/未选择跳过）→ 启发式兜底（保证合法）
   if (!out.targets && !out.skip) return heuristicDecision(sub, "[AI输出非法，系统托管]");
   return out;
+}
+
+/** 动作清洗与认知保存分轨：非法动作不会被意图字段合法化，合法动作也不丢失主体当下认知。 */
+export function sanitizeBatchInput(sub: PendingDecision, inp: DecisionInput): DecisionInput {
+  const out = sanitizeBatchInputAction(sub, inp);
+  return inp.intent ? { ...out, intent: structuredClone(inp.intent) } : out;
 }
 
 // 并行权衡（daySkill batch）：同轮全部持技玩家并发询问（Promise.all），
@@ -1114,14 +1105,17 @@ async function decideBatchWithAi(
     rt.suspendDraft = { thought: null, error: null };
     throw new SuspendDecision();
   }
-  // 白日交刀宣布胜利审核（房规）：狼队宣布提前胜利前，先由分析师审核当下狼人胜率——
-  // 未达 100% 则宣布无效，视作神民阵营取胜（审核不可用时按原规则放行）
+  // 白日拍刀：分析师 AI 按真实轮次、完整进程、规则与技能存量推演。
+  // 审核不可用立即暂停，保留当前待决，绝不继续推进或借故障结算。
   const declareIdx = inputs.findIndex((inp) => inp.declareVictory === true);
   if (declareIdx >= 0) {
     const audit = await auditDeclareVictory(gameId, rt);
-    if (audit === "reject") {
+    if (audit.outcome === "unavailable") {
+      throw new AiOutageError(`拍刀审核分析师无响应，对局已自动暂停：${audit.reason}。请检查分析师配置后点击「继续」——当前拍刀待决不会丢失，恢复后将重新按轮次与规则审核。`);
+    }
+    if (audit.outcome === "reject") {
       const seat = subs[declareIdx]!.seat;
-      return settleDeclareAuditFail(gameId, rt, seat);
+      return settleDeclareAuditFail(gameId, rt, seat, audit.reason);
     }
   }
   const combined: DecisionInput = { thought: "", batchInputs: inputs };
@@ -1144,29 +1138,10 @@ async function decideBatchWithAi(
   }
 }
 
-/** 白日交刀宣布胜利审核：取最新胜率记录判断狼人胜率是否达 100%。
- * 即时性铁律（用户裁定）：拍刀时刻的局面必须即时重评——不沿用既有记录
- *（记录对拍刀时刻必然滞后：上次评估可能生成于数步之前，滞后读数安在当前局面=误判）。
- * 审核不可用（评估失败且无任何记录）时按原规则放行。 */
-/** 白日交刀宣布胜利审核：取最新胜率记录判断狼人胜率是否达 100%。
- * 即时性铁律（用户裁定）：拍刀时刻的局面必须即时重评——不沿用既有记录
- *（记录对拍刀时刻必然滞后：上次评估可能生成于数步之前，滞后读数安在当前局面=误判）。
- * 审核不可用（评估失败且无任何记录）时按原规则放行。
- * 导出供测试：即时性语义（不沿用滞后记录）的单测锚点。 */
-export async function auditDeclareVictory(gameId: string, rt: GameRuntime): Promise<"pass" | "reject"> {
-  // 第一步永远是即时评估当前局面（结果经锚点单调守门禁乱序；与上次相同则按最新读数处理）
-  const fresh = rt.winRateEnabled
-    ? await runWinRateAnalysis(gameId, rt).catch(() => "skip" as const)
-    : ("skip" as const);
-  if (fresh === "stored" || fresh === "same") {
-    // stored=新评估已落库；same=即时评估与最近记录一致（此刻该记录即当前局面的读数）
-    const latest = await getLatestWinRate(gameId);
-    if (latest) return latest.wolfPct >= 100 ? "pass" : "reject";
-  }
-  // 即时评估不可用（AI 故障/解析失败）：回落最近记录兜底；记录也没有 → 审核不可用放行
-  const latest = await getLatestWinRate(gameId);
-  if (!latest) return "pass";
-  return latest.wolfPct >= 100 ? "pass" : "reject";
+/** 白日交刀宣布胜利审核：只读取引擎的存活与技能存量，使用保守确定性规则。
+ * 胜率模型只供观察，不参与胜负裁决；相同引擎状态必得相同审核结果。 */
+export async function auditDeclareVictory(gameId: string, rt: GameRuntime) {
+  return runVictoryAiAudit({ gameId, rt });
 }
 
 /** 宣布胜利未通过审核：宣布无效，神民阵营取胜（房规结算）。
@@ -1179,17 +1154,19 @@ function settleDeclareAuditFail(
   _gameId: string,
   rt: GameRuntime,
   seat: number,
+  reason: string,
 ): { events: EngineEvent[]; input: DecisionInput } {
   const snap = rt.engine.getSnapshot();
+  const analysis = `分析师 AI 按轮次与规则推演后认为仍存在反制路径（${reason}），不能确认狼人必胜`;
   const auditEvent: EngineEvent = {
     day: snap.day,
     phase: snap.phase,
     type: "system",
     actor: null,
     title: "宣布胜利未通过审核",
-    content: `${seat}号代表狼队宣布提前胜利——分析师审核当前狼人胜率未达 100%，宣布无效！神民阵营获胜。`,
+    content: `${seat}号代表狼队宣布提前胜利——${analysis}，宣布无效！神民阵营获胜。`,
     thought: null,
-    meta: { auditReject: true },
+    meta: { auditReject: true, auditReason: reason },
   };
   // 引擎外部结算：落定胜者 + 结果事件（含存活表，与自然终局同格式；缘由注记写入结果文案）；
   // 公开广播行携带完整裁决缘由——玩家公开记录必须知道「狼队拍了刀但被驳回」，
@@ -1197,7 +1174,7 @@ function settleDeclareAuditFail(
   const engineEvents = rt.engine.settleExternal(
     "good",
     "（白日交刀宣布胜利未通过审核）",
-    `【审核】${seat}号代表狼队宣布提前胜利——分析师即时复审当前局面，狼人胜率未达 100%，宣布无效！神民阵营获胜。`,
+    `【审核】${seat}号代表狼队宣布提前胜利——${analysis}，宣布无效！神民阵营获胜。`,
   );
   return {
     events: [auditEvent, ...engineEvents],
@@ -1206,7 +1183,7 @@ function settleDeclareAuditFail(
       thought: "",
       auditSettle: "good",
       auditNote: "（白日交刀宣布胜利未通过审核）",
-      auditPub: `【审核】${seat}号代表狼队宣布提前胜利——分析师即时复审当前局面，狼人胜率未达 100%，宣布无效！神民阵营获胜。`,
+      auditPub: `【审核】${seat}号代表狼队宣布提前胜利——${analysis}，宣布无效！神民阵营获胜。`,
     },
   };
 }
@@ -1366,7 +1343,7 @@ async function seqPublicLog(gameId: string, rt: GameRuntime): Promise<string[] |
     if (rt.pubLogCache && rt.pubLogCache.maxSeq === rt.seq) return rt.pubLogCache.lines;
     const events = await getAllEvents(gameId);
     const lines = publicLogFromEvents(events);
-    rt.pubLogCache = { maxSeq: rt.seq, lines };
+    rt.pubLogCache = { maxSeq: rt.seq, lines, events };
     return lines;
   } catch {
     return null;
@@ -1415,9 +1392,7 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
   if (!rt.studyDoneSeats) rt.studyDoneSeats = new Set();
   const sources = studySourcesOf(rt.options);
   const docs = sources.library ? await getAllLibraryContents(rt.userId ?? "") : [];
-  const guideText = sources.guide
-    ? await getCachedGuideText(rt.userId, rt.boardId).catch(() => "")
-    : "";
+  const guideText = sources.guide ? rt.guideTextSnapshot : "";
   const board = BOARDS.find((b) => b.id === rt.boardId);
   const boardName = board?.name ?? rt.boardId;
   const perCallMs = Math.max(5, rt.options.libraryMaxSec ?? 120) * 1000;
@@ -1476,14 +1451,10 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
             timeoutMs: Math.min(perCallMs, 60_000),
             maxRetries: 0,
           });
-          let chosenIds = hres.ok && hres.text
+          const chosenIds = hres.ok && hres.text
             ? candidates.filter((c) => hres.text!.includes(c.id8)).map((c) => c.id8)
             : [];
-          if (chosenIds.length === 0) {
-            // 选取失败兜底：同版型最近一局，否则最新一局
-            const sameBoard = candidates.find((c) => c.boardName === boardName);
-            chosenIds = [(sameBoard ?? candidates[0]).id8];
-          }
+          // 没有作出有效选择时允许不读，不由系统代选最近对局。
           // 两局摘要并行（相互独立）；暂停/终止即各自中断
           const summaries = await Promise.all(
             chosenIds.slice(0, 2).map(async (id8) => {
@@ -1517,7 +1488,7 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
       historyTrack.catch(() => []); // 防御：轨道内已全捕，此处仅杜绝未处理拒绝
 
       // ---- 阶段一：书名选读（≥3 本时按身份与主题相关性选书，小馆直接全读）----
-      let chosen = chaptered;
+      let chosen = chaptered.length > 2 ? [] : chaptered;
       if (chaptered.length > 2) {
         const pick = buildStudyPickPrompt(seat, roleName, chaptered.map((d) => d.name));
         const pres = await callAi(cfg, pick.system, pick.user, {
@@ -1558,8 +1529,8 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
         const parts: string[] = [];
         for (const d of bigDocs) {
           const titles = sel?.get(d.name);
-          const use = titles ? d.chapters.filter((c) => titles.has(c.title)) : d.chapters.slice(0, 2); // 选读失败兜底：前两章
-          for (const c of (use.length > 0 ? use : d.chapters.slice(0, 2))) {
+          const use = titles ? d.chapters.filter((c) => titles.has(c.title)) : [];
+          for (const c of use) {
             parts.push(`《${d.name}》${c.title}\n${c.text}`);
           }
         }
@@ -1568,10 +1539,6 @@ async function runStudyPhase(gameId: string, rt: GameRuntime): Promise<void> {
       let reading = sources.library
         ? [smallText, chapterText].filter((t) => t.trim()).join("\n\n")
         : "";
-      if (sources.library && !reading.trim()) {
-        // 极端兜底（章节切分异常等）：退回书首通读
-        reading = chosen.map((d) => `《${d.name}》\n${d.content.slice(0, 9_000)}`).join("\n\n");
-      }
       if (guideText.trim()) {
         reading = [reading, `【经验指南】\n${guideText.trim()}`].filter((t) => t.trim()).join("\n\n");
       }
@@ -1899,6 +1866,9 @@ function snapshotFromRuntime(gameId: string, row: GameRow, rt: GameRuntime): Gam
     rt.personaCards?.get(seat)?.name ??
     ((row.setup as StoredSetup)?.seatPersonas ?? []).find((s) => s.seat === seat)?.name ??
     null;
+  const personaGenderOf = (seat: number): string | null =>
+    rt.personaCards?.get(seat)?.profile.gender ??
+    personaGenderFromSetup(row.setup as StoredSetup, seat);
   // 显式标注 GameSnapshot：避免对象字面量属性拓宽（如 phaseBreaking 拓宽成 string）
   const result: GameSnapshot = {
     gameId,
@@ -1929,6 +1899,7 @@ function snapshotFromRuntime(gameId: string, row: GameRow, rt: GameRuntime): Gam
       deathInfo: p.deathInfo,
       aiModel: rt.seatAIs.find((a) => a.seat === p.seat)?.model ?? "",
       personaName: personaNameOf(p.seat),
+      personaGender: personaGenderOf(p.seat),
       personaImageData: rt.personaCards?.get(p.seat)?.imageData ?? null,
     })),
     winner: snap.winner,
@@ -2029,6 +2000,7 @@ function snapshotFromRow(gameId: string, row: GameRow, seq: number, deadSeats?: 
       deathInfo: deathInfo.get(i + 1) ?? (finalSurvivors && !finalSurvivors.has(i + 1) ? '出局' : null),
       aiModel: setup.seatModels?.[i] ?? "",
       personaName: (setup.seatPersonas ?? []).find((s) => s.seat === i + 1)?.name ?? null,
+      personaGender: personaGenderFromSetup(setup, i + 1),
       personaImageData: personaImages?.get(i + 1) ?? null,
     })),
     winner: (row.winner as "wolf" | "good" | null) ?? null,
@@ -2100,6 +2072,10 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
     }
   }
 
+  const guideTextSnapshot = studySourcesOf(input.options).guide
+    ? await getCachedGuideText(userId ?? null, board.id).catch(() => "")
+    : "";
+
   const gameId = crypto.randomUUID();
   // 对局标题号：本地日期 YYYYMMDD + 该用户当日第 N 局（3 位序号）——人格讨论/引用对局的统一编号
   const now = new Date();
@@ -2120,6 +2096,7 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
       seatRoles,
       seatModels: seats.map((s) => s.model),
       options: input.options,
+      guideTextSnapshot,
       timing: initialGameTiming(),
       seatAIsEnc: encryptSecret(JSON.stringify(seats)),
       // 胜率推测开关随 setup 落库：服务重启/恢复后功能仍在
@@ -2154,6 +2131,7 @@ async function createGame(input: CreateGameInput, userId?: string): Promise<{ ga
     timer: null,
     pending: null,
     options: input.options,
+    guideTextSnapshot,
     manualRolesAssigned: false,
     ticking: false,
     lastTickAt: Date.now(),

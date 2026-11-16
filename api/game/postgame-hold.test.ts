@@ -101,7 +101,7 @@ function autoAnswer(user: string): string {
   if (user.includes("退水抉择")) return '{"thought":"t","targets":[0]}';
   if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
   const taskLine = user.slice(user.indexOf("【你的任务】"));
-  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言/.test(taskLine)) {
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|狼人频道队内讨论/.test(taskLine)) {
     return '{"thought":"t","speech":"测试发言"}';
   }
   const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));

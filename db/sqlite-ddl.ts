@@ -1320,3 +1320,19 @@ CREATE INDEX IF NOT EXISTS \`idx_nni_persona\` ON \`persona_nickname_index\` (\`
 export const SQLITE_DDL_0110 = `
 ALTER TABLE \`persona_canon_log\` ADD COLUMN \`sort_order\` integer;
 `;
+
+
+// 增量 DDL（0111：记忆事件溯源——个人叙述与原始事实分轨保存）
+export const SQLITE_DDL_0111 = `
+CREATE TABLE IF NOT EXISTS \`persona_memory_evidence\` (
+  \`memory_id\` integer NOT NULL,
+  \`game_id\` text NOT NULL,
+  \`event_seq\` integer NOT NULL,
+  \`source\` text NOT NULL DEFAULT 'self_narrative',
+  \`learned_at\` text NOT NULL DEFAULT 'postgame',
+  \`narrative_version\` integer NOT NULL DEFAULT 1,
+  \`supersedes\` integer,
+  PRIMARY KEY (\`memory_id\`, \`game_id\`, \`event_seq\`)
+);
+CREATE INDEX IF NOT EXISTS \`idx_pme_memory\` ON \`persona_memory_evidence\` (\`memory_id\`);
+`;

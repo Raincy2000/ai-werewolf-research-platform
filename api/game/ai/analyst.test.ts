@@ -376,7 +376,6 @@ const {
   runAnalysis,
   runDistillCommon,
   runDistillBoard,
-  ANALYSIS_TOTAL_CHAR_LIMIT,
   ANALYST_TIMEOUT_MS,
   ANALYST_MAX_RETRIES,
 } = await import("../analyst");
@@ -476,10 +475,10 @@ describe("buildLogDigest 确定性摘要", () => {
 });
 
 describe("buildAnalysisPrompt 新架构", () => {
-  it("长对局 prompt 总长 ≤10500 字，含摘要与六段输出要求（≤3000 字报告）", () => {
+  it("长对局保留完整公共事实与六段输出要求，不再按总字数截断事实", () => {
     const { system, user } = buildAnalysisPrompt(LONG_SNAPSHOT, makeLongGameEvents());
-    expect(user.length).toBeLessThanOrEqual(ANALYSIS_TOTAL_CHAR_LIMIT);
-    expect(ANALYSIS_TOTAL_CHAR_LIMIT).toBe(10_500);
+    expect(user).toContain("【完整事实索引】");
+    expect(user).toContain("摘要仅辅助阅读");
     // 摘要主体（logDigest 输出）
     expect(user).toContain("【全员身份表】");
     expect(user).toContain("【逐日时间线】");
@@ -657,11 +656,14 @@ describe("buildBoardRulesText 版型规则文本", () => {
 });
 
 describe("buildPrompt 经验指南注入", () => {
-  it("注入 guide：输出含【经验指南】且位于【策略参考】之前", () => {
+  it("注入 guide：保留资料原文与来源，不再设置常驻角色策略参考", () => {
     const { user } = buildPrompt(witchPending, { guide: "狼人第一夜优先刀预言家" });
     expect(user).toContain("【经验指南】");
     expect(user).toContain("狼人第一夜优先刀预言家");
-    expect(user.indexOf("【经验指南】")).toBeLessThan(user.indexOf("【策略参考】"));
+    expect(user).not.toContain("狼人第一夜可重点考虑刀预言家");
+    expect(user).not.toContain("【策略参考】");
+    expect(user.indexOf("【经验指南】")).toBeLessThan(user.indexOf("【输出契约】"));
+    expect(user).not.toContain("【心理博弈】");
   });
 
   it("guide 为空/缺省则不插入【经验指南】", () => {
@@ -754,9 +756,9 @@ describe("service.generateAnalysis 分段流水线", () => {
     for (const call of h.aiCalls) {
       expect(call.opts).toMatchObject({ jsonMode: false, timeoutMs: 600_000, maxRetries: 2 });
     }
-    // analyze 调用输入为新摘要格式（≤10500 字）
+    // analyze 调用同时包含摘要与完整公共事实，不再执行固定字数截断
     expect(h.aiCalls[0].user).toContain("【逐日时间线】");
-    expect(h.aiCalls[0].user.length).toBeLessThanOrEqual(ANALYSIS_TOTAL_CHAR_LIMIT);
+    expect(h.aiCalls[0].user).toContain("【完整事实索引】");
     // 共通蒸馏 prompt 要求通用策略；版型蒸馏 prompt 带版型名与角色配置
     expect(h.aiCalls[1].user).toContain("与具体版型角色配置无关的通用策略");
     expect(h.aiCalls[2].user).toContain("9人标准局（暗牌）");

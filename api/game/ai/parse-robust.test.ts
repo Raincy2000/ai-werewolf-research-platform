@@ -96,6 +96,18 @@ describe("parseDecision 鲁棒修复", () => {
     expect(parseDecision('{"thought":"只写心理，没有报名动作" garbage}', sheriffPending)).toBeNull();
   });
 
+  it("模型把换行写成字面反斜杠n时，统一还原为真实换行", () => {
+    const d = parseDecision(JSON.stringify({
+      thought: "先分析票型。\\n再看归票。",
+      speech: "第一段发言。\\n\\n第二段发言。\\t补充一句。",
+    }), pending);
+    expect(d).not.toBeNull();
+    expect(d!.thought).toBe("先分析票型。\n再看归票。");
+    expect(d!.speech).toBe("第一段发言。\n\n第二段发言。\t补充一句。");
+    expect(d!.speech).not.toContain("\\n");
+    expect(d!.speech).not.toContain("\\t");
+  });
+
   it("正常 JSON 不受影响", () => {
     const d = parseDecision(
       JSON.stringify({ thought: "t", speech: "大家好我是好人", targets: [1] }),

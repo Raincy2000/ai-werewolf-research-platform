@@ -24,6 +24,8 @@ import { runNotebookWriteback } from "../persona/notebook";
 import { runPsyCheck } from "../persona/anatomist";
 import { runCognitionWrite, COGNITION_NOTE_ENABLED } from "../persona/cognition";
 import { buildLogDigest } from "./logDigest";
+import { buildPrivateEvidenceIndex, buildPublicEvidenceIndex, type EvidenceRef } from "./evidence";
+import { MEETING_WOLVES } from "./engine/index";
 import type { GameRuntime, StoredSetup } from "./service";
 
 
@@ -79,6 +81,8 @@ export function createPsyCheck(deps: {
       winnerText: string;
       titleNo: string;
       others: { seat: number; name: string; personaId: number; known: boolean }[];
+      publicEvidence: EvidenceRef[];
+      events: Awaited<ReturnType<typeof getAllEvents>>;
       writebackDoneSeats: Set<number>;
     },
     seat: number,
@@ -88,6 +92,10 @@ export function createPsyCheck(deps: {
     const player = snapshot.players.find((p) => p.seat === seat);
     const roleName = player?.roleName ?? "未知身份";
     const outcome = `${winnerText}${player && !player.alive ? `；出局（${player.deathInfo ?? "死亡"}）` : "；存活"}`;
+    const privateEvidence = buildPrivateEvidenceIndex(gameId, seat, ctx.events, {
+      wolfTeam: MEETING_WOLVES.has(player?.role ?? "villager"),
+    });
+    const evidence = [...ctx.publicEvidence, ...privateEvidence];
     // ---- 记事簿回写：记忆入库/强化/衰减、关系传递、人格漂移（续跑跳过已完成座位） ----
     if (writebackDoneSeats.has(seat)) {
       // 已回写过：漂移已生效、记忆已入账——不重复执行
@@ -103,6 +111,7 @@ export function createPsyCheck(deps: {
           digest,
           gameId,
           otherPersonas: others.filter((o) => o.seat !== seat),
+          evidence,
         });
         if (wb) {
           await appendEvents([
@@ -161,7 +170,7 @@ export function createPsyCheck(deps: {
       // 官方规则全文注入：心理检查的规则认知与引擎/玩家/分析师同一事实源
       const rulesBoard = BOARDS.find((b) => b.id === rt.boardId);
       const rulesText = rulesBoard ? boardRulesText(rulesBoard, rt.options.sheriffEnabled) : undefined;
-      const report = await runPsyCheck(cfg, { card, seat, roleName, outcome, digest, gameTitleNo: titleNo, rulesText });
+      const report = await runPsyCheck(cfg, { card, seat, roleName, outcome, digest, gameTitleNo: titleNo, rulesText, evidence });
       await upsertPersonaReport({ gameId, personaId: card.id, seat, report, model: cfg.model });
       await appendEvents([
         {
@@ -298,6 +307,8 @@ export function createPsyCheck(deps: {
       winnerText,
       titleNo: row.titleNo ?? "",
       others,
+      publicEvidence: buildPublicEvidenceIndex(gameId, events),
+      events,
       writebackDoneSeats,
     };
     const CONCURRENCY = 3; // 各人格链相互独立；过高并发只会撞限流转重试，不降质量

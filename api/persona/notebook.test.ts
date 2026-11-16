@@ -26,6 +26,7 @@ vi.mock("../queries/personas", async (importOriginal) => {
     beginPersonaWriteback: vi.fn(),
     finishPersonaWriteback: vi.fn(),
     insertPersonaMemories: vi.fn(),
+    insertPersonaMemoryEvidence: vi.fn(),
     reinforcePersonaMemories: vi.fn(),
     decayPersonaMemories: vi.fn(),
     applyPersonaDrift: vi.fn(),
@@ -247,7 +248,7 @@ describe("buildWritebackPrompt（关系锚点双轨写进契约）", () => {
     expect(user).toContain("精确等于 TA 的人格名"); // 人格锚点规则
   });
 
-  it("漂移参考面板注入全部层级 + PTG 双通道（修复：原来只注入 bigFive）", () => {
+  it("赛后回顾由人格本人进行，漂移面板完整但不预设创伤或成长方向", () => {
     const card = {
       id: 1,
       name: "测试人格",
@@ -263,7 +264,7 @@ describe("buildWritebackPrompt（关系锚点双轨写进契约）", () => {
       },
       profile: { quotes: [] },
     } as unknown as Parameters<typeof buildWritebackPrompt>[0]["card"];
-    const { user } = buildWritebackPrompt({
+    const { system, user } = buildWritebackPrompt({
       card,
       seat: 3,
       roleName: "平民",
@@ -281,10 +282,14 @@ describe("buildWritebackPrompt（关系锚点双轨写进契约）", () => {
     expect(user).toContain("cognitiveBiases.confirmation=");   // 数组型参数必须用 group.<id>
     expect(user).toContain("defenseMechanisms.humor=");
     expect(user).toContain("bigFive.neuroticism=96");           // 携带当前值
-    // 根因 R3/R4 回归：PTG 双通道 + 情绪二维 + 分层幅度
-    expect(user).toContain("创伤后成长");
+    expect(system).toContain("你就是");
+    expect(system).not.toContain("记忆官");
     expect(user).toContain("valence");
-    expect(user).toContain("大五 ±2");
+    expect(user).not.toContain("真正塑造");
+    expect(user).not.toContain("平庸的对局");
+    expect(user).not.toContain("创伤面");
+    expect(user).not.toContain("成长面");
+    expect(user).not.toContain("创伤后成长");
   });
 });
 
@@ -430,5 +435,140 @@ describe("runNotebookWriteback（赛后关系写入停用）", () => {
     expect(personaQueries.upsertPersonaRelationship).not.toHaveBeenCalled();
     expect(personaQueries.insertPersonaRelationshipHistory).not.toHaveBeenCalled();
     expect(summary?.relationshipsTouched).toBe(0);
+  });
+});
+
+describe("记事簿的完整事实与事件溯源", () => {
+  const evidence = [179, 401].map((seq) => ({
+    gameId: "game-1",
+    seq,
+    day: 1,
+    phase: "day.speech",
+    visibility: "public" as const,
+    ownerSeat: seq === 179 ? 9 : 8,
+    actorLabel: `${seq === 179 ? 9 : 8}号玩家`,
+    title: "公开发言",
+    text: seq === 179 ? "我第一夜的查验：1号，狼人。" : "交个底：女巫。",
+    contentHash: "test-hash",
+  }));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getDb).mockReturnValue({
+      select: () => ({
+        from: () => ({
+          where: () => ({ orderBy: async () => [] }),
+        }),
+      }),
+    } as never);
+    vi.mocked(personaQueries.beginPersonaWriteback).mockResolvedValue(true);
+    vi.mocked(personaQueries.insertPersonaMemories).mockResolvedValue([101]);
+  });
+
+  it("完整事实区保留公开查杀与遗言，不用摘要代替事实", () => {
+    const card = {
+      id: 6,
+      name: "夜神月",
+      params: defaultPersonaParams(),
+      profile: { quotes: [] },
+    } as unknown as PersonaCard;
+    const { user } = buildWritebackPrompt({
+      card,
+      seat: 9,
+      roleName: "预言家",
+      outcome: "狼人阵营胜利",
+      gameTitleNo: "20261107002",
+      digest: "压缩摘要",
+      memories: [],
+      relationships: [],
+      seatRoster: [],
+      evidence,
+    });
+    expect(user).toContain("【完整事实索引】");
+    expect(user).toContain("我第一夜的查验：1号，狼人。");
+    expect(user).toContain("交个底：女巫。");
+    expect(user).toContain("自我叙述");
+  });
+
+  it("旧记忆只以 old_memory 兼容，不冒充已核事实", () => {
+    const card = {
+      id: 6,
+      name: "夜神月",
+      params: defaultPersonaParams(),
+      profile: { quotes: [] },
+    } as unknown as PersonaCard;
+    const { user } = buildWritebackPrompt({
+      card,
+      seat: 9,
+      roleName: "预言家",
+      outcome: "狼人阵营胜利",
+      gameTitleNo: "20261107002",
+      digest: "压缩摘要",
+      memories: [{
+        id: 1,
+        personaId: 6,
+        gameId: "old-game",
+        type: "trauma",
+        content: "旧局记忆原文",
+        emotionalWeight: 70,
+        valence: -50,
+        strength: 60,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }],
+      relationships: [],
+      seatRoster: [],
+      evidence,
+    });
+    expect(user).toContain("old_memory");
+    expect(user).not.toContain("event_fact");
+    expect(user).toContain("旧局记忆原文");
+  });
+
+  it("解析记忆时保留事件序号", () => {
+    const parsed = parseWriteback(JSON.stringify({
+      memories: [{ type: "trauma", content: "我记得那次公开查杀", eventSeqs: [179, 401] }],
+      relationships: [],
+      drift: [],
+    }))!;
+    expect(parsed.memories[0]?.eventSeqs).toEqual([179, 401]);
+  });
+
+  it("只链接证据包中存在的序号，全部新记忆均标为自我叙述", async () => {
+    vi.mocked(callAi).mockResolvedValue({
+      ok: true,
+      text: JSON.stringify({
+        memories: [{ type: "trauma", content: "我赛后对查杀的记忆", eventSeqs: [179, 401, 999], emotionalWeight: 70, valence: -50, reinforceMemoryId: null }],
+        relationships: [],
+        drift: [],
+      }),
+    } as never);
+    const card = {
+      id: 6,
+      name: "夜神月",
+      params: defaultPersonaParams(),
+      paramsResidual: {},
+      gameCount: 1,
+    } as unknown as PersonaCard;
+    await runNotebookWriteback({
+      cfg: {} as SeatAiConfig,
+      card,
+      seat: 9,
+      roleName: "预言家",
+      outcome: "狼人阵营胜利",
+      gameTitleNo: "20261107002",
+      digest: "压缩摘要",
+      gameId: "game-1",
+      otherPersonas: [],
+      evidence,
+    });
+    const links = vi.mocked(personaQueries.insertPersonaMemoryEvidence).mock.calls[0]?.[0] as {
+      memoryId: number;
+      eventSeq: number;
+      source: string;
+    }[];
+    expect(links.map((row) => row.eventSeq)).toEqual([179, 401]);
+    expect(links.every((row) => row.memoryId === 101 && row.source === "self_narrative")).toBe(true);
+    expect(links.some((row) => row.eventSeq === 999)).toBe(false);
   });
 });

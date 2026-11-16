@@ -24,6 +24,8 @@ const h = vi.hoisted(() => ({
   cards: new Map<number, PersonaCard>(),
   notebookCalls: 0,
   anatomistCalls: 0,
+  notebookOptions: [] as { evidence?: { seq: number; visibility: string; ownerSeat: number | null }[] }[],
+  anatomistOptions: [] as { evidence?: { seq: number; visibility: string; ownerSeat: number | null }[] }[],
 }));
 
 vi.mock("../queries/games", () => ({
@@ -114,8 +116,9 @@ vi.mock("../queries/personas", () => ({
 
 // 心理检查师与记事簿回写： mock 为即时成功（只验证编排与续跑语义，不验 AI 内容）
 vi.mock("../persona/notebook", () => ({
-  runNotebookWriteback: async () => {
+  runNotebookWriteback: async (opts: { evidence?: { seq: number; visibility: string; ownerSeat: number | null }[] }) => {
     h.notebookCalls += 1;
+    h.notebookOptions.push(opts);
     return {
       text: "回写摘要",
       memoriesAdded: 1,
@@ -135,8 +138,9 @@ vi.mock("../persona/cognition", () => ({
 }));
 
 vi.mock("../persona/anatomist", () => ({
-  runPsyCheck: async () => {
+  runPsyCheck: async (_cfg: unknown, opts: { evidence?: { seq: number; visibility: string; ownerSeat: number | null }[] }) => {
     h.anatomistCalls += 1;
+    h.anatomistOptions.push(opts);
     return "# 心理检查报告\n（mock）";
   },
 }));
@@ -150,7 +154,7 @@ function autoAnswer(user: string): string {
   if (user.includes("退水抉择")) return '{"thought":"t","targets":[0]}';
   if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
   const taskLine = user.slice(user.indexOf("【你的任务】"));
-  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言|赛后讨论·聊天室/.test(taskLine)) {
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|狼人频道队内讨论|赛后讨论·聊天室/.test(taskLine)) {
     return '{"thought":"t","speech":"测试发言"}';
   }
   const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));
@@ -219,6 +223,8 @@ beforeEach(() => {
   h.reports.length = 0;
   h.notebookCalls = 0;
   h.anatomistCalls = 0;
+  h.notebookOptions.length = 0;
+  h.anatomistOptions.length = 0;
   h.cards.clear();
   registry.clear();
   guideCache.clear();
@@ -258,6 +264,17 @@ describe("心理检查（手动开启 + 可续跑）", () => {
     await waitFor(() => reportsOf(gameId).length === 2, "两份报告落库", 30_000);
     expect(h.anatomistCalls).toBe(2);
     expect(h.notebookCalls).toBe(2);
+    // 完整事实按座位分域：公共索引共享，狼频道不泄露给非狼座位。
+    expect(h.notebookOptions.every((opts) => (opts.evidence?.length ?? 0) > 0)).toBe(true);
+    expect(h.anatomistOptions.every((opts) => (opts.evidence?.length ?? 0) > 0)).toBe(true);
+    const publicA = h.notebookOptions[0]!.evidence!.filter((e) => e.visibility === "public").map((e) => e.seq);
+    const publicB = h.notebookOptions[1]!.evidence!.filter((e) => e.visibility === "public").map((e) => e.seq);
+    expect(publicA).toEqual(publicB);
+    const players = registry.get(gameId)!.engine.getSnapshot().players;
+    for (const opts of h.notebookOptions) {
+      const nonWolfSeats = players.filter((p) => p.role !== "werewolf").map((p) => p.seat);
+      expect(opts.evidence!.some((e) => e.visibility === "wolfTeam" && e.ownerSeat != null && nonWolfSeats.includes(e.ownerSeat))).toBe(false);
+    }
     const evs = eventsOf(gameId);
     expect(evs.filter((e) => e.title === "记事簿回写")).toHaveLength(2);
     expect(evs.filter((e) => e.title === "心理检查报告已生成")).toHaveLength(2);

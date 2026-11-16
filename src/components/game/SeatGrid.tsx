@@ -215,7 +215,7 @@ export const SeatGrid = memo(function SeatGrid({
                     </span>
                     <span data-testid="persona-name-viewport" className={cn('relative h-14 w-4 shrink-0 self-center overflow-hidden text-[11px] font-semibold leading-4 text-foreground', !longPersonaName && 'flex items-center')} title={`人格：${p.personaName}`}>
                       {longPersonaName ? (
-                        <span className="persona-name-marquee absolute left-0 top-1/2 flex flex-col items-center">
+                        <span className="persona-name-marquee absolute left-0 top-1/2 flex flex-col items-center" style={{ animationPlayState: 'running' }}>
                           {[0, 1].map((copy) => (
                             <span data-testid="persona-name" key={copy} className="pb-6 -translate-y-1/2 [writing-mode:vertical-rl]">
                               {p.personaName}
@@ -292,7 +292,7 @@ export const SeatGrid = memo(function SeatGrid({
               {/* 出局原因：右侧灰底白字竖向滚动条 */}
               {!p.alive ? (
                 <div className="relative w-7 shrink-0 overflow-hidden rounded-r-[7px] bg-stone-500/80">
-                  <div className="seat-marquee absolute inset-x-0 top-0 flex flex-col items-center">
+                  <div className="seat-marquee absolute inset-x-0 top-0 flex flex-col items-center" style={{ animationPlayState: 'running' }}>
                     {[0, 1].map((k) => (
                       <span
                         key={k}

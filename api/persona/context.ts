@@ -58,7 +58,7 @@ export function buildPersonaContext(card: PersonaCard, memoryText: string | null
     line("你的欲望与驱动力", p.desires),
     line("你的恐惧与软肋", p.fears),
     line("你的社交面具", p.socialMask),
-    line("你的习惯与癖好", p.quirks),
+    line("你的习惯与癖好（仅作本人历史倾向；关系信物不自动等于本人固定穿戴或高频动作。新的习惯可通过主体自己的观察、学习或模仿逐渐形成，系统不把他人动作预置为本人习惯）", p.quirks),
     line("你亲笔写下的自我认知（用于校准，不得复述）", p.essence),
     memoryText?.trim() ? `【你记得的往事】${memoryText.trim()}` : "",
   ].filter(Boolean).join("\n");

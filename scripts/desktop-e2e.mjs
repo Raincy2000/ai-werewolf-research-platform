@@ -35,7 +35,7 @@ const mock = http.createServer((req, res) => {
     captured.push({ seat, system: sys, user });
 
     let targets = [];
-    if (/参与竞选/.test(user)) {
+    if (/【合法选择】targets=\[1\] 表示参与竞选/.test(user)) {
       targets = [Math.random() < 0.6 ? 1 : 0];
     } else {
       const m = user.match(/【合法目标】([0-9号、]+)/);
@@ -45,8 +45,20 @@ const mock = http.createServer((req, res) => {
       }
     }
     const allowSkip = /允许放弃/.test(user);
-    const skip = allowSkip && Math.random() < 0.3;
+    // 警长定序（day.sheriffOrder）：targets=[1] 升序 / [0] 降序（引擎契约见 api/game/engine/api.ts）
+    if (/【合法选择】targets=\[1\] 表示升序/.test(user)) targets = [1];
+    // 可放弃决策：无目标（如无技能角色的放逐询问）必须沉默，不能输出空 target + skip=false
+    let skip = allowSkip && (targets.length === 0 || Math.random() < 0.3);
     if (skip) targets = [];
+    // 必要目标类但候选为「任意存活玩家」（options 为空）：从【存活】行随机取一个（排除自己，防投票给自己被引擎判非法）
+    if (targets.length === 0 && !skip) {
+      const aliveLine = user.match(/存活[：:]([^\n]+)/);
+      const alive = (aliveLine ? [...aliveLine[1].matchAll(/(\d+)号/g)].map((x) => Number(x[1])) : []).filter(
+        (s) => s !== seat,
+      );
+      if (alive.length) targets = [alive[Math.floor(Math.random() * alive.length)]];
+      else if (allowSkip) skip = true;
+    }
     const needSpeech = /speech 必填/.test(user);
     const payload = {
       thought: `THOUGHT-${callSeq}-seat${seat}`,
@@ -102,7 +114,7 @@ async function main() {
       APP_ID: "werewolf-desktop",
       APP_SECRET: "desktop-e2e-app-secret",
       PRESET_SECRET: "desktop-e2e-preset-secret",
-      OWNER_PASSWORD: "desktop-e2e-owner-password",
+      OWNER_PASSWORD: "ChangeMe-Local-2026!",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -115,7 +127,7 @@ async function main() {
   console.log("app server up (sqlite dialect)");
 
   // 1) 首启自动建户：用户01 直接可登录
-  const login = await trpcMutate("auth.login", { email: "owner@example.com", password: "desktop-e2e-owner-password", remember: true });
+  const login = await trpcMutate("auth.login", { email: "owner@example.com", password: "ChangeMe-Local-2026!", remember: true });
   TOKEN = login.sessionToken;
   if (login.user?.username !== "用户01") throw new Error("自动建户失败：" + JSON.stringify(login.user));
   console.log("✔ 用户01 自动建户并登录");

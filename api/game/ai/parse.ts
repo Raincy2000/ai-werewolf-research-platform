@@ -80,7 +80,14 @@ export function truncateSpeech(text: string, max: number = SPEECH_MAX): string {
 }
 
 function asTrimmedString(v: unknown): string {
-  return typeof v === "string" ? v.trim() : "";
+  if (typeof v !== "string") return "";
+  // 部分模型会把段落分隔写成字面 \n（JSON 已二次转义）。
+  // 在统一决策入口还原控制序列，避免它们进入事件流并显示为反斜杠文本。
+  return v
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t")
+    .trim();
 }
 
 // ---------- 鲁棒修复（DeepSeek 等模型的常见失败形态） ----------
@@ -202,9 +209,9 @@ function salvageFields(text: string): DecisionInput | null {
     const m = text.match(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
     if (!m) return "";
     try {
-      return JSON.parse(`"${m[1]}"`) as string;
+      return asTrimmedString(JSON.parse(`"${m[1]}"`));
     } catch {
-      return m[1];
+      return asTrimmedString(m[1]);
     }
   };
   const thought = grab("thought").trim();
@@ -281,6 +288,18 @@ export function parseDecision(rawText: string, pending: PendingDecision): Decisi
   }
 
   const decision: DecisionInput = { thought: thought.slice(0, 600) };
+  if (typeof o.intent === "object" && o.intent !== null && !Array.isArray(o.intent)) {
+    const rawIntent = o.intent as Record<string, unknown>;
+    const intentTargets = [...new Set(toIntArray(rawIntent.targetSeats).filter((seat) => seat > 0))].slice(0, 16);
+    const basisEventSeqs = [...new Set(toIntArray(rawIntent.basisEventSeqs).filter((seq) => seq > 0))].slice(0, 16);
+    const rationale = asTrimmedString(rawIntent.rationale).slice(0, 600);
+    if (intentTargets.length || basisEventSeqs.length || rationale) {
+      decision.intent = {};
+      if (intentTargets.length) decision.intent.targetSeats = intentTargets;
+      if (basisEventSeqs.length) decision.intent.basisEventSeqs = basisEventSeqs;
+      if (rationale) decision.intent.rationale = rationale;
+    }
+  }
   if (speech) decision.speech = truncateSpeech(speech);
   if (targets.length > 0) decision.targets = targets;
   if (skip) decision.skip = true;
@@ -295,16 +314,13 @@ export function parseDecision(rawText: string, pending: PendingDecision): Decisi
   }
   if (o.witchSave === true) decision.witchSave = true;
 
-  // ---------- 语义清洗：互斥字段（防止引擎校验抛错） ----------
-  // 女巫同一晚只能用一瓶药：skip=什么都不做优先；用解药则不能再下毒；下毒则不能同时用解药
+  // ---------- 互斥字段边界 ----------
+  // 女巫同一晚只能用一瓶药：主体明确选择 skip 时按放弃处理；未选 skip 却同时给出双药，
+  // 必须保留完整非法意图并交引擎拒绝，不能由解析层替主体优先保留解药或毒药。
   if (pending.kind === "witchAction") {
     if (decision.skip === true) {
       delete decision.targets;
       delete decision.witchSave;
-    } else if (decision.witchSave === true) {
-      delete decision.targets;
-    } else if (decision.targets && decision.targets.length > 0) {
-      decision.witchSave = false;
     }
   }
   // selfDestruct 与 duel 互斥：优先自爆，清除决斗目标

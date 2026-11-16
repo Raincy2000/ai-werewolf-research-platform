@@ -12,12 +12,12 @@ import { inspectAttr } from 'plugin-inspect-react-code'
 // 对局引擎在 vite 重启/重载时经决策日志断点恢复续跑（已有机制），单引擎无抢班风险。
 export default defineConfig({
   plugins: [
-    // 仅 vite 内部资产（dev 客户端/源码）走 vite；其余全部进 hono app——
-    // / 由 dist/public 生产构建静态供给（磁盘资产稳定，vite 重启不破坏用户缓存页面），
-    // API 由 app 内 /api/trpc 路由提供
+    // 源码开发仅 /api/* 进 hono；首页、SPA 路由、Vite 内部资产与前端源码全部交给 Vite。
+    // 由 Vite 完整执行 transformIndexHtml，注入 /@vite/client 与 React preamble，
+    // 避免应用 SPA 回退把 JS 模块返回成 HTML，或首页缺少 React 预加载脚本导致空白。
     devServer({
       entry: "api/boot.ts",
-      exclude: [/^\/@vite\/.*$/, /^\/src\/.*$/, /^\/node_modules\/.*$/],
+      exclude: [/^\/(?!api\/).*$/],
     }),
     // dev 模式同样解除 Node http server 的 300s requestTimeout（铸魂师铸造/分析等长任务）
     {

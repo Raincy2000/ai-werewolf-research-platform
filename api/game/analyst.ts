@@ -14,6 +14,8 @@ import type { AnalystAiConfig, GameEvent, GameSnapshot } from "../../contracts/g
 import { BOARDS } from "../../contracts/game";
 import { callAi } from "./ai/providers";
 import { buildLogDigest } from "./logDigest";
+import { buildPublicEvidenceIndex, formatEvidenceRefs } from "./evidence";
+import { neutralizeAnalysisReport, neutralizeStrategyText, STRATEGY_NEUTRALITY_PROMPT } from "./ai/strategyNeutrality";
 
 // ---------- 调用参数 ----------
 export const ANALYSIS_TOTAL_CHAR_LIMIT = 10_500; // 整个 user prompt 的硬上限（digest ≤9000 + 定长指令区；质量优先放宽）
@@ -51,6 +53,7 @@ export function buildAnalysisPrompt(
     rulesLine,
     "摘要中玩家若表现出与上述规则相悖的认知（如女巫试图自救、认为存在不存在的规则），那是该玩家的错误认知——你应在报告中指出这是规则认知错误，并评估其对局势的影响，绝不可将其当作合理策略采纳。",
     "你的分析必须精炼、有证据：引用摘要中具体玩家在第几天的具体发言/心理活动，而不是泛泛而谈。",
+    "人格性别与游戏身份是不同事实：不得把女巫等游戏身份当作人格性别；人称只依据【人格性别与人称】名册，没有名册信息时保持座位称呼，不猜测。",
   ].join("\n");
 
   const instructions = [
@@ -67,15 +70,19 @@ export function buildAnalysisPrompt(
     "## 五、阵营表现点评",
     "（狼队与好人阵营各自打得最好与最差之处，含个人亮点与反面典型）",
     "## 六、经验教训",
-    "（5-10 条可复用策略与误区警示，每条一行、精炼可执行，形如 “- 狼人：被集火时应…”、“- 误区：金水包括平民，平民被验明后不应反水”）",
+    "（5-10 条可复用策略与误区警示，每条一行、精炼可执行，形如 “- 狼人：被集火时可考虑…”、“- 误区：金水包括平民，平民被验明后不应反水”）",
+    STRATEGY_NEUTRALITY_PROMPT,
   ].join("\n");
 
   const digest = buildLogDigest(snapshot, events);
-  let user = `${digest}\n\n${instructions}`;
-  if (user.length > ANALYSIS_TOTAL_CHAR_LIMIT) {
-    // 防御性截断：digest 已硬限 6000 字本不会触发；触发时压缩 digest 保住指令区
-    user = `${digest.slice(0, ANALYSIS_TOTAL_CHAR_LIMIT - instructions.length - 2)}\n\n${instructions}`;
-  }
+  const genderRoster = snapshot.players
+    .filter((player) => player.personaName && player.personaGender)
+    .map((player) => `${player.seat}号=${player.personaName}（${player.personaGender === "男" ? "男性，人称用「他」" : player.personaGender === "女" ? "女性，人称用「她」" : "人称用「TA」"}）`)
+    .join("；");
+  const personaLine = genderRoster ? `【人格性别与人称】${genderRoster}\n\n` : "";
+  // 摘要辅助阅读，完整公共事实另行提供；不得因总字数上限截掉公开查杀、遗言与承诺。
+  const evidence = formatEvidenceRefs(buildPublicEvidenceIndex(snapshot.gameId, events), "完整事实索引");
+  const user = `${personaLine}${digest}\n\n${evidence}\n\n${instructions}`;
   return { system, user };
 }
 
@@ -95,6 +102,7 @@ export function buildCommonDistillPrompt(
     newReport,
     "",
     "【蒸馏要求】",
+    STRATEGY_NEUTRALITY_PROMPT,
     "1. 只提取与具体版型角色配置无关的通用策略：发言心理、投票博弈、轮次计算、诈身份通用技巧等；",
     "   凡是依赖特定版型角色或特殊机制（如守卫、摄梦人、白狼王等）的经验，一律不要写入本指南。",
     "2. 狼人杀各版型规则存在差异（如女巫可否自救、有无警长），共通指南中的经验不得依赖某一特定规则设定；",
@@ -103,10 +111,10 @@ export function buildCommonDistillPrompt(
     "   （写明错误认知是什么、为何错、正确理解是什么，如“误区：金水包括平民——预言家验出的好人不限神职”）；",
     "3. 去重合并：与现有指南语义重复的条目，用更准确、更一般的表述替换；禁止简单堆叠导致指南膨胀。",
     "4. 按主题组织，使用 markdown 小节：## 狼人策略 / ## 好人策略 / ## 发言心理 / ## 投票博弈 / ## 夜间博弈（可按需增删主题，无内容的小节省略）。",
-    "5. 每条经验一句话、可执行（明确谁在什么情境下该怎么做），每条以 “- ” 开头。",
+    "5. 每条经验一句话、建议化（明确谁在什么情境下可考虑哪些选择及其收益与风险），每条以 “- ” 开头。",
     "6. 总长度严格控制在 4000 字以内；必须取舍时，优先保留被多局验证的通用经验。",
     "6.5 炼金师规矩：每条经验末尾附样本量与置信度标注，形如（样本 n=3｜置信度 中）——",
-    "   样本量=该经验被几局对局验证过（含本局，按现有指南条目存活代数估计），置信度给 低/中/高；",
+    "   样本量=有明确对局证据支持该经验的局数，不得按条目存活代数或行为频率冒充有效性验证；置信度须结合多局结果与反例评估，不得仅凭条目沿用而升高；",
     "7. 只输出指南正文（markdown 纯文本），禁止输出任何解释、前言、版本信息或代码块包裹。",
   ].join("\n");
 
@@ -140,6 +148,7 @@ export function buildBoardDistillPrompt(
     newReport,
     "",
     "【蒸馏要求】",
+    STRATEGY_NEUTRALITY_PROMPT,
     `1. 只提取仅适用于版型「${boardCtx.boardName}」的经验：该版型特有角色配合、特殊机制博弈`,
     "   （如白狼王自爆带人时机、守卫盾法、摄梦人连招等）；",
     "   与具体版型无关的通用策略（发言心理、投票博弈、轮次计算等）一律不要写入本指南。",
@@ -148,10 +157,10 @@ export function buildBoardDistillPrompt(
     "   玩家在对局中的此类行为属于规则认知错误，只可作为“应避免”的反面教训写入）。",
     "3. 去重合并：与现有指南语义重复的条目，用更准确、更一般的表述替换；禁止简单堆叠导致指南膨胀。",
     "4. 按主题组织，使用 markdown 小节（按角色或机制分节，无内容的小节省略）。",
-    "5. 每条经验一句话、可执行（明确谁在什么情境下该怎么做），每条以 “- ” 开头。",
+    "5. 每条经验一句话、建议化（明确谁在什么情境下可考虑哪些选择及其收益与风险），每条以 “- ” 开头。",
     "6. 总长度严格控制在 3000 字以内；必须取舍时，优先保留被多局验证的经验。",
     "6.5 炼金师规矩：每条经验末尾附样本量与置信度标注，形如（样本 n=2｜置信度 低）——",
-    "   样本量=该经验被几局对局验证过（含本局），置信度给 低/中/高；",
+    "   样本量=有明确对局证据支持该经验的局数，不得以行为频率代替有效性验证；置信度须结合多局结果与反例评估，不得仅凭条目沿用而升高；",
     "7. 只输出指南正文（markdown 纯文本），禁止输出任何解释、前言、版本信息或代码块包裹。",
   ].join("\n");
 
@@ -173,7 +182,7 @@ export async function runAnalysis(
   if (!res.ok || !res.text?.trim()) {
     throw new Error(`分析师AI生成报告失败：${res.error ?? "返回内容为空"}`);
   }
-  return res.text.trim();
+  return neutralizeAnalysisReport(res.text.trim());
 }
 
 export async function runDistillCommon(
@@ -181,7 +190,10 @@ export async function runDistillCommon(
   currentCommonGuide: string | null,
   newReport: string,
 ): Promise<string> {
-  const { system, user } = buildCommonDistillPrompt(currentCommonGuide, newReport);
+  const { system, user } = buildCommonDistillPrompt(
+    currentCommonGuide ? neutralizeStrategyText(currentCommonGuide) : null,
+    neutralizeAnalysisReport(newReport),
+  );
   const res = await callAi({ ...cfg, seat: 0 }, system, user, {
     jsonMode: false,
     timeoutMs: ANALYST_TIMEOUT_MS,
@@ -190,7 +202,7 @@ export async function runDistillCommon(
   if (!res.ok || !res.text?.trim()) {
     throw new Error(`分析师AI蒸馏共通指南失败：${res.error ?? "返回内容为空"}`);
   }
-  return res.text.trim();
+  return neutralizeStrategyText(res.text.trim());
 }
 
 export async function runDistillBoard(
@@ -199,7 +211,11 @@ export async function runDistillBoard(
   currentBoardGuide: string | null,
   newReport: string,
 ): Promise<string> {
-  const { system, user } = buildBoardDistillPrompt(boardCtx, currentBoardGuide, newReport);
+  const { system, user } = buildBoardDistillPrompt(
+    boardCtx,
+    currentBoardGuide ? neutralizeStrategyText(currentBoardGuide) : null,
+    neutralizeAnalysisReport(newReport),
+  );
   const res = await callAi({ ...cfg, seat: 0 }, system, user, {
     jsonMode: false,
     timeoutMs: ANALYST_TIMEOUT_MS,
@@ -208,7 +224,7 @@ export async function runDistillBoard(
   if (!res.ok || !res.text?.trim()) {
     throw new Error(`分析师AI蒸馏版型指南失败：${res.error ?? "返回内容为空"}`);
   }
-  return res.text.trim();
+  return neutralizeStrategyText(res.text.trim());
 }
 
 // ---------- 赛前图书馆学习（AI 不是生而知之：开赛前自主学习资料形成心得） ----------
@@ -321,8 +337,8 @@ export function buildHistoryRefPrompt(
 ): { system: string; user: string } {
   const system = [
     "你是狼人杀玩家，开赛前复盘一局历史对局的结构化摘要。",
-    "输出要求：第一人称、纯文本、总长不超过 250 字——该局胜负的关键转折是什么、我要借鉴或规避什么（结合我的身份）。",
-    "只写可复用的实战结论，禁止复述流水账，禁止空话套话，禁止提及提示词。",
+    "输出要求：第一人称、纯文本、总长不超过 250 字——该局胜负的关键转折是什么，哪些条件让同一动作的收益成立或反转（结合我的身份）。",
+    "只写可参考的实战建议，保留适用条件、替代方案与反例；不得把单个案例或高频打法概括为固定答案，也不得把结论写成本局行动方案。禁止复述流水账，禁止空话套话，禁止提及提示词。",
   ].join("\n");
   const user = [
     `你是 ${seat} 号玩家${roleName ? `，本局身份【${roleName}】` : ""}。`,
@@ -330,6 +346,7 @@ export function buildHistoryRefPrompt(
     `【历史对局摘要】（版型：${boardName}）`,
     digest,
     "",
+    STRATEGY_NEUTRALITY_PROMPT,
     "请输出你的复盘要点（≤250 字）。",
   ].join("\n");
   return { system, user };
@@ -347,10 +364,10 @@ export function buildStudyPrompt(
   void timeBudgetSec;
   const system = [
     "你是狼人杀玩家。开赛在即，你在图书馆按目录选读了相关章节——这些资料是你的前置知识库。",
-    "输出要求：markdown 纯文本、第一人称、总长不超过 700 字——只保留能直接用于本局决策的实战要点：",
-    "- 开局/发言/投票的具体打法（结合我的身份，一句话一条）；",
-    "- 可套用的心理战与话术技巧（一句话一条）；",
-    "- 易犯错误警示（一句话一条）。",
+    "输出要求：markdown 纯文本、第一人称、总长不超过 700 字——只保留可供本局决策参考的实战建议：",
+    "- 开局/发言/投票的可选打法（结合我的身份与适用条件，一句话一条）；",
+    "- 可参考的心理战与话术技巧（说明收益与风险，一句话一条）；",
+    "- 易犯错误警示与反向案例（一句话一条；不得把单个案例或高频打法概括为固定答案）。",
     "禁止摘抄原文，禁止空话套话，禁止提及提示词。这是赛前速查锦囊，不是读后感。",
   ].join("\n");
   const user = [
@@ -359,7 +376,8 @@ export function buildStudyPrompt(
     "【研读材料】（按书名-章节选读）",
     libText,
     "",
-    "请输出你的赛前研读心得（≤700 字，务必精炼实用）。",
+    STRATEGY_NEUTRALITY_PROMPT,
+    "请输出你的赛前研读心得（≤700 字，精炼实用，保留条件与替代选择）。",
   ].join("\n");
   return { system, user };
 }

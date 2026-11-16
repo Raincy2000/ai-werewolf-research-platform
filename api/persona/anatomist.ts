@@ -10,6 +10,7 @@ import type { SeatAiConfig } from "../../contracts/game";
 import type { PersonaCard } from "../../contracts/persona";
 import { callAi } from "../game/ai/providers";
 import { ANALYST_MAX_RETRIES, ANALYST_TIMEOUT_MS } from "../game/analyst";
+import { formatEvidenceRefs, type EvidenceRef } from "../game/evidence";
 
 export function buildPsyCheckPrompt(opts: {
   card: PersonaCard;
@@ -18,7 +19,9 @@ export function buildPsyCheckPrompt(opts: {
   outcome: string;
   digest: string;
   gameTitleNo?: string;
-  rulesText?: string; // 本局官方规则全文（2026-10-15 用户裁定：心理检查的规则认知必须与引擎一致）
+  rulesText?: string;
+  /** 当前主体合法可见的完整事实；摘要仅辅助阅读 */
+  evidence?: EvidenceRef[]; // 本局官方规则全文（2026-10-15 用户裁定：心理检查的规则认知必须与引擎一致）
 }): { system: string; user: string } {
   const { card, seat, roleName, outcome, digest } = opts;
   const system = [
@@ -49,9 +52,10 @@ export function buildPsyCheckPrompt(opts: {
     "",
     card.profile.persona ? `【人设】${card.profile.persona.slice(0, 500)}` : "",
     "",
-    "【对局摘要】",
+    "【对局摘要】（仅辅助阅读，不代替完整事实）",
     digest,
     "",
+    ...(opts.evidence?.length ? [formatEvidenceRefs(opts.evidence, "完整事实索引"), ""] : []),
     "【输出要求】markdown 格式，全文 ≤2000 字，严格包含以下章节（## 标题）：",
     "## 一、人格卡快照",
     "（TA 带着怎样的参数与过往走进这局：两三句，点出最醒目的冲突参数组合）",
@@ -76,6 +80,8 @@ export async function runPsyCheck(
     digest: string;
     gameTitleNo?: string;
     rulesText?: string;
+  /** 当前主体合法可见的完整事实；摘要仅辅助阅读 */
+  evidence?: EvidenceRef[];
   },
 ): Promise<string> {
   const prompt = buildPsyCheckPrompt(opts);

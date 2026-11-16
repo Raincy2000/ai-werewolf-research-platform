@@ -238,6 +238,23 @@ export const personaMemories = mysqlTable(
   (t) => [index("idx_pmem_persona").on(t.personaId)],
 );
 
+export const personaMemoryEvidence = mysqlTable(
+  "persona_memory_evidence",
+  {
+    memoryId: int("memory_id").notNull(),
+    gameId: varchar("game_id", { length: 64 }).notNull(),
+    eventSeq: int("event_seq").notNull(),
+    source: varchar("source", { length: 32 }).notNull().default("self_narrative"),
+    learnedAt: varchar("learned_at", { length: 16 }).notNull().default("postgame"),
+    narrativeVersion: int("narrative_version").notNull().default(1),
+    supersedes: int("supersedes"),
+  },
+  (t) => [
+    primaryKey({ columns: [t.memoryId, t.gameId, t.eventSeq] }),
+    index("idx_pme_memory").on(t.memoryId),
+  ],
+);
+
 // 关系图谱表（记事簿）：跨对局关系传递；affinity 负值=敌意
 export const personaRelationships = mysqlTable(
   "persona_relationships",

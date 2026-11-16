@@ -19,6 +19,17 @@ export interface EngineEvent {
   meta: Record<string, unknown> | null;
 }
 
+// ---------- 发言与回应契约（只描述流程，不替玩家判断身份或战术） ----------
+export interface SpeechContract {
+  stage: "sheriffSpeech" | "daySpeech" | "pkSpeech";
+  orderedSeats: number[];
+  spokenSeats: number[];
+  remainingSeats: number[];
+  interruptedSeats: number[];
+  mandatory: true;
+  nextStages: Record<number, Array<"daySpeech" | "pkSpeech" | "lastWords" | "postgame">>;
+}
+
 // ---------- 玩家视角（信息壁垒出口，只含该玩家可见信息） ----------
 export interface PlayerView {
   seat: number;
@@ -37,6 +48,7 @@ export interface PlayerView {
   boardRules?: string;            // 版型官方规则全文（开局即全员公开：角色池/胜负/警长/女巫/特殊角色要点）
   // 公开历史：发言与投票记录（所有玩家都能看到的东西）
   publicLog: string[];            // 按时间排序的公开事件文本（发言全文、投票明细、死亡公告）
+  speech?: SpeechContract;         // 发言/投票相关决策时的回应流程事实（阶段、顺序、后续合法可能）
   // 私密信息（因角色而异；不包含其他玩家身份！）
   private: {
     wolfTeammates?: number[];     // 狼队队友座位（石像鬼/隐狼不见面，不在其中）
@@ -113,8 +125,19 @@ export interface PendingDecision {
 }
 
 // ---------- AI 决策回传 ----------
+export interface IntentState {
+  /** 主体当前意图目标；可指向未来对象，不等同于本次合法动作 targets。 */
+  targetSeats?: number[];
+  /** 主体自愿留下的当下理由；缺省时沿用 thought，不由系统补写。 */
+  rationale?: string;
+  /** 主体自愿关联的事件序号；仅作认知依据，不证明结论正确。 */
+  basisEventSeqs?: number[];
+}
+
 export interface DecisionInput {
   thought: string;          // 心理活动（观察者可见，不进其他玩家 prompt）
+  /** 主体当场形成的显式意图；引擎只结算动作字段，不据此奖励、惩罚或替换选择。 */
+  intent?: IntentState;
   speech?: string;          // 公开发言（发言类决策必填）
   targets?: number[];       // 目标座位
   skip?: boolean;           // 放弃技能

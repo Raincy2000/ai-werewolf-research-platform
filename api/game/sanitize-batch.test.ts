@@ -29,8 +29,9 @@ describe("批次子决策清洗（暗选暗票事故回归）", () => {
     const knight = fakeSub("daySkill", "knight", [1, 2, 4, 5], true);
     expect(sanitizeBatchInput(knight, { thought: "t", duel: 4 })).toEqual({ thought: "t", duel: 4 });
     expect(sanitizeBatchInput(knight, { thought: "t" })).toEqual({ thought: "t", skip: true });
-    expect(sanitizeBatchInput(knight, { thought: "t", duel: 99 })).toEqual({ thought: "t", skip: true });
-    expect(sanitizeBatchInput(wolf, { thought: "t", duel: 4 })).toEqual({ thought: "t", skip: true });
+    // 非法技能意图只能标记退回，不得静默改成按兵不动并进入结算。
+    expect(sanitizeBatchInput(knight, { thought: "t", duel: 99 }).thought).toMatch(/^\[AI输出非法/);
+    expect(sanitizeBatchInput(wolf, { thought: "t", duel: 4 }).thought).toMatch(/^\[AI输出非法/);
   });
 
   it("上警报名（不允许跳过）：合法 targets 原样保留，绝不被篡改为 skip", () => {

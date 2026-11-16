@@ -197,11 +197,11 @@ beforeEach(() => {
 });
 
 describe("parse 互斥字段语义清洗", () => {
-  it("witchSave=true 时强制清空 targets（同晚只能用一瓶药）", () => {
-    const d = parseDecision('{"thought":"救人","witchSave":true,"targets":[5]}', witchPending);
+  it("同晚双药互斥时保留完整非法意图，交引擎退回而非替玩家选解药", () => {
+    const d = parseDecision('{"thought":"救人又毒人","witchSave":true,"targets":[5]}', witchPending);
     expect(d).not.toBeNull();
     expect(d!.witchSave).toBe(true);
-    expect(d!.targets).toBeUndefined();
+    expect(d!.targets).toEqual([5]);
   });
 
   it("targets 非空时强制 witchSave=false", () => {
@@ -261,31 +261,22 @@ describe("tick 循环：decide 校验抛错处理", () => {
     await gameService.control(gameId, "terminate");
   });
 
-  it("解药耗尽仍 witchSave → 意图保留式修正（不托管、不重试、thought 保留、meta.repaired 标注）", async () => {
-    // 事故回归（2026-08-02 线上实锤）：解药首夜已用，后续夜晚模型仍 witchSave=true，
-    // 引擎拒"解药已用完"→重试仍犯→整轮降级托管。修复后：repairDecision 直接修成合法等价。
+  it("解药耗尽仍 witchSave → 不自动改成不用药；带原因重试，仍非法则暂停且不消费决策", async () => {
     h.engine = makeFakeEngine((d) => (d.witchSave ? "解药已用完" : null));
-    // 待决视图里药水状态为"解药无"（引擎校验与服务层修正共用同一事实源）
     witchPending.view.private.witchPotions = { save: false, poison: true };
-    h.aiQueue.push('{"thought":"想救2号","witchSave":true}');
+    h.aiQueue.push('{"thought":"想救2号","witchSave":true}', '{"thought":"仍想救2号","witchSave":true}');
 
     const gameId = await startGame();
-    await waitStatus(gameId, "finished");
+    await waitStatus(gameId, "paused");
 
-    expect(h.aiCalls.length).toBe(1); // 不触发重试
-    const last = h.engine!.state.decided.at(-1)!;
-    expect(last.witchSave).toBeUndefined(); // 解药被剔除
-    expect(last.skip).toBe(true); // 按不用药处理
-    expect(last.thought).toBe("想救2号"); // 思考量保留（此前会被托管标签覆盖丢失）
-    expect(last.thought).not.toContain("系统托管");
-    expect(
-      h.events.some((e) => {
-        const m = typeof e.meta === "string" ? e.meta : JSON.stringify(e.meta ?? {});
-        return m.includes("AI输出修正");
-      }),
-    ).toBe(true);
-    // 恢复夹具，避免污染同文件其他用例
+    expect(h.aiCalls.length).toBe(2);
+    expect(h.aiCalls[1].user).toContain("解药已用完");
+    expect(h.engine!.state.decided.length).toBe(0);
+    const { registry } = await import("../service");
+    expect(registry.get(gameId)!.pauseReason).toContain("连续输出非法");
+    expect(h.events.some((e) => e.thought === "[AI输出非法，系统托管]")).toBe(false);
     witchPending.view.private.witchPotions = { save: true, poison: true };
+    await gameService.control(gameId, "terminate");
   });
 
   it("AI 连续无响应 → 立即暂停（托管抹消），决策不消费、提示含恢复指引", async () => {

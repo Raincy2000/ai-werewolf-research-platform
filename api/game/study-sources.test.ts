@@ -10,6 +10,7 @@ const h = vi.hoisted(() => ({
   notes: new Map<string, string>(),
   docs: [] as { name: string; content: string }[],
   historyEnabled: false,
+  invalidHistoryPick: false,
   guideText: "通用指南要点\n版型指南要点",
   libraryCalls: 0,
   historyCalls: 0,
@@ -124,7 +125,7 @@ vi.mock("./ai/providers", () => ({
   callAi: async (_cfg: unknown, system: string, user: string) => {
     if (user.includes("【历史对局档案】")) {
       h.studyUsers.push(user);
-      return { ok: true, text: `{"games":["abcdef12"]}`, latencyMs: 1, error: null };
+      return { ok: true, text: h.invalidHistoryPick ? '{"games":["not-found"]}' : `{"games":["abcdef12"]}`, latencyMs: 1, error: null };
     }
     if (system.includes("复盘一局历史对局")) {
       h.studyUsers.push(user);
@@ -184,6 +185,7 @@ beforeEach(() => {
   h.notes.clear();
   h.docs = [];
   h.historyEnabled = false;
+  h.invalidHistoryPick = false;
   h.guideText = "通用指南要点\n版型指南要点";
   h.libraryCalls = 0;
   h.historyCalls = 0;
@@ -265,6 +267,40 @@ describe("可组合赛前学习来源", () => {
     await gameService.control(gameId, "terminate", "test-user");
   });
 
+  it("未选择指南来源时决策资料快照为空，选择后冻结开局版本", async () => {
+    const withoutGuide = await startStudy({ libraryEnabled: true, studyGuideEnabled: false });
+    expect(registry.get(withoutGuide)!.guideTextSnapshot).toBe("");
+    await gameService.control(withoutGuide, "terminate", "test-user");
+
+    const original = h.guideText;
+    const withGuide = await startStudy({
+      libraryEnabled: true,
+      studyGuideEnabled: true,
+      studyLibraryEnabled: false,
+    });
+    const frozen = registry.get(withGuide)!.guideTextSnapshot;
+    expect(frozen).toContain(original);
+    h.guideText = "赛后新增加的指南，不得回流当前局";
+    expect(registry.get(withGuide)!.guideTextSnapshot).toBe(frozen);
+    expect(registry.get(withGuide)!.guideTextSnapshot).not.toContain("赛后新增加");
+    await gameService.control(withGuide, "terminate", "test-user");
+  });
+
+  it("历史选局失败时不由系统代选最近对局", async () => {
+    h.historyEnabled = true;
+    h.invalidHistoryPick = true;
+    const gameId = await startStudy({
+      libraryEnabled: true,
+      studyHistoryEnabled: true,
+      studyLibraryEnabled: false,
+      studyGuideEnabled: false,
+    });
+    const note = registry.get(gameId)!.studyNotes!.get(1) ?? "";
+    expect(note).not.toContain("历史借鉴");
+    expect(note).not.toContain("历史对局参考");
+    await gameService.control(gameId, "terminate", "test-user");
+  });
+
   it("所有选中来源均为空：直接完成且不发起学习调用", async () => {
     h.guideText = "";
     const gameId = await startStudy({
@@ -274,6 +310,32 @@ describe("可组合赛前学习来源", () => {
       studyGuideEnabled: true,
     });
     expect(registry.get(gameId)!.studyNotes!.size).toBe(0);
+    expect(h.studyUsers).toHaveLength(0);
+    await gameService.control(gameId, "terminate", "test-user");
+  });
+
+  it("关闭赛前学习与全部来源：不等待学习、不读取资料，直接完成首个夜间决策", async () => {
+    const { gameId } = await gameService.createGame({
+      boardId: "standard9",
+      seats: seats(),
+      options: {
+        ...OPTS,
+        libraryEnabled: false,
+        studyHistoryEnabled: false,
+        studyGuideEnabled: false,
+        studyLibraryEnabled: false,
+      },
+      winRateEnabled: false,
+    }, "test-user");
+    await gameService.control(gameId, "start", "test-user");
+    await waitFor(
+      () => h.decisions.some((d) => d.gameId === gameId),
+      "关闭赛前学习后的首个夜间决策",
+    );
+    expect(registry.get(gameId)!.status).toBe("running");
+    expect(registry.get(gameId)!.guideTextSnapshot).toBe("");
+    expect(h.libraryCalls).toBe(0);
+    expect(h.historyCalls).toBe(0);
     expect(h.studyUsers).toHaveLength(0);
     await gameService.control(gameId, "terminate", "test-user");
   });

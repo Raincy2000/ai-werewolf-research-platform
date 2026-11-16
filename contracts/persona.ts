@@ -251,8 +251,24 @@ export interface PersonaMemory {
   emotionalWeight: number; // 0-100 唤醒度（arousal）
   valence: number; // -100..100 效价（valence）：负=创伤/挫败，正=高光/成就（Russell 1980）
   strength: number; // 0-100 记忆强度（随时间衰减，被唤起/复述则强化）
+  /** 缺省旧记录只代表历史来源，不得被当成已核事实 */
+  source?: MemorySource;
   createdAt: string;
   updatedAt: string; // 最近一次强化/衰减触碰时间
+}
+
+export type MemorySource = "event_fact" | "self_narrative" | "observer_inference" | "old_memory";
+export type MemoryLearnedAt = "live" | "postgame" | "reportReady" | "unknown";
+
+/** 记忆与原始事件的证据链接：个人叙述可保留，但不能因此冒充原始事实。 */
+export interface PersonaMemoryEvidence {
+  memoryId: number;
+  gameId: string;
+  eventSeq: number;
+  source: MemorySource;
+  learnedAt: MemoryLearnedAt;
+  narrativeVersion: number;
+  supersedes: number | null;
 }
 
 // ---------- 记事簿：关系图谱 ----------
@@ -820,6 +836,10 @@ export interface MirrorReport {
   selfControl: number; // 自控余量 0-100（低=涌现更失控）
   /** 对在场者的真实感受（可为空；缺省时视为无特别感受） */
   bonds?: MirrorBond[];
+  /** 当前事件进入后、公开发言前的原始反应；平静或无反应时可为空字符串。 */
+  currentReaction?: string;
+  /** 主体是否愿意继续反思；false 时其余深层字段保持空白，不由观察者补写。 */
+  wantsReflection?: boolean;
 }
 
 /** 涌现事件注解（落 event.meta.persona）：双视角解释（铁律4）+ 撕裂摘要（观察者展示） */
@@ -831,6 +851,10 @@ export interface PersonaEventMeta {
   psy: string; // 人格动力学解释（一句）
   contextVersion?: string; // 本局人格上下文版本（观察者审计，不进人物可见文本）
   degraded?: string[]; // 小上下文预算下被整块降级的材料；空数组=无降级
+  /** 观察者展示模板：只在事件附加人格元数据时使用，绝不覆盖主体原始 thought。 */
+  observerThought?: string;
+  /** 表达问题只作观察，不触发系统代写；空数组=未检测到。 */
+  expressionIssues?: string[];
 }
 
 // ---------- 铸魂师（AI 铸造：联网检索 + 整合量化） ----------

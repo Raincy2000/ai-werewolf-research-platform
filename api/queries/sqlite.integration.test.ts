@@ -54,6 +54,7 @@ beforeEach(async () => {
     tbl.personaCognitionNotes,
     tbl.personaCastCheckpoints,
     tbl.personaRelationships,
+    tbl.personaMemoryEvidence,
     tbl.personaMemories,
     tbl.personas,
     tbl.games,
@@ -662,5 +663,42 @@ describe("persona_cast_drafts（草稿箱：进程镜像与清库唯一通道）
     // 用户主动删除=唯一清库口
     await personasQ.deletePersonaCastDraft("d1");
     expect((await personasQ.listPersonaCastDrafts()).find((r) => r.castId === "d1")).toBeUndefined();
+  });
+});
+
+describe("persona_memory_evidence（记忆事件溯源）", () => {
+  it("证据链接幂等且来源明确，旧记忆内容不被改写", async () => {
+    const original = "我赛后以为当时没有公开查杀";
+    const persona = await personasQ.createPersona(
+      "evidence-u",
+      { name: "溯源人格", params: defaultPersonaParams(), profile: emptyPersonaProfile() },
+      "manual",
+    );
+    const [memoryId] = await personasQ.insertPersonaMemories([{
+      personaId: persona.id,
+      gameId: "g-evidence",
+      type: "general",
+      content: original,
+      emotionalWeight: 70,
+      valence: -50,
+      strength: 60,
+    }]);
+    const evidence = {
+      memoryId,
+      gameId: "g-evidence",
+      eventSeq: 179,
+      source: "self_narrative" as const,
+      learnedAt: "postgame" as const,
+      narrativeVersion: 1,
+      supersedes: null,
+    };
+    await personasQ.insertPersonaMemoryEvidence([evidence]);
+    await personasQ.insertPersonaMemoryEvidence([evidence]);
+    const linked = await personasQ.getPersonaMemoryEvidence([memoryId]);
+    expect(linked).toHaveLength(1);
+    expect(linked[0]).toMatchObject({ memoryId, eventSeq: 179, source: "self_narrative" });
+    const all = await personasQ.listPersonaMemories(persona.id, "evidence-u");
+    expect(all?.find((m) => m.id === memoryId)?.content).toBe(original);
+    expect(await personasQ.getPersonaMemoryEvidence([999_999])).toEqual([]);
   });
 });

@@ -7,6 +7,7 @@ import { describe, it, expect } from "vitest";
 import type { PendingDecision, PlayerView } from "../engine/api";
 import {
   buildPrompt,
+  formatPublicLog,
   modelContextTokens,
   promptCharBudget,
 } from "./prompts";
@@ -48,7 +49,7 @@ const LONG_LOG = Array.from(
   (_, i) =>
     `${(i % 12) + 1}号玩家发言：上一轮${(i % 5) + 1}号的投票逻辑很矛盾，他先说相信3号是好人，最后却把票投给了3号，这种摇摆是典型的狼人行为，我认为应该重点怀疑并听其解释。`,
 );
-const LONG_GUIDE = "女巫全程不可自救，解药应用于救治关键神职；警长归票时注意末置位发言。".repeat(120); // 约 5000+ 字符
+const LONG_GUIDE = "女巫可结合轮次与风险选择是否用药；警长可结合发言与票型选择归票对象。".repeat(120); // 约 5000+ 字符，全部为可保留的建议文本
 
 describe("prompt 长度预算", () => {
   it("模型上下文映射：已知型号精确命中，未知型号保守 16K", () => {
@@ -118,16 +119,67 @@ describe("prompt 长度预算", () => {
     expect(user).toContain("2号=第二夜 · 被女巫毒杀");
   });
 
-  it("赛后权威事实卡紧邻输出契约，明确出局时间的核对依据", () => {
+  it("赛后权威事实卡只列引擎事实，不指导玩家如何理解", () => {
     const pending = makePending([]);
     pending.kind = "postgameSpeak";
     pending.view.phase = "postgame.discuss";
     pending.view.deathTimeline = { 10: "第三日 · 被放逐" };
     const { user } = buildPrompt(pending);
     expect(user).toContain("【赛后权威事实卡】");
-    expect(user).toContain("涉及出局时间时必须以此为准");
-    expect(user.indexOf("【赛后权威事实卡】")).toBeGreaterThan(user.indexOf("【心理博弈】"));
+    expect(user).toContain("10号=第三日 · 被放逐");
+    expect(user).not.toContain("不要沿用其错误");
+    expect(user.indexOf("【赛后权威事实卡】")).toBeGreaterThan(user.indexOf("【你的任务】"));
     expect(user.indexOf("【赛后权威事实卡】")).toBeLessThan(user.indexOf("【输出契约】"));
+  });
+
+  it("发言契约只陈述阶段、顺序和合法可能，不指导或禁止身份推理", () => {
+    const pending = makePending([]);
+    pending.view.speech = {
+      stage: "pkSpeech",
+      orderedSeats: [4, 8],
+      spokenSeats: [4],
+      remainingSeats: [8],
+      interruptedSeats: [2],
+      mandatory: true,
+      nextStages: { 4: ["lastWords", "postgame"], 8: ["lastWords", "postgame"], 2: ["daySpeech"] },
+    };
+    const { user } = buildPrompt(pending);
+    expect(user).toContain("【发言与回应契约】");
+    expect(user).toContain("pkSpeech");
+    expect(user).toContain("已发言：4号");
+    expect(user).toContain("待发言：8号");
+    expect(user).toContain("中断：2号");
+    expect(user).toContain("后续合法可能");
+    expect(user).toContain("当前阶段已发言者不能在该阶段再次普通回应。");
+    for (const text of ["不证明清白", "不得仅凭", "分析配合需要", "后续阶段是否存在", "不能提前预支", "【心理博弈】"]) {
+      expect(user).not.toContain(text);
+    }
+  });
+
+  it("资料原文不被运行时改写，且不再常驻角色策略参考", () => {
+    const rawGuide = "预言家必须第一天起跳，绝不留到第二天。";
+    const { user } = buildPrompt(makePending([]), { guide: rawGuide });
+    expect(user).toContain(rawGuide);
+    expect(user).not.toContain("可考虑第一天起跳");
+    expect(user).not.toContain("【策略参考】");
+  });
+
+  it("发言风格与赛后参与方式由主体决定，不使用统一积极攻防指令", () => {
+    const normal = buildPrompt(makePending([]));
+    expect(normal.system).not.toContain("有立场、有逻辑攻防");
+    const pending = makePending([]);
+    pending.kind = "postgameSpeak";
+    const postgame = buildPrompt(pending);
+    expect(postgame.user).not.toContain("鼓励积极发言");
+  });
+
+  it("早期公开记录超限时保留完整编号索引，而不是无声丢弃", () => {
+    const lines = Array.from({ length: 80 }, (_, i) => `[#${i + 1}] ${i + 1}号玩家发言：第${i + 1}条记录`);
+    const text = formatPublicLog(lines, 300);
+    expect(text).toContain("早期记录编号索引");
+    expect(text).toContain("#1");
+    expect(text).toContain("#40");
+    expect(text).toContain("[#80]");
   });
 
   it("缺省 modelContext 按保守 16K 处理", () => {

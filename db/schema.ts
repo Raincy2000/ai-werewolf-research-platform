@@ -31,6 +31,7 @@ export const personaCastDrafts =
 export const personaRelationshipHistory =
   picked.personaRelationshipHistory as typeof mysqlSchema.personaRelationshipHistory;
 export const personaDriftLog = picked.personaDriftLog as typeof mysqlSchema.personaDriftLog;
+export const personaMemoryEvidence = picked.personaMemoryEvidence as typeof mysqlSchema.personaMemoryEvidence;
 export const personaReports = picked.personaReports as typeof mysqlSchema.personaReports;
 
 export type { GameRow, GameEventRow, UserRow, SessionRow } from "./schema.mysql";

@@ -14,6 +14,13 @@ export interface PersonaCircleBinding {
   gender?: string | null; // 性别（男/女/其他）：决定人称代词——夜神月是女巫角色但被叫「她」的事故防线
 }
 
+/** 历史快照只从开局冻结人格卡恢复性别，不从女巫/猎人等游戏角色名推断。 */
+export function personaGenderFromSetup(setup: {
+  personaSnapshots?: Record<string, { card?: { profile?: { gender?: string | null } | undefined } | undefined } | undefined>;
+}, seat: number): string | null {
+  return setup.personaSnapshots?.[String(seat)]?.card?.profile?.gender ?? null;
+}
+
 /** 观察者人格与在场另一人格的羁绊（记事簿跨局关系 + 档案互提的原作渊源） */
 export interface PersonaBondInfo {
   seat: number; // 对方座位
@@ -26,6 +33,13 @@ export interface PersonaBondInfo {
 }
 
 export type PersonaVisibility = "full" | "partial" | "none";
+
+/** 运行时完整性闸门：名册存在却未进入实际提示时立即失败，不静默猜测性别。 */
+export function assertPersonaCircleCoverage(context: string, circleText: string | null): void {
+  if (circleText && !context.includes(circleText)) {
+    throw new Error("人格名册未进入实际提示，已停止本次生成；请检查人格输入链路后重试");
+  }
+}
 
 function clip(s: string, max: number): string {
   const t = s.replace(/\s+/g, " ").trim();
@@ -43,10 +57,7 @@ export function buildPersonaCircleText(
   const vis = visibility ?? "full"; // 默认完全可见
 
   if (vis === "none") {
-    return [
-      "【人格迷雾】本局所有玩家对你而言都是迷雾：你不知道任何人的真实人格——",
-      "可以观察言行自行推测（也可能谁都猜不中），但不得假装确知某位玩家是谁。",
-    ].join("");
+    return "【人格迷雾】本局所有玩家对你而言都是迷雾：你未获得任何玩家的人格姓名，人格身份不属于你的已知信息。";
   }
 
   const fog = new Set(vis === "partial" ? (fogSeats ?? []) : []);
@@ -72,16 +83,12 @@ export function buildPersonaCircleText(
       `【人格圈层】迷雾散开——你知道这些座位背后的真实人格（其详细人格与游戏身份你不清楚）：` +
         known.map(fmt).join("；") + "。",
     );
-    // 称呼与博弈指引：人格名互称 + 基于认知的博弈（用户核心设想）
     lines.push(
-      "你可以直呼已知人格的人格名来对话（如「五条悟，你刚才那波……」），人格名与座位号可自由混用；" +
-        "你了解 TA 们的人格底色与作风——可以用你对 TA 的认知去预判、游说、结盟或提防。" +
-        "但记住：人格只是参考，本局身份与立场才是博弈本体（也可能有人刻意扮演反差）。对迷雾中的玩家仍按座位号称呼。",
+      "已知人格的人格名与座位号均可用于称呼；你获得这些人格的基本印象与外貌信息。" +
+        "本局游戏身份与人格圈层信息分别提供；迷雾玩家仅提供座位号。",
     );
   }
-  lines.push(
-    "除此之外的玩家对你而言都是迷雾（不知道其真实人格，可自行推测，也可能谁都猜不中），不得假装确知迷雾身份。",
-  );
+  lines.push("除此之外的玩家对你而言都是迷雾：你未获得他们的人格姓名，人格身份不属于你的已知信息。");
   // 羁绊注入：仅限「可见人格」——对方在迷雾里时你不知道 TA 是谁，羁绊无从谈起
   const knownSeats = new Set(known.map((b) => b.seat));
   const myBonds = (bonds ?? []).filter((b) => knownSeats.has(b.seat));
@@ -91,14 +98,12 @@ export function buildPersonaCircleText(
         ? `${b.seat}号${b.name}：原作渊源——${clip(b.origin, 80)}`
         : `${b.seat}号${b.name}：${b.relation || "旧识"}（亲疏${b.affinity}，信任${b.trust}）${b.note ? `——${clip(b.note, 60)}` : ""}`;
     lines.push(
-      `【你与在场人格的羁绊】（你亲历或熟知的过往，他人不知道这些细节——可在博弈中利用，也当心对方同样记得）：` +
+      `【你与在场人格的羁绊】（你亲历或熟知的过往，他人不知道这些细节，对方也可能同样记得）：` +
         myBonds.map(fmtBond).join("；") + "。",
     );
   }
   if (vis === "partial" && fog.has(seat)) {
-    lines.push(
-      "注意：你自己处于迷雾状态——其他玩家不知道你的人格（你的言行不会被对号入座，可利用这一点，也可有意引导）。",
-    );
+    lines.push("注意：你自己处于迷雾状态——其他玩家不知道你的人格。");
   }
   return lines.join("\n");
 }

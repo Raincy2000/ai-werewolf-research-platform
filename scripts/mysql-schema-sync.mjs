@@ -41,8 +41,8 @@ const DEFAULTS = {
   host: "127.0.0.1",
   port: 3307,
   user: "root",
-  // 密码只从环境变量或显式参数读取，不在公开源码中提供默认口令。
-  password: process.env.DB_PASSWORD ?? "",
+  // 本地便携 MySQL（tools/db-start.cmd）的固定密码；连其它库请显式传 --password/--url
+  password: "wwlocal123",
   database: "werewolf",
 };
 
@@ -101,7 +101,7 @@ if (opts.help) {
       "",
       "options:",
       "  --database <name>      目标库（默认 werewolf）",
-      "  --host/--port/--user/--password/--url  连接参数（默认 127.0.0.1:3307 root；密码由 DB_PASSWORD 或参数提供）",
+      "  --host/--port/--user/--password/--url  连接参数（默认 127.0.0.1:3307 root/wwlocal123）",
       "  --create-database      目标库不存在时创建",
       "  --check                只检查漂移（不写库）；有漂移/关键项缺失则退出码 1",
       "  --dry-run              打印执行计划但不写库",

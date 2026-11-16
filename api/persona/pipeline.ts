@@ -26,7 +26,6 @@ import { parseJsonRobust } from "../game/ai/parse";
 import { parseDecision } from "../game/ai/parse";
 import {
   describePrivateInfo,
-  formatPublicLog,
   PHASE_LABEL,
   KIND_GUIDE,
   promptCharBudget,
@@ -34,12 +33,11 @@ import {
 } from "../game/ai/prompts";
 import type { SeatAiConfig } from "../../contracts/game";
 import { buildPersonaContext, degradePersonaContext } from "./context";
+import { assertPersonaCircleCoverage } from "../game/personaVisibility";
 import { buildBehaviorBridge } from "./behavior-bridge";
 import {
-  buildFidelityRetryNote,
   duplicateExactText,
   inspectPersonaText,
-  mergePersonaTextOnly,
   sharedStylePhrases,
 } from "./fidelity";
 
@@ -146,19 +144,46 @@ function profileDigest(card: PersonaCard): string {
   return [ctx.conscious, ctx.voice, latentInner].filter(Boolean).join("\n") || "（无档案）";
 }
 
-function situationDigest(pending: PendingDecision, logLimit: number): string {
+function sectionOf(baseUser: string, start: string, ends: string[]): string {
+  const from = baseUser.indexOf(start);
+  if (from < 0) return "";
+  const tail = baseUser.slice(from);
+  const indexes = ends.map((end) => tail.indexOf(end, start.length)).filter((index) => index >= 0);
+  const to = indexes.length ? Math.min(...indexes) : tail.length;
+  return tail.slice(0, to).trim();
+}
+
+/** 主体独立定向：只读本人合法认知域，不让他人的逐字修辞先替主体立题。 */
+function orientationDigest(pending: PendingDecision, base?: AssembledPrompt): string {
   const view = pending.view;
-  const lines = [
+  const privateText = base
+    ? sectionOf(base.user, "【你的私密信息】", ["【你的完整自我事实台账", "【你的完整意图轨迹】", "【你的对局笔记】", "【你的任务】"])
+    : describePrivateInfo(view);
+  const selfFacts = base
+    ? sectionOf(base.user, "【你的完整自我事实台账", ["【你的完整意图轨迹】", "【你的对局笔记】", "【你的任务】"])
+    : "";
+  const intentTrail = base
+    ? sectionOf(base.user, "【你的完整意图轨迹】", ["【你的对局笔记】", "【你的任务】"])
+    : "";
+  const currentInteraction = base
+    ? sectionOf(base.user, "【本轮互动事实】", ["【完整公共事实】", "【赛后完整公共事实", "【公开记录】", "【你的私密信息】"])
+    : "";
+  // 人格名册是主体合法认知域的一部分：心镜也必须获得性别与称呼，不能只在涌现阶段补入。
+  const personaCircle = base
+    ? sectionOf(base.user, "【人格圈层】", ["【输出契约】"]) || sectionOf(base.user, "【人格迷雾】", ["【输出契约】"])
+    : "";
+  return [
     `第${view.day}天 · ${PHASE_LABEL[view.phase] ?? view.phase}`,
     `存活：${view.aliveSeats.map((s) => `${s}号`).join("、")}；已死亡：${view.deadSeats.map((s) => `${s}号`).join("、") || "无"}`,
-    `最近公开记录：`,
-    formatPublicLog(view.publicLog.slice(-10), logLimit),
-    `你的私密信息：`,
-    describePrivateInfo(view),
+    currentInteraction,
+    personaCircle,
+    "你的私密信息：",
+    privateText,
+    selfFacts,
+    intentTrail,
     `当前任务：${pending.hint}`,
     KIND_GUIDE[pending.kind] ? `环节说明：${KIND_GUIDE[pending.kind].slice(0, 200)}` : "",
-  ];
-  return lines.filter(Boolean).join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 export function buildMirrorPrompt(
@@ -166,16 +191,24 @@ export function buildMirrorPrompt(
   memoryText: string | null,
   pending: PendingDecision,
   relationDigest?: string | null,
+  base?: AssembledPrompt,
 ): AssembledPrompt {
   const system = [
-    `你是「心镜」——「${card.name}」的人格内核。你只输出「人格状态报告」，绝不说台词、绝不描述任何行动或发言。`,
-    "你的职责：读入人格参数卡、跨对局记忆与当前情境，报告此刻哪些参数被点燃、哪些参数在互相拉扯、哪些防御机制被触发、是否有创伤记忆被唤醒。",
-    "背景：TA 身处米勒山谷的一场狼人杀游戏——只是游戏，出局≠死亡；但在意输赢、在意他人眼光，是 TA 的本性。",
+    `你是「心镜」——「${card.name}」的人格内核。你输出「人格状态报告」，不直接输出公开台词。`,
+    "你的职责：读入当前互动、人格参数卡、跨对局记忆与本人历史，记录实际出现的感受、想法、意图与人际反应。",
+    "背景：TA 身处米勒山谷的一场狼人杀游戏——只是游戏，出局≠死亡；公开胜负条件由规则说明。",
     "铁律：",
-    "1. 参数溢出——每一项心理活动必须挂在具体参数上（给出参数路径与当前值），禁止无根表演；",
-    "2. 真情生于撕裂——禁止二选一：相互冲突的参数必须同时列出、分别写明各自的诉求，并给出拉扯强度；",
-    "3. 严格只输出 JSON 本体。",
+    "1. 普通反应、平静与无反应都是正常结果。先记录 currentReaction，并由主体用 wantsReflection 表示是否愿意继续反思。",
+    "2. wantsReflection=false 时，pressures、tensions、defenses、trauma、impulse、bonds 均留空，selfControl=50；不得为填满报告补写冲突或创伤。",
+    "3. wantsReflection=true 时也只记录实际出现的参数触发、冲突、防御与创伤记忆；相互冲突的参数才组成 tensions，单极记录不组装成冲突。",
+    "4. 感受、关系欲望、自我控制与具体战术意图可以连续出现，不因涉及上警、报验、归票、刀口或技能时机而删除主体思想。",
+    "5. 严格只输出 JSON 本体。",
   ].join("\n");
+  const directed = orientationDigest(pending, base);
+  const requiredCircle = base
+    ? sectionOf(base.user, "【人格圈层】", ["【输出契约】"]) || sectionOf(base.user, "【人格迷雾】", ["【输出契约】"])
+    : "";
+  assertPersonaCircleCoverage(directed, requiredCircle || null);
   const user = [
     "【人格参数卡】",
     paramsDigest(card),
@@ -189,12 +222,12 @@ export function buildMirrorPrompt(
     relationDigest?.trim() ? "【你与在场者的旧账（你自己的分量，不是规则）】" : "",
     relationDigest?.trim() ? relationDigest.trim() : "",
     "",
-    "【当前情境】",
-    situationDigest(pending, 900),
+    "【主体独立定向】（先依据你自己形成关注点，公共证据将在涌现阶段完整提供）",
+    directed,
     "",
     "【输出契约】严格输出 JSON：",
-    '{"pressures":[{"param":"参数路径","value":0,"reason":"触发事由一句"}],"tensions":[{"poles":[{"param":"参数A","urge":"这一极想要什么（一句）"},{"param":"参数B","urge":"另一极想要什么"}],"intensity":0.0}],"defenses":[{"mechanism":"防御机制名","toward":"防御指向"}],"trauma":"被唤醒的创伤记忆或null","impulse":"此刻最想做的事（一句）","selfControl":0,"bonds":[{"toward":"某个在场者的名字","feel":"此刻对TA的真实感受（大白话，禁止术语）","urge":"由此想对TA做什么/不做什么"}]}',
-    "硬性要求：pressures≥1 或 tensions≥1（无参数触发=无根表演，输出非法）；tensions 可多达 3 组；intensity 取 0-1；selfControl 取 0-100（越低越失控）。**bonds：只对【你与在场者的旧账】/当前情境中出现的在场者写，toward 写对方人格名或座位号（禁止写不在场/不认识的人）；没有就不写；禁止空话套话，要有具体所指。**",
+    '{"currentReaction":"当前事件引起的原始反应；普通、平静或无反应均可，无则空字符串","wantsReflection":false,"pressures":[{"param":"参数路径","value":0,"reason":"实际触发事由"}],"tensions":[{"poles":[{"param":"参数A","urge":"实际心理诉求或具体意图"},{"param":"参数B","urge":"实际心理诉求或具体意图"}],"intensity":0.0}],"defenses":[{"mechanism":"防御机制名","toward":"实际防御指向"}],"trauma":"实际被唤醒的创伤记忆或null","impulse":"实际出现的直接想法或需求，可空","selfControl":50,"bonds":[{"toward":"某个在场者的名字","feel":"此刻对TA的真实感受（大白话，禁止术语）","urge":"由此想对TA做什么/不做什么"}]}',
+    "先填 currentReaction 与 wantsReflection。wantsReflection=false 时其余深层字段按系统约定留空；true 时也只记录真实出现的内容。tensions 每组至少两极，intensity 取 0-1；bonds 的 toward 写当前情境中的在场者人格名或座位号。",
   ].filter((x, i, arr) => !(x === "" && arr[i - 1] === "")).join("\n");
   return { system, user };
 }
@@ -222,6 +255,8 @@ export function parseMirrorReport(text: string): MirrorReport | null {
     })
     .filter((x): x is NonNullable<typeof x> => x !== null)
     .slice(0, 6);
+  // 空数组是合法空反应；显式提交空参数名等无效条目仍属于结构非法。
+  if (Array.isArray(o.pressures) && o.pressures.length > 0 && pressures.length === 0) return null;
 
   const tensions: TensionGroup[] = (Array.isArray(o.tensions) ? o.tensions : [])
     .map((x) => {
@@ -243,8 +278,7 @@ export function parseMirrorReport(text: string): MirrorReport | null {
     .filter((x): x is NonNullable<typeof x> => x !== null)
     .slice(0, 3);
 
-  // 铁律2：无根表演判非法（无被点燃的参数、也无任何撕裂 → 不成立的心理活动）
-  if (pressures.length === 0 && tensions.length === 0) return null;
+  // 平静、无撕裂和无创伤都是合法状态；只有无法解析或字段结构非法才拒绝。
 
   const defenses = (Array.isArray(o.defenses) ? o.defenses : [])
     .map((x) => {
@@ -261,7 +295,8 @@ export function parseMirrorReport(text: string): MirrorReport | null {
   selfControl = Math.max(0, Math.min(100, selfControl));
 
   const trauma = typeof o.trauma === "string" && o.trauma.trim() ? o.trauma.trim().slice(0, 200) : null;
-  const impulse = String(o.impulse ?? "").trim().slice(0, 120) || "（心镜未给出冲动）";
+  const impulse = String(o.impulse ?? "").trim().slice(0, 120);
+  const currentReaction = typeof o.currentReaction === "string" ? o.currentReaction.trim().slice(0, 500) : "";
 
   // §24 第 4 层断裂修复：解析「对人」条目
   const bonds: MirrorBond[] = (Array.isArray(o.bonds) ? o.bonds : [])
@@ -276,69 +311,26 @@ export function parseMirrorReport(text: string): MirrorReport | null {
     .filter((x): x is MirrorBond => x !== null)
     .slice(0, 8);
 
-  return { pressures, tensions, defenses, trauma, impulse, selfControl, bonds };
+  const hasReflectionContent = pressures.length > 0 || tensions.length > 0 || defenses.length > 0 || !!trauma || !!impulse || bonds.length > 0;
+  const wantsReflection = typeof o.wantsReflection === "boolean" ? o.wantsReflection : hasReflectionContent;
+  if (!wantsReflection) {
+    return { pressures: [], tensions: [], defenses: [], trauma: null, impulse: "", selfControl: 50, bonds: [], currentReaction, wantsReflection: false };
+  }
+  return { pressures, tensions, defenses, trauma, impulse, selfControl, bonds, currentReaction, wantsReflection: true };
 }
 
-/** 心镜 AI 失败时的确定性兜底：由参数卡直接推导状态报告（铁律2 不降级——触发参数来自卡本身） */
-export function mirrorFallbackReport(card: PersonaCard, pending: PendingDecision): MirrorReport {
-  const p = card.params;
-  // 极端值即最易被点燃的参数：取 |值-50| 最大的两个固定维度
-  const flat: { param: string; value: number }[] = [
-    { param: "bigFive.openness", value: p.bigFive.openness },
-    { param: "bigFive.conscientiousness", value: p.bigFive.conscientiousness },
-    { param: "bigFive.extraversion", value: p.bigFive.extraversion },
-    { param: "bigFive.agreeableness", value: p.bigFive.agreeableness },
-    { param: "bigFive.neuroticism", value: p.bigFive.neuroticism },
-    { param: "attachment.anxiety", value: p.attachment.anxiety },
-    { param: "attachment.avoidance", value: p.attachment.avoidance },
-    { param: "darkTetrad.machiavellianism", value: p.darkTetrad.machiavellianism },
-    { param: "darkTetrad.narcissism", value: p.darkTetrad.narcissism },
-    { param: "darkTetrad.psychopathy", value: p.darkTetrad.psychopathy },
-    { param: "emotionRegulation.rumination", value: p.emotionRegulation.rumination },
-  ];
-  flat.sort((a, b) => Math.abs(b.value - 50) - Math.abs(a.value - 50));
-  const top = flat.slice(0, 2);
-  const phaseLabel = PHASE_LABEL[pending.view.phase] ?? pending.view.phase;
-  const pressures = top.map((t) => ({
-    param: t.param,
-    value: t.value,
-    reason: `${phaseLabel}的压力将其点燃（心镜暂由参数直推）`,
-  }));
-  // 天然撕裂组：宜人性 ⇄ 最强黑暗面；若依恋双轴皆高则补一组焦虑⇄回避
-  const dark = (
-    [
-      ["darkTetrad.machiavellianism", p.darkTetrad.machiavellianism],
-      ["darkTetrad.narcissism", p.darkTetrad.narcissism],
-      ["darkTetrad.psychopathy", p.darkTetrad.psychopathy],
-      ["darkTetrad.sadism", p.darkTetrad.sadism],
-    ] as [string, number][]
-  ).sort((a, b) => b[1] - a[1])[0];
-  const tensions: TensionGroup[] = [
-    {
-      poles: [
-        { param: "bigFive.agreeableness", urge: "想相信他人、维持表面和谐" },
-        { param: dark[0], urge: "想利用局面为自己牟利" },
-      ],
-      intensity: Math.min(1, (Math.abs(p.bigFive.agreeableness - dark[1]) + 30) / 130),
-    },
-  ];
-  if (p.attachment.anxiety >= 50 && p.attachment.avoidance >= 50) {
-    tensions.push({
-      poles: [
-        { param: "attachment.anxiety", urge: "怕被孤立背叛，想抓住盟友" },
-        { param: "attachment.avoidance", urge: "怕被看穿束缚，想抽身独处" },
-      ],
-      intensity: Math.min(1, (p.attachment.anxiety + p.attachment.avoidance) / 200),
-    });
-  }
+/** 心镜不可用时只提供空状态：不由参数编造主体并未产生的当下感受或意图。 */
+export function emptyMirrorReport(): MirrorReport {
   return {
-    bonds: [], // 兜底报告不含对人条目（关系由涌现层从 relationDigest 获取）
-    pressures,
-    tensions: tensions.slice(0, 3),
+    bonds: [],
+    pressures: [],
+    tensions: [],
     defenses: [],
     trauma: null,
-    impulse: "在表态与隐藏之间先观望一步",
+    impulse: "",
     selfControl: 50,
+    currentReaction: "",
+    wantsReflection: false,
   };
 }
 
@@ -347,8 +339,9 @@ export function mirrorFallbackReport(card: PersonaCard, pending: PendingDecision
 // ============================================================
 
 const PERSONA_ACTION_FIELDS = `"targets":[座位号],"skip":false,"selfDestruct":false,"duel":null,"witchSave":false`;
-const PERSONA_SPEECH_FIELD = `"speech":"公开发言（发言类必填：正文600字内长短自由（可极短），逻辑要完整说完；（括号）夹带的动作/神态/语气描写不计入字数，动作尽管写；非发言类留空串）"`;
-const PERSONA_THOUGHT_FIELDS = `"thought":"涌现输出：你此刻最真实的反应（200字内，禁止任何心理学术语，像活人内心独白）","bodyTrace":"身体痕迹：此刻的副语言（姿态/表情/声音变化，一句）","analysisGt":"这一步的博弈论解释（一句，≤80字）","analysisPsy":"这一步的人格动力学解释（一句，≤80字，这里允许术语）"`;
+const PERSONA_SPEECH_FIELD = `"speech":"公开发言（发言类必填：正文600字内长短自由（可极短），按你当下想说多少自然表达；（括号）夹带的动作/神态/语气描写不计入字数；非发言类留空串）"`;
+const PERSONA_THOUGHT_FIELDS = `"thought":"涌现输出：你此刻最真实的反应（200字内，禁止任何心理学术语，像活人内心独白）","bodyTrace":"身体痕迹：此刻的副语言（姿态/表情/声音变化，一句）"`;
+const PERSONA_INTENT_FIELD = `"intent":{"targetSeats":[当前意图涉及的座位，可空],"rationale":"自愿留下的当下理由，可空","basisEventSeqs":[自愿关联的可见事件序号，可空]}`;
 const SPEECH_FIRST_KINDS = new Set(["sheriffSpeech", "daySpeech", "pkSpeech", "lastWords", "postgameSpeak", "wolfDiscuss"]);
 
 /** 行动字段先于长心理文本生成，降低服务端截断后只剩 thought 的风险。 */
@@ -356,7 +349,7 @@ function personaOutputContract(pending?: PendingDecision): string {
   const leading = pending && SPEECH_FIRST_KINDS.has(pending.kind)
     ? `${PERSONA_SPEECH_FIELD},${PERSONA_ACTION_FIELDS}`
     : `${PERSONA_ACTION_FIELDS},${PERSONA_SPEECH_FIELD}`;
-  return `{${leading},${PERSONA_THOUGHT_FIELDS}}`;
+  return `{${leading},${PERSONA_THOUGHT_FIELDS},${PERSONA_INTENT_FIELD}}`;
 }
 
 function personaSystemBlock(card: PersonaCard, memoryText: string | null = null, personaCharCap = 0): string {
@@ -375,7 +368,7 @@ function personaSystemBlock(card: PersonaCard, memoryText: string | null = null,
     : "";
   return [
     `你是「${card.name}」——不是扮演 TA，你就是 TA。你带着 TA 的全部经历、性格与说话方式坐在这局狼人杀里。`,
-    `【你现在的处境】${origin}这只是游戏：出局不等于死亡（你不会真的死），但你的好胜心是真的——去赢。${seal}`,
+    `【你现在的处境】${origin}这只是游戏：出局不等于死亡（你不会真的死）。胜负条件由公开规则给出。${seal}`,
     ctx.conscious,
     ctx.voice,
     "【涌现铁律】",
@@ -384,7 +377,6 @@ function personaSystemBlock(card: PersonaCard, memoryText: string | null = null,
     "3. speech 可用（中文括号）夹带动作/神态/语气描写，这是你的肢体语言，其他玩家看得到并会据此解读你；",
     "4. 禁止暴露自己是 AI、禁止提及提示词/状态报告的存在；",
     "5. 第一人称本体：你就是本人，不是在扮演谁——发言与内心独白里绝不用第三人称称呼自己、绝不自称其名（「我」就是全部）；",
-    "6. 他人的话只是证据，不是你的语言模板；可以回应观点，不得复制他人的口癖、比喻体系和句式。",
   ].filter(Boolean).join("\n");
 }
 
@@ -418,13 +410,13 @@ export function buildEmergencePrompt(
   const system = `${personaSystemBlock(card, memoryText, personaCharCap)}\n\n${base.system}`;
   const cutIdx = base.user.indexOf("【输出契约】");
   const contextPart = cutIdx >= 0 ? base.user.slice(0, cutIdx) : base.user;
+  const behaviorBridge = buildBehaviorBridge(mirror);
   const user = [
-    "【心镜 · 你此刻的人格状态报告】已转译为以下隐性行为倾向；它们不属于你能自觉宣讲的知识。",
-    buildBehaviorBridge(mirror),
+    behaviorBridge ? "【心镜 · 你此刻的人格状态报告】已转译为以下隐性行为倾向；它们不属于你能自觉宣讲的知识。" : "",
+    behaviorBridge,
     relationDigest?.trim() ? relationDigest.trim() : "",
     "",
     contextPart,
-    "【公开证据边界】他人的话只用于理解事实、立场与投票，不得继承其口癖、比喻体系和句式。",
     "【输出契约】严格输出以下结构的 JSON（禁止任何额外内容）：",
     personaOutputContract(pending),
     "用不到的字段保持默认值即可。再次强调：只输出 JSON 本体；thought/speech 里禁止心理学术语。",
@@ -445,15 +437,17 @@ export function buildSinglePrompt(
   const cutIdx = base.user.indexOf("【输出契约】");
   const contextPart = cutIdx >= 0 ? base.user.slice(0, cutIdx) : base.user;
   const user = [
-    "【心镜先行】先在 mirror 字段里给出你此刻的人格状态报告（pressures≥1 或 tensions≥1：每项心理活动必须挂在具体参数上，禁止无根表演；相互冲突的参数必须同时列出、互相拉扯，禁止二选一），再让反应从中生长。",
+    "【心镜先行】先在 mirror 字段里记录当前事件引起的实际反应。普通反应、平静与无反应都正常；由你填写 wantsReflection 决定是否继续反思，false 时其余深层字段留空，selfControl=50。感受、关系欲望与具体战术意图可以连续出现。",
     "【人格参数卡】",
     paramsDigest(card),
     relationDigest?.trim() ? relationDigest.trim() : "",
     "",
+    "【主体独立定向】",
+    orientationDigest(pending, base),
+    "",
     contextPart,
-    "【公开证据边界】他人的话只用于理解事实、立场与投票，不得继承其口癖、比喻体系和句式。",
     "【输出契约】严格输出以下结构的 JSON（禁止任何额外内容）：",
-    '{"mirror":{"pressures":[{"param":"参数路径","value":0,"reason":"触发事由"}],"tensions":[{"poles":[{"param":"参数A","urge":"诉求"},{"param":"参数B","urge":"诉求"}],"intensity":0.0}],"defenses":[{"mechanism":"防御机制","toward":"指向"}],"trauma":null,"impulse":"此刻最想做的事","selfControl":0},' +
+    '{"mirror":{"currentReaction":"当前事件引起的原始反应；普通、平静或无反应均可","wantsReflection":false,"pressures":[{"param":"参数路径","value":0,"reason":"实际触发事由"}],"tensions":[{"poles":[{"param":"参数A","urge":"实际心理诉求或具体意图"},{"param":"参数B","urge":"实际心理诉求或具体意图"}],"intensity":0.0}],"defenses":[{"mechanism":"防御机制","toward":"实际指向"}],"trauma":null,"impulse":"实际出现的直接想法或需求，可空","selfControl":50},' +
       personaOutputContract(pending).slice(1),
     "用不到的字段保持默认值即可。只输出 JSON 本体；thought/speech 里禁止心理学术语。",
   ].join("\n");
@@ -495,8 +489,9 @@ export function formatTensionTemplate(
     );
   }
   if (mirror.trauma) parts.push(`【创伤唤醒】${mirror.trauma}`);
-  parts.push(`【身体痕迹】${bodyTrace.trim() || "（无显著痕迹）"}`);
-  parts.push(`【涌现输出】${emergenceThought.trim() || mirror.impulse}`);
+  if (bodyTrace.trim()) parts.push(`【身体痕迹】${bodyTrace.trim()}`);
+  const emergence = emergenceThought.trim() || mirror.impulse;
+  if (emergence) parts.push(`【涌现输出】${emergence}`);
   return parts.join("\n\n").slice(0, 1600);
 }
 
@@ -512,8 +507,6 @@ export interface PersonaPipelineResult {
 
 interface RawExtras {
   bodyTrace: string;
-  analysisGt: string;
-  analysisPsy: string;
   mirrorRaw?: unknown;
 }
 
@@ -528,8 +521,6 @@ function extractExtras(text: string): RawExtras {
   const o = (typeof obj === "object" && obj !== null ? obj : {}) as Record<string, unknown>;
   return {
     bodyTrace: String(o.bodyTrace ?? "").trim().slice(0, 150),
-    analysisGt: String(o.analysisGt ?? "").trim().slice(0, 120),
-    analysisPsy: String(o.analysisPsy ?? "").trim().slice(0, 120),
     mirrorRaw: o.mirror,
   };
 }
@@ -542,8 +533,8 @@ async function callWithBudget(
 ): Promise<{ text: string | null; error: string | null }> {
   const res = await callAi(cfg, prompt.system, prompt.user, {
     timeoutMs: Math.max(3_000, timeoutMs),
-    // deadlineAt 透传：重试循环内逐次按剩余预算截断——单次调用内部重试不得烧穿所属环节的预算份额
-    maxRetries: timeoutMs > 60_000 ? 1 : 0,
+    // 心镜与涌现均使用 providers 默认退避重试，覆盖短暂 5xx 故障窗口。
+    // deadlineAt 同时约束退避等待和每次请求，重试不得烧穿所属环节的预算份额。
     deadlineAt,
   });
   return res.ok && res.text ? { text: res.text, error: null } : { text: null, error: res.error ?? "AI 调用失败" };
@@ -583,7 +574,7 @@ export async function runPersonaPipeline(opts: {
 
   let mirror: MirrorReport | null = null;
   let thought = "";
-  let extras: RawExtras = { bodyTrace: "", analysisGt: "", analysisPsy: "" };
+  let extras: RawExtras = { bodyTrace: "" };
   let decision: DecisionInput | null = null;
 
   if (dual) {
@@ -591,7 +582,7 @@ export async function runPersonaPipeline(opts: {
     // 设计教训（对局 20260930002 实锤）：心镜内部重试曾可烧掉 80% 决策预算（104s×2），
     // 涌现层——必须成功的调用——只剩 52s 残羹而必败托管。心镜是辅助件（有本地参数直推兜底），
     // 预算是涌现层的保命钱：心镜 35% 封顶，涌现拿全部剩余。
-    const mirrorPrompt = buildMirrorPrompt(card, memoryText, pending, relationDigest);
+    const mirrorPrompt = buildMirrorPrompt(card, memoryText, pending, relationDigest, base);
     const mirrorCap = Math.min(baseTimeout, remaining * 0.35);
     const mirrorDeadline = Date.now() + mirrorCap;
     let mr = await callWithBudget(cfg, mirrorPrompt, mirrorCap, mirrorDeadline);
@@ -604,7 +595,7 @@ export async function runPersonaPipeline(opts: {
           cfg,
           {
             system: mirrorPrompt.system,
-            user: `${mirrorPrompt.user}\n\n【上一次输出非法】未给出任何触发参数（pressures 与 tensions 皆空）。请重新输出，至少给出一条被点燃的参数或一组撕裂。`,
+            user: `${mirrorPrompt.user}\n\n【上一次输出非法】无法解析为规定的 JSON 结构。请按原结构重新输出；没有实际触发、撕裂、防御或创伤时，对应字段留空。`,
           },
           retryBudget,
           mirrorDeadline,
@@ -612,7 +603,7 @@ export async function runPersonaPipeline(opts: {
         if (retry.text) mirror = parseMirrorReport(retry.text);
       }
     }
-    if (!mirror) mirror = mirrorFallbackReport(card, pending);
+    if (!mirror) mirror = emptyMirrorReport();
 
     // ---- 涌现（预算的绝对优先方：拿心镜消耗后的全部剩余，deadlineAt 透传约束内部重试）----
     const emergePrompt = buildEmergencePrompt(card, mirror, memoryText, base, relationDigest, pending, personaCharCap);
@@ -637,11 +628,11 @@ export async function runPersonaPipeline(opts: {
     if (extras.mirrorRaw) {
       mirror = parseMirrorReport(JSON.stringify(extras.mirrorRaw));
     }
-    if (!mirror) mirror = mirrorFallbackReport(card, pending);
+    if (!mirror) mirror = emptyMirrorReport();
     thought = decision.thought ?? "";
   }
 
-  // 表达保真：最多追加一次“只改文本”调用。无论模型新输出什么，行动字段都取首次决策。
+  // 表达问题只作观察，不追加系统代写；主体发言与心理保持首次明确输出。
   const currentSpeech = String((decision as DecisionInput & { speech?: string }).speech ?? "");
   const ownPrefix = `${pending.seat}号玩家发言：`;
   const peerLogs = pending.view.publicLog.filter((line) => !line.startsWith(ownPrefix));
@@ -651,25 +642,9 @@ export async function runPersonaPipeline(opts: {
     ...sharedStylePhrases(currentSpeech, peerLogs).map((phrase) => `复用他人句式：${phrase}`),
   ];
   if (duplicateExactText(currentSpeech, previousOwn?.slice(ownPrefix.length))) issues.push("与本人上一条发言完全重复");
-  const fidelityRemaining = opts.deadlineAt != null ? opts.deadlineAt - Date.now() : baseTimeout;
-  if (issues.length > 0 && fidelityRemaining > 3_000) {
-    const { speech: _speech, thought: _thought, ...lockedAction } = decision as DecisionInput & { speech?: string };
-    const fidelityPrompt = dual
-      ? buildEmergencePrompt(card, mirror, memoryText, base, relationDigest, pending, personaCharCap)
-      : buildSinglePrompt(card, memoryText, pending, base, relationDigest, personaCharCap);
-    fidelityPrompt.user += `\n${extraNote}\n${buildFidelityRetryNote(issues, lockedAction)}`;
-    const retry = await callWithBudget(cfg, fidelityPrompt, Math.min(baseTimeout, fidelityRemaining), opts.deadlineAt);
-    const rewritten = retry.text ? parseDecision(retry.text, pending) : null;
-    if (rewritten) {
-      decision = mergePersonaTextOnly(decision, rewritten);
-      extras = extractExtras(retry.text!);
-      thought = decision.thought ?? "";
-    }
-  }
 
-  // 张力模板覆盖 thought（观察者可见的心理检查注解；涌现原文进【涌现输出】段）
-  const fullThought = formatTensionTemplate(card, mirror, extras.bodyTrace, thought);
-  decision.thought = fullThought;
+  // 主体原始 thought 保持不变；展示模板只进入观察者元数据，避免参数化解释回流为本人记忆。
+  const observerThought = formatTensionTemplate(card, mirror, extras.bodyTrace, thought);
 
   const contextAudit = degradePersonaContext(buildPersonaContext(card, memoryText), personaCharCap).audit;
   const personaMeta: PersonaEventMeta = {
@@ -681,8 +656,11 @@ export async function runPersonaPipeline(opts: {
       poles: t.poles.map((p) => paramLabel(card, p.param)),
       intensity: t.intensity,
     })),
-    gt: extras.analysisGt,
-    psy: extras.analysisPsy,
+    // 后置观察字段不参与主体生成，也不把旧输出中的分析回灌进事件。
+    gt: "",
+    psy: "",
+    observerThought,
+    expressionIssues: issues,
   };
   return { decision, error: null, personaMeta };
 }

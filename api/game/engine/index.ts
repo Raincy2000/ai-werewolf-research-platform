@@ -14,6 +14,7 @@ import type {
   EngineEvent,
   PendingDecision,
   PlayerView,
+  SpeechContract,
 } from "./api";
 import { SPEECH_REQUIRED_KINDS } from "./api";
 import { BOARDS, ROLE_META, boardRulesText } from "../../../contracts/game";
@@ -151,6 +152,21 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
   // 赛后讨论由独立协程驱动（postGamePhase 只依赖 players/winner 等模块状态，不依赖主流程断点）
   let mainAbandoned = false;
   let postgameGen: Flow | null = null;
+  let activeSpeech: {
+    stage: SpeechContract["stage"];
+    orderedSeats: number[];
+    spokenSeats: Set<number>;
+    interruptedSeats: Set<number>;
+  } | null = null;
+  const startSpeech = (stage: SpeechContract["stage"], orderedSeats: number[]): void => {
+    activeSpeech = { stage, orderedSeats: [...orderedSeats], spokenSeats: new Set(), interruptedSeats: new Set() };
+  };
+  const markSpeech = (seat: number): void => { activeSpeech?.spokenSeats.add(seat); };
+  const interruptSpeech = (seats: number[]): void => { for (const seat of seats) activeSpeech?.interruptedSeats.add(seat); };
+  const nextSpeechStages = (stage: SpeechContract["stage"]): SpeechContract["nextStages"][number] =>
+    stage === "sheriffSpeech" ? ["daySpeech", "pkSpeech", "lastWords", "postgame"]
+      : stage === "daySpeech" ? ["pkSpeech", "lastWords", "postgame"]
+        : ["lastWords", "postgame"];
 
   const players: PlayerState[] = seatRoles.map((role, i) => ({
     seat: i + 1,
@@ -299,7 +315,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       kind: "badgePass",
       options: others,
       allowSkip: true,
-      hint: `你是阵亡警长（警徽流抉择）：targets=[目标] 移交警徽（其接任警长、获归票位与1.5票），或 skip=true 撕毁警徽（本局再无警长）。两者完全正当、无优劣预设：移交可信好人延续信息链，看走眼则送狼归票权；无人可信时撕毁是干净止损。狼人警长同样：续给狼队友会暴露关联，撕毁则掩埋遗产。`,
+      hint: `你是阵亡警长（警徽流抉择）：targets=[目标] 移交警徽（其接任警长、获归票位与1.5票），或 skip=true 撕毁警徽（本局再无警长）。`,
     });
     if (!inp.skip && inp.targets?.length) {
       const t = inp.targets[0];
@@ -413,6 +429,17 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     // 死亡公告前的死亡不对外可见（夜间结算到天亮公告之间，死者身份仍保密）
     const pubDead = players.filter((x) => announcedDead.has(x.seat)).map((x) => x.seat);
     const pubAlive = players.filter((x) => !announcedDead.has(x.seat)).map((x) => x.seat);
+    const speech: SpeechContract | undefined = activeSpeech && req && ["sheriffSpeech", "daySpeech", "pkSpeech", "dayVote", "sheriffVote"].includes(req.kind)
+      ? {
+          stage: activeSpeech.stage,
+          orderedSeats: [...activeSpeech.orderedSeats],
+          spokenSeats: [...activeSpeech.spokenSeats],
+          remainingSeats: activeSpeech.orderedSeats.filter((s) => !activeSpeech!.spokenSeats.has(s)),
+          interruptedSeats: [...activeSpeech.interruptedSeats],
+          mandatory: true,
+          nextStages: Object.fromEntries(activeSpeech.orderedSeats.map((s) => [s, nextSpeechStages(activeSpeech!.stage)])),
+        }
+      : undefined;
 
     return {
       seat,
@@ -430,6 +457,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       rules: { witchSelfSave: witchSelfSaveRule, postGameDiscuss: !!options.postGameDiscuss },
       boardRules,
       publicLog: publicLog.slice(),
+      speech,
       private: priv,
     };
   }
@@ -641,7 +669,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
           kind: "wolfDiscuss",
           options: [],
           allowSkip: false,
-          hint: "狼人频道队内讨论：请向狼队友发言（提议今晚刀谁、为什么，可回应队友此前发言、制定白天伪装策略）。队内按座位顺序每晚各发言一次，后发言者能看到先发言队友的内容，你的发言也会被后续队友看到。",
+          hint: "狼人频道队内讨论：speech 必填，仅狼队友可见。队内按座位顺序每晚各发言一次；后发言者能看到先发言队友的内容，你的发言也会被后续队友看到。",
         });
         const text = (inp.speech ?? "").trim();
         const line = `${w.seat}号：${text}`;
@@ -1170,7 +1198,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     const candidates: number[] = [];
     const runSeats = aliveSeats();
     const runHint =
-      "警长竞选报名（全员同时暗选，结果统一公布）：有明确竞选意愿则上警（targets=[1]）；否则留在警下投票选警长（targets=[0]）。流程保障：警上发言结束后还有退水环节，可放弃竞选转为警下投票——可以先上警表表态、不合适再退，不必因怕下不来台而不敢上警。即使全员上警也会先完成警上发言和退水；若届时无人退水，才会因警下无人投票导致警徽流失，没有竞选把握建议留在警下。";
+      "警长竞选报名（全员同时暗选，结果统一公布）：targets=[1]=上警参与竞选，targets=[0]=留在警下投票。警上发言后可退水转为警下投票；若最终全员留任，警下无人投票，警徽流失。";
     const runInputs = yield* askBatch(
       runSeats.map((s) => ({
         seat: s,
@@ -1222,6 +1250,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     // 警上发言（狼可自爆吞警徽 → 本局无警长，直接入夜）
     // 发言与权衡并行：上一段发言的权衡与下一段发言合并为并行批次，发言不等待权衡
     setPhase("day.sheriff.speech", `第${day}天 · 警上发言`);
+    startSpeech("sheriffSpeech", candidates);
     let weighReqs: AskReq[] = [];
     let weighObject = "";
     const sheriffWeighAbort = (): void => {
@@ -1237,14 +1266,15 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
         (x) => at(x).alive && !sheriffSpoke.has(x) && !sheriffActed.has(x),
       );
       if (!skipped.length) return;
+      interruptSpeech(skipped);
       const names = skipped.map((x) => `${x}号`).join("、");
       emit(
         "system",
         null,
         "发言中断说明",
-        `因技能发动，警上发言流程提前中断：${names}未轮到发言——这是流程安排所致，并非他们故意保持沉默，请勿据此怀疑其身份。`
+        `因技能发动，警上发言流程提前中断：${names}未轮到普通发言。`
       );
-      pub(`【发言中断说明】技能发动导致流程中断：${names}未轮到发言（并非主动沉默）。`);
+      pub(`【发言中断说明】技能发动导致流程中断：${names}未轮到普通发言。`);
     };
     for (const s of candidates) {
       if (!at(s).alive) continue;
@@ -1278,6 +1308,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
         return "aborted";
       }
       sheriffSpoke.add(s);
+      markSpeech(s);
       emit("speech", s, "警上发言", inp.speech ?? "", inp.thought);
       pub(`【警上发言】${s}号玩家：${inp.speech ?? ""}`);
 
@@ -1551,17 +1582,16 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     return "done";
   }
 
-  // 最后一只狼自爆判负警示：狼阵营仅剩提问者自己时，自爆=神民立即胜利，必须在提示中显式阻断
+  // 最后一只狼自爆的公开规则结果。
   function lastWolfBoomWarning(): string {
     return players.filter((x) => x.alive && campOf(x.role) === "wolf").length === 1
-      ? "⚠️警告：你是场上最后一只狼——自爆后场上再无狼人，神民将立即胜利（直接判负）！自爆不能换任何战术收益，绝不能自爆！"
+      ? "⚠️你是场上最后一只狼：自爆后场上再无狼人，神民立即胜利（直接判负）。"
       : "";
   }
 
   // ---------- 白天主动技能实时介入（骑士决斗 / 狼人自爆 / 白狼王自爆带人等） ----------
   // 持有可用白天主动技能的存活玩家，在白天全程实时跟进公开信息：
-  // 夜亡公告后、上警名单公布后、每段警上/白天/PK发言之后、警长当选后（第1天），都会获得一次发动机会——
-  // 可择机打断不利信息的扩散（如狼队友被查杀时立即自爆入夜、骑士听出狼立即决斗）。
+  // 夜亡公告后、上警名单公布后、每段警上/白天/PK发言之后、警长当选后（第1天），都会获得一次发动机会。
   // 不发动则按兵不动（思考量落观察者事件，不进公开记录，不暴露身份）。
   // 构造本轮权衡请求（不立即询问）：objectText 写入按兵/发动事件 meta.skillObject
   // allowKnight（2026-10-15 用户裁定，对齐网易官方）：骑士决斗仅在「放逐发言阶段」（白天发言与
@@ -1589,10 +1619,10 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       const surrenderPart =
         options.allowSurrender === false
           ? ""
-          : "；或白日交刀认输（surrender=true，狼队认输、神民立即获胜——仅局面崩溃胜利无望时用）；或白日交刀宣布胜利（declareVictory=true，狼队立即获胜——仅在必胜时用：场上非狼玩家仅剩1人，或存活人数配置使好人绝无翻盘轮次，或其他你确信的必胜局面；误判则狼队白给，这是提前宣布胜利的爽感附带的风险）";
+          : "；可白日交刀认输（surrender=true，狼队认输、神民立即获胜）；可白日交刀宣布胜利（declareVictory=true，由分析师按当前进程与规则裁决，误判则狼队判负）";
       const hint = isKnight
-        ? `主动技能权衡（思考对象：${objectText}）：骑士可选择现在翻牌决斗（duel=目标座位），或 skip 按兵不动继续观察。决斗全场仅一次：中狼则狼出局并立即入夜，中好人则你出局。`
-        : `主动技能权衡（思考对象：${objectText}）：可选择现在自爆（selfDestruct=true，当天剩余流程跳过直接入夜，可打断不利信息扩散）${surrenderPart}；或 skip 按兵不动继续观察。${lastWolfBoomWarning()}`;
+        ? `主动技能权衡（思考对象：${objectText}）：骑士可翻牌决斗（duel=目标座位），或 skip=true 不发动。决斗全场仅一次：中狼则狼出局并立即入夜，中好人则你出局。`
+        : `主动技能权衡（思考对象：${objectText}）：可自爆（selfDestruct=true，当天剩余流程跳过并直接入夜）${surrenderPart}；或 skip=true 不发动。${lastWolfBoomWarning()}`;
       reqs.push({ seat: s, kind: "daySkill", options: aliveOthers(s), allowSkip: true, hint });
     }
     return reqs;
@@ -1699,7 +1729,17 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
           s,
           "警长定序",
           `警长${s}号选择${ascending ? "升序" : "降序"}发言（从${ordered[0]}号开始），警长最后归票发言。`,
-          inp.thought
+          inp.thought,
+          { channel: "skillThink", skillObject: "警长定序" },
+        );
+        // 定序是全员必须知晓的公开决定，不能只存在于观察者权衡面板。
+        // 公开事实写入玩家记录；thought 仅供观察者查看，并由人格富化统一为标准心镜模板。
+        emit(
+          "system",
+          s,
+          "警长定序",
+          `警长${s}号选择${ascending ? "升序" : "降序"}发言（从${ordered[0]}号开始），警长最后归票发言。`,
+          inp.thought,
         );
         pub(`【警长定序】警长${s}号选择${ascending ? "升序" : "降序"}发言，警长最后归票发言。`);
       }
@@ -1714,15 +1754,17 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
     const noteUnspoken = (): void => {
       const skipped = speakers.filter((x) => at(x).alive && !spoken.has(x) && !acted.has(x));
       if (!skipped.length) return;
+      interruptSpeech(skipped);
       const names = skipped.map((x) => `${x}号`).join("、");
       emit(
         "system",
         null,
         "发言中断说明",
-        `因技能发动，当天发言流程提前中断：${names}未轮到发言——这是流程安排所致，并非他们故意保持沉默，请勿据此怀疑其身份。`
+        `因技能发动，当天发言流程提前中断：${names}未轮到普通发言。`
       );
-      pub(`【发言中断说明】技能发动导致流程中断：${names}未轮到发言（并非主动沉默）。`);
+      pub(`【发言中断说明】技能发动导致流程中断：${names}未轮到普通发言。`);
     };
+    startSpeech("daySpeech", speakers);
     for (const s of speakers) {
       if (!at(s).alive) continue;
       const p = at(s);
@@ -1772,6 +1814,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       }
 
       spoken.add(s);
+      markSpeech(s);
       emit("speech", s, "公开发言", inp.speech ?? "", inp.thought);
       pub(`【白天发言】${s}号玩家：${inp.speech ?? ""}`);
 
@@ -1873,6 +1916,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
         const pkWeighAbort = (): void => {
           crowCurseSeat = null;
         };
+        startSpeech("pkSpeech", tied);
         for (const s of tied) {
           if (!at(s).alive) continue;
           const { input: inp, aborted, speakerDied } = yield* askSpeechWithWeigh(
@@ -1901,6 +1945,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
             crowCurseSeat = null;
             return;
           }
+          markSpeech(s);
           emit("speech", s, "PK发言", inp.speech ?? "", inp.thought);
           pub(`【PK发言】${s}号玩家：${inp.speech ?? ""}`);
           pkWeighObject = `${s}号的平票PK发言`;
@@ -2043,7 +2088,8 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       exiled,
       "放逐权衡",
       `${exiled}号玩家被放逐，权衡是否发动技能。`,
-      inp2.thought,
+      // 主持人统一发起的技能询问不是玩家的实际发动，不展示心理活动；开枪时保留 inp2.thought。
+      null,
     );
 
     // 3. 发动（开枪）或沉默，然后进入出局状态
@@ -2162,24 +2208,20 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       "system",
       null,
       "赛后讨论开始",
-      `对局结束，全员进入赛后频道（聊天室）：身份全亮、全程对局记录所有人可见。按座位顺序轮流发言——复盘分析、抒发不满、吐槽批评皆可，还可以点名回复任何一位玩家。每人最多 ${QUOTA} 次发言机会；一整轮无人发言时环节结束。`
+      `对局结束，全员进入赛后频道（聊天室）：身份全亮、全程对局记录所有人可见。全员按座位顺序依次决策，每人最多 ${QUOTA} 次发言机会；可发言或沉默，可点名回复其他玩家；一整轮无人发言时环节结束。`
     );
-    pub(`【赛后讨论】对局结束，聊天室开启：全员按座位顺序自由讨论（每人最多 ${QUOTA} 次发言，可点名回复）。`);
+    pub(`【赛后讨论】对局结束，聊天室开启：全员按座位顺序依次决策（每人最多 ${QUOTA} 次发言，可发言或沉默，可点名回复）。`);
     for (let round = 1; round <= MAX_ROUNDS; round++) {
       let anySpoke = false;
       for (const p of players) { // 含死者，全员；按座位顺序
         const left = QUOTA - (used.get(p.seat) ?? 0);
         if (left <= 0) continue;
-        const nudge =
-          (used.get(p.seat) ?? 0) === 0
-            ? "你还没有发过言——大家都很期待听听你的想法，请积极参与讨论！"
-            : "";
         const inp = (yield* ask({
           seat: p.seat,
           kind: "postgameSpeak",
           options: [0, ...players.map((x) => x.seat).filter((s) => s !== p.seat)], // 0=@所有人；其余=可点名对象（含死者，可多人）
           allowSkip: true,
-          hint: `赛后讨论·聊天室（第${round}轮，你还剩 ${left} 次发言机会）：对局已结束，全员身份与全程记录公开，之前所有人的赛后发言都在公开记录的【赛后讨论】条目里。想说什么都可以——复盘分析、点评表现、抒发不满、吐槽批评；点名可 targets=[对方座位]，也可同时 @多人（targets=[3,5]）或 @所有人（targets=[0]），speech 里承接 TA 们的发言。发言填 speech（targets 留空=对大家说）；本轮确实无话可说再 skip=true（不消耗机会，后面仍可发言）。${nudge}`,
+          hint: `赛后讨论·聊天室（第${round}轮，你还剩 ${left} 次发言机会）：对局已结束，全员身份与全程记录公开，之前所有人的赛后发言都在公开记录的【赛后讨论】条目里。发言填 speech（targets 留空=对大家说）；点名可 targets=[对方座位]，也可同时 @多人（targets=[3,5]）或 @所有人（targets=[0]）；可选择沉默，skip=true（不消耗机会，后面仍可发言）。`,
         })) as DecisionInput;
         const text = typeof inp.speech === "string" ? inp.speech.trim() : "";
         if (!text) {
@@ -2229,7 +2271,7 @@ export const createEngine: CreateEngine = ({ boardId, seatRoles, options }) => {
       "游戏开始",
       `版型【${board?.name ?? boardId}】，${n}名玩家就位。${options.sheriffEnabled ? "有警长。" : "无警长。"}屠边规则。${
         options.postGameDiscuss
-          ? "本局已开启赛后讨论环节：对局结束后全员身份公开，进入赛后频道自由讨论（想说什么都可以）。"
+          ? "本局已开启赛后讨论环节：对局结束后全员身份公开，进入赛后频道。"
           : ""
       }${boardRules ? `\n${boardRules}` : ""}`
     );

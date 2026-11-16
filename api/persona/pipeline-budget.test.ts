@@ -60,7 +60,7 @@ function makePending(): PendingDecision {
 const VALID_MIRROR = `{"pressures":[{"param":"bigFive.neuroticism","value":85,"reason":"被质疑"}],
   "tensions":[{"poles":[{"param":"bigFive.agreeableness","urge":"想和气"},{"param":"darkTetrad.machiavellianism","urge":"想操控"}],"intensity":75}],
   "defenses":[],"trauma":null,"impulse":"先稳住","selfControl":40}`;
-const INVALID_MIRROR = '{"pressures":[],"tensions":[],"impulse":"x"}'; // 铁律2 判非法
+const INVALID_MIRROR = '{"pressures":[{"param":"","reason":"x"}]}'; // 空参数名属于结构非法；合法空数组不再被误判。
 const VALID_EMERGENCE = '{"thought":"权衡","speech":"大家好，我先听听。","bodyTrace":"握拳","analysisGt":"观望","analysisPsy":"防御"}';
 
 // ---------- callAi 记录器：按调用顺序出脚本 ----------
@@ -108,9 +108,16 @@ describe("双程管线预算纪律（涌现优先）", () => {
 
     expect(res.decision).not.toBeNull();
     expect(res.decision!.speech).toContain("大家好");
+    // 主体原文与观察者模板分离：decision.thought 不被展示格式覆盖。
+    expect(res.decision!.thought).toBe("权衡");
+    expect(res.personaMeta?.observerThought).toContain("【涌现输出】权衡");
+    expect(res.personaMeta?.gt).toBe("");
+    expect(res.personaMeta?.psy).toBe("");
     expect(res.personaMeta?.dual).toBe(true);
     expect(res.personaMeta?.contextVersion).toContain("persona-context-v1:");
     expect(res.personaMeta?.degraded).toEqual([]);
+    // 心镜不可用只标记状态缺失，不用参数编造当局撕裂或冲动。
+    expect(res.personaMeta?.tensions).toEqual([]);
 
     // 心镜：35% 上限（≈91s），deadlineAt 把心镜内部重试也锁在上限内
     expect(h.calls.length).toBe(2);
@@ -141,6 +148,25 @@ describe("双程管线预算纪律（涌现优先）", () => {
     expect(h.calls[1]!.timeoutMs).toBeLessThanOrEqual(91_000);
     // 涌现预算不受心镜重试侵蚀
     expect(h.calls[2]!.timeoutMs).toBe(150_000);
+  });
+
+  it("文风或参数自述只记录观察问题，不自动重写主体文本", async () => {
+    h.script.push(
+      { ok: true, text: VALID_MIRROR },
+      { ok: true, text: '{"thought":"我有自己的判断","speech":"人格参数漂移","bodyTrace":"平静","analysisGt":"","analysisPsy":""}' },
+    );
+    const res = await runPersonaPipeline({
+      cfg: CFG,
+      card: makeCard(),
+      memoryText: null,
+      pending: makePending(),
+      base: BASE,
+      modelContext: 1_048_576,
+      deadlineAt: h.t0 + 260_000,
+    });
+    expect(res.decision?.speech).toBe("人格参数漂移");
+    expect(res.personaMeta?.expressionIssues).toContain("研究机制自述");
+    expect(h.calls.length).toBe(2);
   });
 
   it("心镜成功：不触发解析重试，涌现直接跟上（共 2 次调用）", async () => {

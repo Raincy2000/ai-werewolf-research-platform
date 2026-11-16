@@ -133,7 +133,7 @@ export function createAnalysisPipeline(deps: {
         note: `${snapshot.boardName}｜收录对局 ${gameId.slice(0, 8)}：${winnerLabel}`,
         userId: ownerId,
       });
-      // 指南已更新：立即刷新该版型的注入缓存，后续决策用上最新版
+      // 指南已更新：刷新未来对局的资料缓存；当前对局只读开局快照，不受本次蒸馏影响
       deps.guideCache.set(`${ownerId}:${boardId}`, {
         at: Date.now(),
         text: deps.combineGuideText(boardId, commonGuide ?? "", boardGuide),

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:desktop": "npm --prefix desktop run dev:source",
     "build": "vite build && esbuild api/boot.ts --platform=node --bundle --format=esm --outdir=dist --banner:js=\"import { createRequire } from 'module';const require = createRequire(import.meta.url);\"",
     "lint": "eslint .",
     "preview": "vite preview",
@@ -12,6 +13,7 @@
     "check": "tsc -b",
     "format": "prettier --write .",
     "test": "vitest run",
+    "cognition:compare": "node scripts/cognition-compare.mjs",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "node scripts/guard-push.cjs",

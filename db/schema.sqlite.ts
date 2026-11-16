@@ -238,6 +238,23 @@ export const personaMemories = sqliteTable(
   (t) => [index("idx_pmem_persona").on(t.personaId)],
 );
 
+export const personaMemoryEvidence = sqliteTable(
+  "persona_memory_evidence",
+  {
+    memoryId: integer("memory_id").notNull(),
+    gameId: text("game_id").notNull(),
+    eventSeq: integer("event_seq").notNull(),
+    source: text("source").notNull().default("self_narrative"),
+    learnedAt: text("learned_at").notNull().default("postgame"),
+    narrativeVersion: integer("narrative_version").notNull().default(1),
+    supersedes: integer("supersedes"),
+  },
+  (t) => [
+    primaryKey({ columns: [t.memoryId, t.gameId, t.eventSeq] }),
+    index("idx_pme_memory").on(t.memoryId),
+  ],
+);
+
 export const personaRelationships = sqliteTable(
   "persona_relationships",
   {

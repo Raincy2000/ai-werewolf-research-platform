@@ -12,7 +12,7 @@ import { hashPassword, encryptSecret, isEncrypted } from "./authCrypto.js";
 import { DEFAULT_AVATAR } from "../../contracts/auth.js";
 import { randomUUID } from "node:crypto";
 
-const OWNER_EMAIL = process.env.OWNER_EMAIL || "owner@example.com";
+const OWNER_EMAIL = "owner@example.com";
 const OWNER_USERNAME = "用户01";
 
 export async function runSeedOwner(ownerPassword: string): Promise<void> {

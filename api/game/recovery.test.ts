@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   events: [] as Record<string, unknown>[],
   decisions: [] as Record<string, unknown>[], // 决策日志（全对局共享，按 gameId 过滤）
   aiCalls: 0,
+  sheriffCandidateSeat: null as number | null, // 需要警长定序的用例指定一个参选座位
   dropNextAppend: false, // 模拟「崩溃致事件批未落盘」：下一次 appendEvents 丢弃
 }));
 
@@ -93,7 +94,7 @@ function autoAnswer(user: string): string {
   if (user.includes("退水抉择")) return '{"thought":"t","targets":[0]}';
   if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
   const taskLine = user.slice(user.indexOf("【你的任务】"));
-  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言|赛后讨论·聊天室/.test(taskLine)) {
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|狼人频道队内讨论|赛后讨论·聊天室/.test(taskLine)) {
     return '{"thought":"t","speech":"测试发言"}';
   }
   const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));
@@ -108,6 +109,10 @@ vi.mock("./ai/providers", () => ({
   // AI 自动应答（托管抹消后由正常输出推进流程；失败场景由各用例经 h.aiCalls 专项构造）
   callAi: async (_cfg: unknown, _system: string, user: string) => {
     h.aiCalls += 1;
+    const seat = (_cfg as { seat?: number }).seat;
+    if (h.sheriffCandidateSeat === seat && user.includes("参与竞选")) {
+      return { ok: true, text: '{"thought":"t","targets":[1]}', latencyMs: 1, error: null };
+    }
     return { ok: true, text: autoAnswer(user), latencyMs: 1, error: null };
   },
 }));
@@ -153,6 +158,7 @@ beforeEach(() => {
   h.events.length = 0;
   h.decisions.length = 0;
   h.aiCalls = 0;
+  h.sheriffCandidateSeat = null;
   h.dropNextAppend = false;
   registry.clear();
 });
@@ -375,6 +381,46 @@ describe("对局断点可恢复", () => {
     expect(droppedCount).toBeGreaterThan(0);
 
     await gameService.control(gameId, "pause"); // 清理（paused 恢复不会自动跑，幂等）
+  }, 60_000);
+
+  it("人格标准模板与原始心理不同：恢复不得重复补写定序及后续阶段事件", async () => {
+    const { gameService } = await import("./service");
+    h.sheriffCandidateSeat = 2;
+    const { gameId } = await gameService.createGame({
+      boardId: "standard12",
+      seats: makeSeats(12),
+      options: { ...OPTS, stepDelayMs: 500 },
+    });
+    await gameService.control(gameId, "start");
+    await waitFor(
+      () => decisionsOf(gameId).at(-1)?.kind === "sheriffOrder" &&
+        eventsOf(gameId).filter((e) => e.title === "警长定序").length === 2,
+      "警长定序的双频道事件完整落盘",
+    );
+    await gameService.control(gameId, "pause");
+    await waitFor(() => !registry.get(gameId)!.ticking, "定序后的 tick 链停稳");
+    expect(decisionsOf(gameId).at(-1)?.kind).toBe("sheriffOrder");
+    expect(eventsOf(gameId).at(-1)?.type).toBe("phase");
+
+    // 真实落盘事件会被 enrichPersonaEvents 改为观察者模板；重放时引擎只掌握主体原文。
+    const observerThought = "【参数触发】测试【涌现输出】t";
+    const orders = eventsOf(gameId).filter((e) => e.title === "警长定序");
+    expect(orders).toHaveLength(2);
+    for (const order of orders) {
+      order.thought = observerThought;
+      order.meta = {
+        ...(order.meta as Record<string, unknown> | null),
+        persona: { name: "测试人格", observerThought },
+      };
+    }
+    const beforeCount = eventsOf(gameId).length;
+    registry.delete(gameId);
+    await gameService.poll(gameId, 0);
+
+    expect(eventsOf(gameId)).toHaveLength(beforeCount);
+    expect(eventsOf(gameId).filter((e) => e.title === "警长定序")).toHaveLength(2);
+    const seqs = eventsOf(gameId).map((e) => e.seq as number);
+    expect(new Set(seqs).size).toBe(seqs.length);
   }, 60_000);
 
   it("批后已追加系统事件（对局终止标记）：恢复不重复补落已完整落盘的批次", async () => {

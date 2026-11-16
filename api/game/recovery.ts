@@ -403,6 +403,7 @@ export function createRecovery(deps: RecoveryDeps) {
             phaseLabel: latestPhaseEvt.title,
           }
         : null,
+      guideTextSnapshot: setup.guideTextSnapshot ?? "",
       pendingHold: false,
       breakKind: null,
       acts: null,
@@ -469,14 +470,24 @@ export function createRecovery(deps: RecoveryDeps) {
     // 整批未落盘（崩溃窗口）全批补齐；匹配段恰在尾部末端补缺失后缀；
     // 匹配段不在末端（批后已有服务层事件/手术改写）绝不补落（杜绝重复诈尸）
     if (lastDrained.length > 0) {
-      const sameEvt = (dbEvt: { day: number; phase: string; type: string; actor: number | null; title: string; content: string; thought: string | null }, ev: EngineEvent): boolean =>
-        dbEvt.day === ev.day &&
-        dbEvt.phase === ev.phase &&
-        dbEvt.type === ev.type &&
-        dbEvt.actor === ev.actor &&
-        dbEvt.title === ev.title &&
-        dbEvt.content === ev.content &&
-        dbEvt.thought === ev.thought;
+      const sameEvt = (
+        dbEvt: { day: number; phase: string; type: string; actor: number | null; title: string; content: string; thought: string | null; meta?: Record<string, unknown> | null },
+        ev: EngineEvent,
+      ): boolean => {
+        // 落盘前的人格富化会把主体原文替换为观察者模板；重放只有主体原文。
+        // 仅在模板与 meta.persona.observerThought 精确一致时承认两种表示等价，
+        // 其余心理差异仍照常判为不同事件，避免放宽去重边界。
+        const persona = dbEvt.meta?.persona as { observerThought?: unknown } | null | undefined;
+        const sameThought = dbEvt.thought === ev.thought ||
+          (ev.thought !== null && dbEvt.thought === persona?.observerThought);
+        return dbEvt.day === ev.day &&
+          dbEvt.phase === ev.phase &&
+          dbEvt.type === ev.type &&
+          dbEvt.actor === ev.actor &&
+          dbEvt.title === ev.title &&
+          dbEvt.content === ev.content &&
+          sameThought;
+      };
       let bestLen = 0;
       let bestPos = -1;
       for (let p = 0; p + bestLen < persistedTail.length; p++) {

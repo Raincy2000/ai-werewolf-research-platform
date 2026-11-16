@@ -187,6 +187,36 @@ describe("批量决策托管原因透出", () => {
     expect(h.events.some((e) => e.title === "AI 服务中断")).toBe(true);
     await gameService.control(gameId, "terminate");
   });
+
+  it("拍刀分析师无响应 → 立即暂停且不消费当前拍刀待决", async () => {
+    const seats = Array.from({ length: 9 }, (_, i) => ({
+      seat: i + 1,
+      provider: "kimi" as const,
+      baseUrl: "http://mock.local/v1",
+      model: "mock-model",
+      apiKey: "sk-mock",
+    }));
+    const { gameId } = await gameService.createGame({
+      boardId: "standard9",
+      seats,
+      options: { stepDelayMs: 5, sheriffEnabled: false, allowSelfDestruct: true, speechRoundsLimit: 2 },
+    });
+    h.aiResponses.push(
+      '{"thought":"宣布胜利","declareVictory":true}',
+      '{"thought":"宣布胜利","declareVictory":true}',
+    );
+    await gameService.control(gameId, "start");
+    const t0 = Date.now();
+    while (Date.now() - t0 < 3_000) {
+      if (h.games.get(gameId)?.status === "paused") break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(h.games.get(gameId)?.status).toBe("paused");
+    expect(h.engine!.state.decided.length).toBe(0);
+    const { registry } = await import("../service");
+    expect(registry.get(gameId)!.pauseReason).toContain("拍刀审核分析师无响应");
+    await gameService.control(gameId, "terminate");
+  });
 });
 
 describe("批量「输出非法」托管的原因透出与原始输出留痕（对局 20261009001 回归）", () => {

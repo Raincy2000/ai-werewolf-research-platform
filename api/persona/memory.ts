@@ -16,6 +16,8 @@
 /** 机制版本：写入调制日志，保证跨版本可比较（D3） */
 export const SELF_MECHANISM_VERSION = "self-1.0";
 
+export type MemoryMaterialKind = "eventExperience" | "observerReport" | "languageAnchor";
+
 export interface MemoryItem {
   id: number;
   type: string; // trauma | triumph | relationship | general
@@ -25,6 +27,18 @@ export interface MemoryItem {
   emotionalWeight: number; // 0..100
   situationSignature?: string | null;
   lifecycle?: string | null; // active | archived
+  /** 数据库来源；观察者报告与语言模板不得借记忆检索回流。 */
+  origin?: string | null;
+  materialKind?: MemoryMaterialKind;
+}
+
+export function memoryMaterialKindOf(item: Pick<MemoryItem, "origin" | "materialKind">): MemoryMaterialKind {
+  if (item.materialKind) return item.materialKind;
+  if (item.origin === "observer_report" || item.origin === "analysis_report" || item.origin === "self_narrative") {
+    return "observerReport";
+  }
+  if (item.origin === "language_anchor") return "languageAnchor";
+  return "eventExperience";
 }
 
 /** 情绪状态（跨回合持久，见 §14.6） */
@@ -87,7 +101,13 @@ export function scoreMemory(m: MemoryItem, opts: RecallOptions = {}): number {
   const base = Math.max(0, Math.min(100, m.strength)) / 100;
   const vm = valenceMatch(m.valence, o.affect?.valence ?? 0);
   const sm = situationMatch(m.situationSignature, o.signature);
-  const score = base * (1 + o.gammaValence * vm) * (1 + o.gammaSignature * sm);
+  const concerns = (o.concerns ?? []).map((c) => c.trim()).filter(Boolean);
+  const concernHits = concerns.filter(
+    (c) => m.content.includes(c) || (m.situationSignature?.includes(c) ?? false),
+  ).length;
+  // 主动回忆只放大与当前关注直接相关的联想，不按胜负或战术收益排序。
+  const concernBoost = 1 + concernHits * 0.8;
+  const score = base * (1 + o.gammaValence * vm) * (1 + o.gammaSignature * sm) * concernBoost;
   // 归档记忆不参与检索（§4.10.5，不物理删除）
   return m.lifecycle === "archived" ? 0 : score;
 }
@@ -99,8 +119,8 @@ export function scoreMemory(m: MemoryItem, opts: RecallOptions = {}): number {
  */
 export function recallMemories(items: MemoryItem[], opts: RecallOptions = {}): MemoryItem[] {
   const o = { ...DEF, ...opts };
-  // 归档记忆永不参与；其余全部候选，由得分（含情境一致性）排序——不做硬过滤
-  const active = items.filter((m) => m.lifecycle !== "archived");
+  // 归档、观察者报告和语言模板不参与本人经历检索；旧局事件经验不受内容禁词过滤。
+  const active = items.filter((m) => m.lifecycle !== "archived" && memoryMaterialKindOf(m) === "eventExperience");
   const scored = active.map((m) => ({ m, s: scoreMemory(m, o) }));
   scored.sort((a, b) => (b.s - a.s) || (a.m.id - b.m.id));
   return scored.slice(0, Math.max(0, o.k)).map((x) => x.m);

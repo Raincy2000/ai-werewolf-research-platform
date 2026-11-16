@@ -186,7 +186,7 @@ export function boardRulesText(board: BoardDef, sheriffEnabled: boolean): string
     .filter((r) => r !== "villager" && r !== "werewolf")
     .map((r) => `${ROLE_META[r].name}：${ROLE_META[r].description}`);
   return [
-    `版型【${board.name}】：${board.playerCount} 名玩家，角色池为 ${comp}。所有人开局即知道这个角色池——不存在的角色（如本池没有猎人就没有猎人）不要幻想。`,
+    `版型【${board.name}】：${board.playerCount} 名玩家，角色池为 ${comp}。所有人开局即知道这个角色池；未包含的角色不会出现在本局。`,
     `胜负判定（屠边）：狼人杀光全部神职或全部平民→狼胜；好人放逐全部狼人→好人胜。`,
     `狼刀规则：见面狼夜间讨论后各投一刀口票，多数决定最终落刀；平票则狼刀空悬（当夜无人被刀）。你自己的票不等于最终结果，以狼队台账为准。`,
     `终局规则：夜晚结算狼刀在先——狼刀达成屠边的同夜，即使女巫随后毒死最后一狼也判狼胜；最后一狼出局（被放逐/死亡/自爆）时其带走类技能不发动（狼全灭即终局，神民胜）；骑士决斗只能在白天放逐发言阶段（含平票PK发言）发起，被放逐时无权发动。`,
@@ -216,6 +216,7 @@ export interface PlayerSnapshot {
   deathInfo: string | null;   // 死因描述，如 "第2夜被刀"
   aiModel: string;            // 该座位的模型名（研究展示用）
   personaName?: string | null; // 人格研究站：该座位绑定的人格名（未绑定为 null/缺省）
+  personaGender?: string | null; // 人格自身性别（与人格所抽到的女巫/猎人等角色无关）
   personaImageData?: string | null; // 人格头像（仅运行时从人格卡读取，不重复写入对局 setup）
 }
 

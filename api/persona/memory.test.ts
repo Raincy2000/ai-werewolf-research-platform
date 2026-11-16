@@ -10,6 +10,7 @@ import {
   valenceMatch,
   type MemoryItem,
 } from "./memory";
+import { renderMemoryText } from "../queries/personas";
 
 const mem = (over: Partial<MemoryItem> & { id: number }): MemoryItem => ({
   type: "general",
@@ -80,6 +81,15 @@ describe("记性：检索层（§4.10.4）", () => {
     expect(a.map((m) => m.id)).toEqual(b.map((m) => m.id));
   });
 
+  it("主动回忆线索：主体当前关注的人与事可越过部分强度差", () => {
+    const items = [
+      mem({ id: 1, strength: 85, content: "一场无关的胜负" }),
+      mem({ id: 2, strength: 45, content: "6号当众背叛了我" }),
+    ];
+    const got = recallMemories(items, { concerns: ["6号", "背叛"], k: 1 });
+    expect(got.map((m) => m.id)).toEqual([2]);
+  });
+
   it("情绪一致性：效价接近当下情绪者得分更高", () => {
     const sad = mem({ id: 1, valence: -80, strength: 50 });
     const glad = mem({ id: 2, valence: 80, strength: 50 });
@@ -113,6 +123,20 @@ describe("记性：组装层（§4.10.2 命名硬规则）", () => {
 
   it("空输入返回空串", () => {
     expect(composeRemembered([], {})).toBe("");
+  });
+});
+
+describe("记性：在场关系过滤", () => {
+  it("旧关系优先当前在场者，而非只按更新时间抢占注意", () => {
+    const text = renderMemoryText({
+      items: [],
+      relationships: [
+        { targetName: "在场者", relation: "旧识", affinity: 10, trust: 20, note: "本局相见" },
+        { targetName: "场外者", relation: "宿敌", affinity: -90, trust: 0, note: "不在本局" },
+      ],
+    }, { presentNames: ["在场者"] } as never);
+    expect(text).toContain("在场者");
+    expect(text).not.toContain("场外者");
   });
 });
 

@@ -3,6 +3,7 @@ import type { HttpBindings } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import fs from "fs";
 import path from "path";
+import { env } from "./env";
 
 type App = Hono<{ Bindings: HttpBindings }>;
 
@@ -24,6 +25,13 @@ export function serveStaticFiles(app: App) {
     path.resolve(import.meta.dirname, "../../dist/public"),
   ];
   const found = candidates.find((p) => fs.existsSync(path.join(p, "index.html")));
+  // 源码开发不依赖 dist：以源码根目录 index.html 作为 SPA 回退，交由 Vite 注入开发客户端。
+  // 文件流响应与生产静态页一致，避免字符串压缩与开发脚本注入发生冲突。
+  if (!env.isProduction && !found) {
+    console.log("[serveStatic] 开发模式无 dist，使用源码 index.html");
+    app.get("*", serveStatic({ root: process.cwd(), path: "index.html" }));
+    return;
+  }
   const distPath = found ?? candidates[0];
   if (!found) {
     // 便于排障：把实际探测过的路径打到 desktop.log（stderr 会被主进程转发）

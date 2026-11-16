@@ -57,12 +57,14 @@ describe("玩家人格可见度（人格圈层知晓文本）", () => {
     expect(clear).not.toContain("你自己处于迷雾状态");
   });
 
-  it("none：全员迷雾，不列任何姓名，可推测但不得假装确知", () => {
+  it("none：全员迷雾只陈述未知信息，不指导或禁止推测", () => {
     const t = buildPersonaCircleText(1, BINDINGS, "none", undefined)!;
     expect(t).toContain("所有玩家对你而言都是迷雾");
     expect(t).not.toContain("五条悟");
     expect(t).not.toContain("夏油杰");
-    expect(t).toContain("自行推测");
+    expect(t).not.toContain("自行推测");
+    expect(t).not.toContain("不得假装确知");
+    expect(t).toContain("人格身份不属于你的已知信息");
   });
 });
 
@@ -82,12 +84,13 @@ describe("人格圈层增强（基本印象/互称指引/羁绊注入）", () =>
     expect(t).toContain("外貌气质：东北口音");
   });
 
-  it("full 可见时携带人格名互称与认知博弈指引", () => {
+  it("full 可见时只提供人格事实与称呼信息，不附加认知或战术指导", () => {
     const t = buildPersonaCircleText(1, BINDINGS, "full", undefined)!;
-    expect(t).toContain("直呼已知人格的人格名");
-    expect(t).toContain("预判、游说、结盟或提防");
-    expect(t).toContain("人格只是参考"); // 人格不破博弈本体的护栏
-    expect(t).toContain("对迷雾中的玩家仍按座位号称呼");
+    expect(t).toContain("已知人格的人格名与座位号均可用于称呼");
+    expect(t).not.toContain("预判、游说、结盟或提防");
+    expect(t).not.toContain("利用这一点");
+    expect(t).not.toContain("如何影响你的理解、信任与选择由你决定");
+    expect(t).toContain("迷雾玩家仅提供座位号");
   });
 
   it("羁绊注入：记事簿关系行（亲疏/信任/注记）+ 原作渊源", () => {

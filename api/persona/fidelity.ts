@@ -48,7 +48,7 @@ export function mergePersonaTextOnly<T extends object>(original: T, rewritten: T
 export function buildFidelityRetryNote(issues: string[], lockedAction: unknown): string {
   return [
     "【表达保真重写】上一次文本存在：" + issues.join("、"),
-    "只重写 speech、thought、bodyTrace、analysisGt、analysisPsy，不得改变任何投票、技能目标或行动字段。",
+    "只重写 speech、thought、bodyTrace，不得改变任何投票、技能目标或行动字段。",
     `【已冻结行动】${JSON.stringify(lockedAction)}`,
     "重写时沿用本人语言风格，不得复制其他玩家的口癖、比喻体系和句式，不得自述人格参数或研究机制。",
   ].join("\n");

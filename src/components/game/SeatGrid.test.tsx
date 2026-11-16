@@ -123,4 +123,10 @@ describe('SeatGrid 座位视图', () => {
     expect(html).not.toMatch(/data-testid="persona-composition"[^>]*grayscale/)
     expect(html).not.toContain('opacity-60')
   })
+
+  it('长人格名和出局原因显式保持滚动播放，不绑定对局暂停状态', () => {
+    const html = render([player({ alive: false, deathInfo: '第1夜被刀', personaName: '一个名字特别长的人格' })])
+    expect(html).toMatch(/persona-name-marquee[^>]*animation-play-state:running/)
+    expect(html).toMatch(/seat-marquee[^>]*animation-play-state:running/)
+  })
 })

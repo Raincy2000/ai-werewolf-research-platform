@@ -6,7 +6,7 @@
 //   Kimi 思考系（k3/k2.x）temperature/top_p 官方固定，免传（传入他值必 400 空跑一轮）
 // - Anthropic：POST {baseUrl}/v1/messages，headers x-api-key + anthropic-version
 // 单次调用超时按模型能力画像分流（modelCaps：思考型 150s / 常规 90s，AI_TIMEOUT_MS 可覆盖），
-// 失败重试 2 次（指数退避）；调用方可用 opts.timeoutMs / opts.maxRetries / opts.deadlineAt 覆盖
+// 默认失败重试 4 次（1s 起指数退避）；调用方可用 opts.timeoutMs / opts.maxRetries / opts.deadlineAt 覆盖
 // （如分析师长调用：180s + 仅重试 1 次；决策点预算截止线在重试循环内逐次生效）。
 // 传输层用 longFetch（npm undici + 关闭隐藏 300s headersTimeout）——应用层
 // AbortController 是唯一超时闸门；网络错误经 netErrorMessage 透传底层 cause。
@@ -32,7 +32,7 @@ import { isQuotaErrorText } from "./quota";
 export interface CallAiOptions {
   jsonMode?: boolean; // 默认 true（OpenAI 兼容端点带 response_format）；false = 纯文本输出
   timeoutMs?: number; // 单次请求超时，默认按模型能力画像（modelCaps.defaultCallTimeoutMs）
-  maxRetries?: number; // 失败重试次数（不含首发），默认 2
+  maxRetries?: number; // 失败重试次数（不含首发），默认 4；仍受 deadlineAt 总预算约束
   /** 决策点总预算截止线（epoch ms）：每次尝试前把单次超时截到剩余预算，
    *  剩余不足一次最短调用即停止重试——预算在重试循环内同样生效
    *  （此前只在调用方入口检查一次，内部 3×90s 重试会把 120s 预算实际烧成 274s） */
@@ -41,7 +41,12 @@ export interface CallAiOptions {
 
 // 思考型模型单步推理可达 150s+（kimi-k3 永远思考、reasoning_effort 默认 max）；
 // 默认超时由 modelCaps.defaultCallTimeoutMs 按模型分流，可用 AI_TIMEOUT_MS 覆盖
-const DEFAULT_MAX_RETRIES = 2; // 首发 1 次 + 重试 2 次
+const DEFAULT_MAX_RETRIES = 4; // 首发 1 次 + 重试 4 次（覆盖短暂 5xx 故障窗口）
+
+function retryDelayMs(attempt: number): number {
+  const schedule = [1_000, 2_000, 4_000, 8_000, 15_000];
+  return schedule[Math.min(attempt - 1, schedule.length - 1)]!;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -219,7 +224,16 @@ export async function callAi(
   let lastError = "未知错误";
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (attempt > 0) {
-      await sleep(400 * 2 ** (attempt - 1)); // 400ms → 800ms 指数退避
+      let delayMs = retryDelayMs(attempt);
+      if (opts?.deadlineAt != null) {
+        const remaining = opts.deadlineAt - Date.now();
+        if (remaining <= 3_000) {
+          lastError = "AI响应总预算耗尽";
+          break;
+        }
+        delayMs = Math.min(delayMs, Math.max(0, remaining - 500));
+      }
+      await sleep(delayMs);
     }
     // 决策点总预算在重试循环内逐次生效：剩余不足一次最短调用即收手转兜底，
     // 单次超时截到剩余预算——预算不再只是入口一次性检查（历史：120s 预算实际烧 274s）

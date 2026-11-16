@@ -34,6 +34,16 @@ function log(...args) {
 }
 log("=== 客户端启动 ===", `packaged=${app.isPackaged}`);
 
+// 20261105003 第 252 条后实锤：Intel igdkmdn64.sys 触发 LiveKernelEvent 141，
+// 随后 Electron 与资源管理器同时挂起。普通 2D 对局界面无需硬件 GPU，
+// 在 ready 前统一切到软件渲染，避免显卡驱动重置拖垮整个客户端。
+app.commandLine.appendSwitch('disable-gpu');
+app.disableHardwareAcceleration();
+log("GPU 硬件加速已禁用：使用软件渲染（显卡驱动挂起防护）");
+app.on("gpu-process-crashed", (_event, killed) => {
+  log("[gpu] GPU 进程退出", `killed=${killed}`);
+});
+
 // ---------- 机器级配置（首启生成随机密钥并持久化） ----------
 const cfgPath = path.join(userData, "desktop-config.json");
 function loadConfig() {
@@ -52,8 +62,8 @@ for (const key of ["appSecret", "presetSecret"]) {
   }
 }
 if (!cfg.ownerPassword) {
-  // owner（用户01）初始密码：首启随机生成并保存到本机配置，不在源码中硬编码。
-  cfg.ownerPassword = crypto.randomBytes(16).toString("hex");
+  // owner（用户01）初始密码：仅本机使用；改动后下次首启生效（已有账户不重置）
+  cfg.ownerPassword = crypto.randomBytes(12).toString("base64url");
   cfgDirty = true;
 }
 if (cfgDirty) {
@@ -83,7 +93,13 @@ const TRANSIENT_BOOT_EXIT = new Set([2147483651, -1073740791]); // STATUS_BREAKP
 const BOOT_MAX_ATTEMPTS = 3;
 
 async function startServer() {
-  serverPort = process.env.WW_PORT ? Number(process.env.WW_PORT) : await freePort();
+  const devUrl = process.env.WW_DEV_URL;
+  serverPort = devUrl ? Number(new URL(devUrl).port) : process.env.WW_PORT ? Number(process.env.WW_PORT) : await freePort();
+  if (devUrl) {
+    // 开发启动器已用系统 Node 启动 Vite 并完成健康检查；Electron 仅连接该地址。
+    log("源码开发模式：连接独立 Vite 服务", devUrl, "| db =", path.join(userData, "werewolf.db"));
+    return;
+  }
   const serverPath = app.isPackaged
     ? path.join(process.resourcesPath, "dist", "boot.js")
     : path.resolve(import.meta.dirname, "..", "dist", "boot.js");
@@ -209,6 +225,7 @@ async function startServerOnce(serverPath) {
 }
 
 async function createMainWindow() {
+  const devUrl = process.env.WW_DEV_URL;
   const win = new BrowserWindow({
     width: 1500,
     height: 950,
@@ -216,10 +233,15 @@ async function createMainWindow() {
     minHeight: 700,
     autoHideMenuBar: true,
     backgroundColor: "#0b0f14",
-    title: "AI模拟狼人杀研究平台",
+    title: devUrl ? "AI模拟狼人杀研究平台 · 源码开发版" : "AI模拟狼人杀研究平台",
     // 窗口图标：打包版自动用 exe 内嵌图标（electron-builder 由 build/icon.png 生成），开发模式显式指定
     ...(app.isPackaged ? {} : { icon: path.resolve(import.meta.dirname, "build", "icon.png") }),
   });
+  win.webContents.on("render-process-gone", (_event, details) => {
+    log("[renderer] 渲染进程退出", `reason=${details.reason}`, `exitCode=${details.exitCode}`);
+  });
+  win.on('unresponsive', () => log("[renderer] 窗口无响应"));
+  win.on("responsive", () => log("[renderer] 窗口恢复响应"));
   await win.loadURL(`http://127.0.0.1:${serverPort}/`);
 }
 

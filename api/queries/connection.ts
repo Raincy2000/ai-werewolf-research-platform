@@ -11,7 +11,7 @@ import path from "node:path";
 import { env } from "../lib/env";
 import * as mysqlSchema from "@db/schema.mysql";
 import * as sqliteSchema from "@db/schema.sqlite";
-import { SQLITE_DDL, SQLITE_DDL_0001, SQLITE_DDL_0002, SQLITE_DDL_0003, SQLITE_DDL_0004, SQLITE_DDL_0005, SQLITE_DDL_0006, SQLITE_DDL_0007, SQLITE_DDL_0008, SQLITE_DDL_0009, SQLITE_DDL_0010, SQLITE_DDL_0011, SQLITE_DDL_0012, SQLITE_DDL_0013, SQLITE_DDL_0014, SQLITE_DDL_0015, SQLITE_DDL_0016, SQLITE_DDL_0017, SQLITE_DDL_0018, SQLITE_DDL_0019, SQLITE_DDL_0020, SQLITE_DDL_0021, SQLITE_DDL_0022, SQLITE_DDL_0100, SQLITE_DDL_0101, SQLITE_DDL_0102, SQLITE_DDL_0103, SQLITE_DDL_0104, SQLITE_DDL_0105, SQLITE_DDL_0106, SQLITE_DDL_0107, SQLITE_DDL_0108, SQLITE_DDL_0109, SQLITE_DDL_0110 } from "@db/sqlite-ddl";
+import { SQLITE_DDL, SQLITE_DDL_0001, SQLITE_DDL_0002, SQLITE_DDL_0003, SQLITE_DDL_0004, SQLITE_DDL_0005, SQLITE_DDL_0006, SQLITE_DDL_0007, SQLITE_DDL_0008, SQLITE_DDL_0009, SQLITE_DDL_0010, SQLITE_DDL_0011, SQLITE_DDL_0012, SQLITE_DDL_0013, SQLITE_DDL_0014, SQLITE_DDL_0015, SQLITE_DDL_0016, SQLITE_DDL_0017, SQLITE_DDL_0018, SQLITE_DDL_0019, SQLITE_DDL_0020, SQLITE_DDL_0021, SQLITE_DDL_0022, SQLITE_DDL_0100, SQLITE_DDL_0101, SQLITE_DDL_0102, SQLITE_DDL_0103, SQLITE_DDL_0104, SQLITE_DDL_0105, SQLITE_DDL_0106, SQLITE_DDL_0107, SQLITE_DDL_0108, SQLITE_DDL_0109, SQLITE_DDL_0110, SQLITE_DDL_0111 } from "@db/sqlite-ddl";
 
 let instance: unknown;
 /** 底层 SQLite 连接（仅测试/诊断用；MySQL 方言下为 null） */
@@ -254,6 +254,13 @@ function createSqliteDb(dbPath: string) {
       .get();
     if (!hasCanonSort) {
       raw.exec(SQLITE_DDL_0110);
+    }
+    // ---- 2026-11-09：记忆事件溯源（只增表，不改旧记忆内容） ----
+    const hasMemoryEvidence = raw
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='persona_memory_evidence'")
+      .get();
+    if (!hasMemoryEvidence) {
+      raw.exec(SQLITE_DDL_0111);
     }
     const hasScenarios = raw
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='scenarios'")

@@ -78,6 +78,7 @@ export function PersonaThought({
   mode?: 'full' | 'emergence' | 'detail'
 }) {
   const parsed = parseTensionTemplate(thought)
+  if (!thought.trim() && !persona?.gt && !persona?.psy) return null
   // 仅涌现正文（收起态）
   if (mode === 'emergence') {
     return <EmergenceText thought={thought} parsed={parsed} />

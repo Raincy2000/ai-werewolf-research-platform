@@ -13,15 +13,20 @@ describe("隐性行为桥接", () => {
       defenses: [{ mechanism: "合理化", toward: "自己的多疑" }],
       trauma: null,
       impulse: "先稳住二号",
+      currentReaction: "这句话让我先停顿一下。",
       selfControl: 25,
       bonds: [{ toward: "二号", feel: "不甘心被轻视", urge: "让他收回判断" }],
     };
     const text = buildBehaviorBridge(mirror);
     expect(text).toContain("先稳住二号");
+    expect(text).toContain("这句话让我先停顿一下");
     expect(text).toContain("想维持和气");
     expect(text).toContain("想借刀杀人");
     expect(text).toContain("不甘心被轻视");
-    expect(text).toContain("克制较弱");
+    expect(text).toContain("25/100");
+    expect(text).not.toContain("如何回应由你决定");
+    expect(text).not.toContain("是否以及如何行动由你决定");
+    expect(text).not.toContain("更容易直接落到措辞和动作上");
     expect(text).not.toContain("bigFive");
     expect(text).not.toContain("87");
     expect(text).not.toContain("0.8");

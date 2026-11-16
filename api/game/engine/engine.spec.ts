@@ -1126,8 +1126,10 @@ describe("专项：白天规则", () => {
     }, {
       stop: (p) => p?.kind === "daySpeech" && p.view.day === 2, // 停在第2天首次发言（狼刀+警徽流已结算）
     });
-    // 警长5号夜亡后出现 badgePass 待决
-    expect(pendings.some((p) => p.kind === "badgePass" && p.seat === 5)).toBe(true);
+    // 警长5号夜亡后出现 badgePass 待决，提示只含选项与规则结果。
+    const badge = pendings.find((p) => p.kind === "badgePass" && p.seat === 5);
+    expect(badge).toBeDefined();
+    expect(badge!.hint).toBe("你是阵亡警长（警徽流抉择）：targets=[目标] 移交警徽（其接任警长、获归票位与1.5票），或 skip=true 撕毁警徽（本局再无警长）。");
     const snap = engine.getSnapshot();
     expect(snap.players.find((x) => x.seat === 7)!.sheriff).toBe(true); // 7号接任警长
     expect(snap.players.find((x) => x.seat === 5)!.sheriff).toBe(false);
@@ -1259,7 +1261,13 @@ describe("专项：白天规则", () => {
     expect(note).toBeDefined();
     expect(note!.content).toContain("5号");
     expect(note!.content).toContain("12号");
-    expect(note!.content).toContain("并非");
+    expect(note!.content).toContain("因技能发动，当天发言流程提前中断：");
+    expect(note!.content).toContain("未轮到普通发言。");
+    expect(note!.content).not.toContain("这只是当前流程记录");
+    expect(note!.content).not.toContain("由玩家结合其他证据自行判断");
+    expect(note!.content).not.toContain("并非故意保持沉默");
+    expect(note!.content).not.toContain("并非主动沉默");
+    expect(note!.content).not.toContain("请勿据此怀疑其身份");
     expect(note!.content).not.toContain("8号"); // 死者不在说明之列
   });
 
@@ -1659,6 +1667,64 @@ describe("专项：发言轮次与警长定序", () => {
     "villager", "villager", "villager", "villager",
   ];
 
+  it("发言回应契约：警上、全体与投票阶段分别提供顺序和后续合法阶段", () => {
+    const { pendings } = drive("standard12", STD12, (p) => {
+      const thought = "t";
+      if (p.kind === "wolfKill") return { thought, targets: [12] };
+      if (p.kind === "seerCheck") return { thought, targets: [1] };
+      if (p.kind === "sheriffRun") return BATCH_MAP(p, (sub) => ({ thought, targets: [[5, 6].includes(sub.seat) ? 1 : 0] }));
+      if (p.kind === "sheriffVote") return BATCH_MAP(p, () => ({ thought, targets: [5] }));
+      if (p.kind === "sheriffOrder") return { thought, targets: [1] };
+      return QUICK(p);
+    }, { stop: (p) => p?.kind === "dayVote" && p.view.day === 1 });
+    const sheriffFirst = subPendings(pendings, "sheriffSpeech").find((p) => p.seat === 5)!;
+    const sheriffSecond = subPendings(pendings, "sheriffSpeech").find((p) => p.seat === 6)!;
+    expect(sheriffFirst.view.speech?.stage).toBe("sheriffSpeech");
+    expect(sheriffFirst.view.speech?.orderedSeats).toEqual([5, 6]);
+    expect(sheriffFirst.view.speech?.spokenSeats).toEqual([]);
+    expect(sheriffSecond.view.speech?.spokenSeats).toEqual([5]);
+    expect(sheriffFirst.view.speech?.nextStages[5]).toContain("daySpeech");
+    const dayFirst = subPendings(pendings, "daySpeech").find((p) => p.view.day === 1)!;
+    expect(dayFirst.view.speech?.stage).toBe("daySpeech");
+    expect(dayFirst.view.speech?.nextStages[6]).toContain("lastWords");
+    const vote = pendings.find((p) => p.kind === "dayVote" && p.view.day === 1)!;
+    expect(vote.view.speech?.remainingSeats).toEqual([]);
+  });
+
+  it("平票PK是独立回应阶段，后续只列合法可能而非提前承诺", () => {
+    const { pendings } = drive("standard12", STD12, (p) => {
+      const thought = "t";
+      if (p.kind === "wolfKill") return { thought, targets: [9] };
+      if (p.kind === "seerCheck") return { thought, targets: [2] };
+      if (p.kind === "dayVote") {
+        const activeVoters = (p.batch ?? [p]).filter((sub) => sub.seat !== 11);
+        const neutralVoters = activeVoters.filter((sub) => ![1, 2].includes(sub.seat));
+        return BATCH_MAP(p, (sub) => {
+          if (sub.seat === 11) return { thought, skip: true };
+          // 1、2号互投；其余8名合法选民均分两组，形成1、2号各5票。
+          let target: number;
+          if (sub.seat === 1 || sub.seat === 2) {
+            target = sub.seat === 1 ? 2 : 1;
+          } else {
+            const rank = neutralVoters.findIndex((voter) => voter.seat === sub.seat);
+            target = rank < neutralVoters.length / 2 ? 1 : 2;
+          }
+          if (!sub.options.includes(target)) throw new Error(`测试夹具无法构造平票：${sub.seat}号可选${sub.options.join("/")}`);
+          return { thought, targets: [target] };
+        });
+      }
+      return QUICK(p);
+    }, {
+      options: { sheriffEnabled: false },
+      stop: (p) => !!p && subPendings([p], "pkSpeech").length > 0,
+    });
+    const pk = subPendings(pendings, "pkSpeech")[0]!;
+    expect(pk.view.speech?.stage).toBe("pkSpeech");
+    expect([...(pk.view.speech?.orderedSeats ?? [])].sort((a, b) => a - b)).toEqual([1, 2]);
+    expect(pk.view.speech?.nextStages[1]).toContain("lastWords");
+    expect(pk.view.speech?.nextStages[1]).not.toContain("daySpeech");
+  });
+
   it("无警长版型（standard9）：第1天全体发言仅1轮（speechRoundsLimit 不再生效）", () => {
     const R9: RoleId[] = [
       "seer", "witch", "hunter",
@@ -1916,6 +1982,8 @@ describe("专项：赛后讨论", () => {
     const pgPendings = pendings.filter((p) => p.kind === "postgameSpeak");
     expect(pgPendings.length).toBe(36);
     expect(pgPendings.every((p) => !p.batch)).toBe(true);
+    expect(pgPendings.every((p) => p.hint.includes("可选择沉默"))).toBe(true);
+    expect(pgPendings.every((p) => !p.hint.includes("积极参与") && !p.hint.includes("确实无话可说"))).toBe(true);
   });
 
   it("机会用尽：仅7号每轮发言，5次用尽后第6轮起不再询问7号", () => {
@@ -2071,6 +2139,11 @@ describe("专项：开局告知与快照存量", () => {
     });
     const startEvt = events.find((e) => e.phase === "game.start" && e.type === "system")!;
     expect(startEvt.content).toContain("赛后讨论");
+    expect(startEvt.content).toContain("全员身份公开");
+    expect(startEvt.content).not.toContain("想说什么都可以");
+    expect(startEvt.content).not.toContain("自由讨论");
+    expect(startEvt.content).not.toContain("不要幻想");
+    expect(startEvt.content).toContain("未包含的角色不会出现在本局");
     expect(pendings.length).toBeGreaterThan(0);
     expect(pendings[0].view.rules?.postGameDiscuss).toBe(true);
   });

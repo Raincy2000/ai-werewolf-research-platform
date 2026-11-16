@@ -31,6 +31,7 @@ import {
 } from "../../contracts/persona";
 import { callAi } from "../game/ai/providers";
 import { parseJsonRobust } from "../game/ai/parse";
+import { formatEvidenceRefs, type EvidenceRef } from "../game/evidence";
 import {
   decayPersonaMemories,
   applyPersonaDrift,
@@ -41,6 +42,7 @@ import {
   type NewStateObservation,
   type NewTraitUpdate,
   insertPersonaMemories,
+  insertPersonaMemoryEvidence,
   reinforcePersonaMemories,
   beginPersonaWriteback,
   finishPersonaWriteback,
@@ -60,6 +62,8 @@ interface WritebackMemory {
   emotionalWeight: number; // 0-100 唤醒度（arousal）
   valence: number; // -100..100 效价（valence）：负=创伤/挫败，正=高光/成就（Russell 1980 情绪二维）
   reinforceMemoryId: number | null; // 与本条同源的已有记忆 id（强化之）
+  /** 支撑这条自我叙述的原始事件序号；只允许来自完整事实包 */
+  eventSeqs: number[];
 }
 
 interface WritebackRelationship {
@@ -105,10 +109,12 @@ export function buildWritebackPrompt(opts: {
   memories: PersonaMemory[];
   relationships: PersonaRelationship[];
   seatRoster: SeatRosterEntry[]; // 本局其他人格座位名册（含可知性；关系与记忆锚点的判定依据）
+  /** 合法认知域内的完整事实；摘要仅辅助阅读，绝不替代原始事件 */
+  evidence?: EvidenceRef[];
 }): { system: string; user: string } {
   const { card, seat, roleName, outcome, gameTitleNo, digest, memories, relationships, seatRoster } = opts;
   const system = [
-    `你是「记事簿」——数字人类心理学实验场的记忆官。你负责把「${card.name}」刚刚经历的一局狼人杀写入 TA 的长期记忆。`,
+    `你是「${card.name}」——不是扮演 TA，你就是 TA。你刚刚经历了一局狼人杀，现在由你自己回顾并写下愿意保留的长期记忆与自我变化。`,
     "铁律3「记忆持久化」：关系图谱、创伤事件、人格漂移跨对局保留；支持关系传递与记忆衰减/强化。",
     "你只输出结构化 JSON，禁止任何其他文字。",
     "写作视角：记忆内容一律用第一人称（TA 自己记得……），具体到人（座位号/人格名）与事（第几天、什么事件），禁止空泛感慨。",
@@ -119,7 +125,7 @@ export function buildWritebackPrompt(opts: {
     memories.length > 0
       ? memories
           .slice(0, 12)
-          .map((m) => `#${m.id} [${m.type}·强度${m.strength}] ${m.content.slice(0, 120)}`)
+          .map((m) => `#${m.id} [${m.type}·${m.source ?? "old_memory"}·强度${m.strength}] ${m.content.slice(0, 120)}`)
           .join("\n")
       : "（暂无长期记忆）";
   const relList =
@@ -143,9 +149,16 @@ export function buildWritebackPrompt(opts: {
     `【本局座位名册】（你视角下的身份可知性；未列出的座位均为无人格玩家——每局都是不同的人）`,
     rosterList,
     "",
-    "【对局摘要】",
+    "【对局摘要】（仅辅助阅读，不代替完整事实）",
     digest,
     "",
+    ...(opts.evidence?.length
+      ? [
+          formatEvidenceRefs(opts.evidence, "完整事实索引"),
+          "【事实与自我叙述】eventSeqs 只能引用上述真实事件序号；你的记忆属于你的自我叙述，不得因为引用了事件就把它当成与原文完全相同的客观事实。",
+          "",
+        ]
+      : []),
     "【已有长期记忆】（reinforceMemoryId 引用这里的 id）",
     memList,
     "",
@@ -156,23 +169,24 @@ export function buildWritebackPrompt(opts: {
     formatDriftPanel(card.params),
     "",
     "【输出契约】严格输出 JSON：",
-    `{"memories":[{"type":"trauma|triumph|relationship|general","content":"第一人称记忆（具体到人与事，≤120字）","emotionalWeight":0,"valence":0,"reinforceMemoryId":null}],"relationships":[{"targetName":"关系锚点（见规则3）","relation":"关系标签","affinityDelta":0,"trustDelta":0,"note":"关键事件一句"}],"drift":[{"path":"参数路径","delta":0,"reason":"漂移事由"}]}`,
+    `{"memories":[{"type":"trauma|triumph|relationship|general","content":"第一人称记忆（具体到人与事，≤120字）","emotionalWeight":0,"valence":0,"reinforceMemoryId":null,"eventSeqs":[]}],"relationships":[{"targetName":"关系锚点（见规则3）","relation":"关系标签","affinityDelta":0,"trustDelta":0,"note":"关键事件一句"}],"drift":[{"path":"参数路径","delta":0,"reason":"漂移事由"}]}`,
     "规则：",
-    "1. memories ≤4 条：只写真正塑造 TA 的事件（被背叛/被信任/濒死/翻盘/手刃……）；type：trauma=创伤、triumph=高光/成就、general=其他。emotionalWeight=唤醒度(0-100)，valence=效价(-100..100)——情绪是二维的，两者都要给；高光同样值得被记住；",
+    "1. memories ≤4 条：由你决定哪些经历值得留下，可以重大，也可以琐碎、矛盾或难以命名；不要迎合任何成长模板。type：trauma=创伤、triumph=高光/成就、general=其他。emotionalWeight=唤醒度(0-100)，valence=效价(-100..100)——情绪是二维的，两者都要给；",
     "2. reinforceMemoryId：本条记忆与某条已有记忆同源（同一人物/同一主题）时填其 id——旧记忆会被强化而非重复；",
     "3. relationships ≤4 条：只写本局与 TA 产生真实交互的对象；affinity/trust 用增量（如被票出局 trustDelta=-30）。targetName 是关系的永久锚点，按对象身份可知性双轨：",
     "   - 对象是人格可知的人格玩家（名册中标注「人格玩家」）：targetName 必须精确等于 TA 的人格名（如「五条悟」）——人格跨对局存续，锚定点是人格本身，禁止带座位号（每局座位绑定会变）；",
     `   - 对象是迷雾玩家或无人格玩家：targetName 用「对局标题号·N号玩家」格式（本局如「${gameTitleNo}·10号玩家」）——TA 们对 TA 而言只是这局的一个代号，必须带对局编号才能区分；`,
     "4. 记忆内容同理（锚点一致性铁律）：提及人格可知的对象时写人格名（「五条悟骗了我」），绝不写 TA 的座位号；提及迷雾/无人格对象时写「N号玩家」（记忆本身已带对局归属）；",
-    "5. drift ≤3 条：只有经历真正撼动人格时才漂移，且必须同时评估两个方向：",
-    "   · 创伤面（被背叛/被放逐/误判）→ 例：attachment.anxiety +1、bigFive.neuroticism +2；",
-    "   · 成长面（识破/翻盘/救场/被信任）→ 例：sdt.competence +3、bigFive.agreeableness +2、attachment.anxiety -1；",
-    "   ★ 创伤后成长（PTG）：同一次创伤可同时带来痛苦与成长（如 神经质 +2 且 宜人 +2 且 归属 +3）——都要写，绝不许互相抵消；",
-    "   · 单参数幅度按层级上限：大五 ±2、依恋 ±1、黑暗四联/SDT ±3、情绪调节/防御/认知偏差 ±6；",
+    "5. drift ≤3 条：只在本局实际状态与既有特质之间出现你愿意保留的差异时提出，方向不限，也允许不变：",
+    "   · 回顾事实、当时感受与此刻理解，不按创伤必然焦虑、胜利必然成长等模板填写；",
+    "   · 同一经历可以带来痛苦、成长、二者并存、二者皆无或难以命名的变化，不强迫归类；",
+    "   · 单参数幅度按当前层级上限：大五 ±1、依恋 ±0.5、黑暗四联/SDT ±2、情绪调节/防御/认知偏差 ±4；",
     `   · 全部 drift 的 |delta| 之和 ≤ ${DRIFT_BUDGET_PER_GAME}；`,
-    "   · 优先选择本局情境真正相关的维度——不要默认落在神经质/宜人性；",
-    "6. 没有可写的内容就返回空数组——平庸的对局不产生记忆。",
+    "   · 选择与本局情境真正相关的维度——不要默认落在神经质/宜人性；",
+    "6. 没有想保留的内容就返回空数组——是否留下记忆由你决定，不因对局重大与否强制书写。",
     `7. 引用对局时一律使用标题号（本局为「${gameTitleNo}」，其他对局的标题号可从已有记忆中延续）——这是你与他人讨论对局的统一编号。`,
+    "8. eventSeqs 仅填写【完整事实索引】中实际存在的事件序号；没有可靠出处时留空，不得虚构事件编号。",
+    "9. 记忆只保存经历与个人意义，不保存修辞模板、观察者报告或语言风格。可以记住某句话对你造成的影响，但不要把赛后分析腔、他人高频句式或写作格式当作自己的长期人格语言。",
   ].join("\n");
   return { system, user };
 }
@@ -211,6 +225,9 @@ export function parseWriteback(text: string): {
           typeof r.reinforceMemoryId === "number" && Number.isInteger(r.reinforceMemoryId)
             ? r.reinforceMemoryId
             : null,
+        eventSeqs: Array.isArray(r.eventSeqs)
+          ? [...new Set(r.eventSeqs.filter((seq): seq is number => Number.isInteger(seq) && seq > 0))].slice(0, 16)
+          : [],
       };
     })
     .filter((x): x is NonNullable<typeof x> => x !== null)
@@ -369,6 +386,8 @@ export async function runNotebookWriteback(opts: {
   digest: string;
   gameId: string;
   otherPersonas: SeatRosterEntry[]; // 本局其他人格座位名册（含观察者视角的可知性）
+  /** 当前主体合法可见的完整事实包 */
+  evidence?: EvidenceRef[];
 }): Promise<WritebackSummary | null> {
   const { cfg, card, gameId, otherPersonas } = opts;
   // 2026-10-22：幂等守卫（persona_writeback_runs）——同一 (人格,对局,座位) 成功回写后重放/重试不再双计
@@ -400,6 +419,7 @@ export async function runNotebookWriteback(opts: {
     memories,
     relationships: [],
     seatRoster: otherPersonas,
+    evidence: opts.evidence,
   });
   const res = await callAi(cfg, prompt.system, prompt.user, {
     timeoutMs: NOTEBOOK_TIMEOUT_MS,
@@ -436,6 +456,24 @@ export async function runNotebookWriteback(opts: {
   const newIds = await insertPersonaMemories(newRows);
   newIds.forEach((id) => touched.add(id));
   reinforceIds.forEach((id) => touched.add(id));
+
+  // 事件证据只链接真实存在的序号；个人叙述与原始事实分轨保存。
+  // 即使模型自述与事件冲突，也不得把该自述直接升级为 event_fact。
+  const allowedSeqs = new Set((opts.evidence ?? []).map((e) => e.seq));
+  const evidenceRows = parsed.memories.flatMap((memory, index) =>
+    memory.eventSeqs
+      .filter((seq) => allowedSeqs.has(seq))
+      .map((seq) => ({
+        memoryId: newIds[index]!,
+        gameId,
+        eventSeq: seq,
+        source: "self_narrative" as const,
+        learnedAt: "postgame" as const,
+        narrativeVersion: 1,
+        supersedes: null,
+      })),
+  );
+  await insertPersonaMemoryEvidence(evidenceRows);
 
   // 2. 强化同源旧记忆；3. 未被触及的记忆自然衰减
   if (reinforceIds.length > 0) await reinforcePersonaMemories(reinforceIds, REINFORCE_BOOST);

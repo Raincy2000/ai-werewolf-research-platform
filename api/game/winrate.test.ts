@@ -108,7 +108,7 @@ function autoAnswer(user: string): string {
   if (user.includes("参与竞选")) return '{"thought":"t","targets":[0]}';
   // 发言类判定只看【你的任务】行（版型规则全文/输出契约里有「发言/PK发言」字样，全文匹配会误中）
   const taskLine = user.slice(user.indexOf("【你的任务】"));
-  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|队内讨论：请向狼队友发言|赛后讨论·聊天室/.test(taskLine)) {
+  if (/发表白天发言|发表警上竞选发言|平票PK发言|发表遗言|狼人频道队内讨论|赛后讨论·聊天室/.test(taskLine)) {
     return '{"thought":"t","speech":"测试发言"}';
   }
   const needTarget = user.includes("必须行动") || (!user.includes("允许放弃") && !user.includes("可弃票"));
@@ -122,6 +122,9 @@ function autoAnswer(user: string): string {
 vi.mock("./ai/providers", () => ({
   // 胜率分析调用（system 含「实时评估」标识）返回可控文本；其余（玩家决策）恒失败 → 启发式兜底
   callAi: async (_cfg: unknown, system: string, user: string) => {
+    if (typeof system === "string" && system.includes("拍刀审核分析师")) {
+      return { ok: true, text: h.winRateText, latencyMs: 1, error: null };
+    }
     if (typeof system === "string" && system.includes("实时评估「神民阵营」的胜率")) {
       h.winRateCalls += 1;
       h.lastWinRatePrompt = { system, user };
@@ -609,7 +612,7 @@ describe("白日交刀宣布胜利审核", () => {
   it("胜率未达 100% → 宣布无效，神民阵营取胜", async () => {
     const { gameService } = await import("./service");
     h.winRateVary = false;
-    h.winRateText = '{"good":62,"reasons":["神民占优"]}'; // 狼人胜率 38%
+    h.winRateText = '{"verdict":"not_guaranteed","reason":"分析师推演仍存在反制路径"}'; // 狼人胜率 38%
     h.playerHook = declareScript;
     const { gameId } = await createAuditedGame({
       boardId: "standard12",
@@ -625,10 +628,10 @@ describe("白日交刀宣布胜利审核", () => {
     await stopGame(gameId);
   }, 120_000);
 
-  it("胜率达 100% → 审核通过，狼人阵营取胜", async () => {
+  it("模型称狼人 100% 但仍有反制路径 → 审核驳回，神民阵营取胜", async () => {
     const { gameService } = await import("./service");
     h.winRateVary = false;
-    h.winRateText = '{"good":0,"reasons":["狼人必胜"]}'; // 狼人胜率 100%
+    h.winRateText = '{"verdict":"not_guaranteed","reason":"分析师推演仍存在反制路径"}'; // 狼人胜率 100%
     h.playerHook = declareScript;
     const { gameId } = await createAuditedGame({
       boardId: "standard12",
@@ -638,9 +641,9 @@ describe("白日交刀宣布胜利审核", () => {
     });
     await gameService.control(gameId, "start");
 
-    await waitFor(() => registry.get(gameId)?.status === "finished", "狼人胜利", 90_000);
-    expect(h.games.get(gameId)?.winner).toBe("wolf");
-    expect(h.events.some((e) => e.gameId === gameId && e.title === "宣布胜利未通过审核")).toBe(false);
+    await waitFor(() => registry.get(gameId)?.status === "finished", "确定性审核终局", 90_000);
+    expect(h.games.get(gameId)?.winner).toBe("good");
+    expect(h.events.some((e) => e.gameId === gameId && e.title === "宣布胜利未通过审核")).toBe(true);
     await stopGame(gameId);
   }, 120_000);
 
@@ -649,7 +652,7 @@ describe("白日交刀宣布胜利审核", () => {
     //（横幅「对局已手动终止」），赛后讨论/心理检查/分析报告全部不触发，决策日志形态错误
     const { gameService } = await import("./service");
     h.winRateVary = false;
-    h.winRateText = '{"good":62,"reasons":["神民占优"]}';
+    h.winRateText = '{"verdict":"not_guaranteed","reason":"分析师推演仍存在反制路径"}';
     h.playerHook = declareScript;
     const { gameId } = await createAuditedGame({
       boardId: "standard12",
@@ -715,9 +718,7 @@ describe("胜率缘由去重", () => {
   }, 60_000);
 });
 
-describe("白日交刀审核：即时性铁律（auditDeclareVictory 直测）", () => {
-  // 用户裁定：拍刀时刻的局面必须即时重评，不得把滞后记录安在当前局面（否则误判）
-  // 锚点单调守门要求事件游标前进：给每个用例的对局铺一条 seq=100 的事件
+describe("白日交刀审核：确定性规则，不使用模型胜率", () => {
   const seedEvent = (gid: string) => {
     h.events.push({
       gameId: gid, seq: 100, day: 4, phase: "day.skill", type: "action",
@@ -728,72 +729,73 @@ describe("白日交刀审核：即时性铁律（auditDeclareVictory 直测）",
     userId: "u1",
     boardId: "standard12",
     options: {
-      stepDelayMs: 0,
-      phaseBreakMs: 0,
-      sheriffEnabled: true,
-      allowSelfDestruct: true,
-      speechRoundsLimit: 2,
+      stepDelayMs: 0, phaseBreakMs: 0, sheriffEnabled: true,
+      allowSelfDestruct: true, speechRoundsLimit: 2,
     },
-    seatAIs: [
-      { seat: 1, provider: "kimi" as const, baseUrl: "http://test.local/v1", model: "m", apiKey: "k" },
-    ],
+    seatAIs: [{ seat: 1, provider: "kimi" as const, baseUrl: "http://test.local/v1", model: "m", apiKey: "k" }],
     analystAi: null,
     winRateEnabled: true,
     winRateLastStoredSeq: 0,
     winRateDirty: false,
     engine: {
       getSnapshot: () => ({
-        day: 4,
-        phase: "day.skill",
-        phaseLabel: "第4天 · 技能权衡",
-        winner: null,
-        finished: false,
-        pendingSeat: null,
-        pendingKind: null,
-        players: [],
+        day: 4, phase: "day.skill", phaseLabel: "第4天 · 技能权衡",
+        winner: null, finished: false, pendingSeat: null, pendingKind: null, players: [],
       }),
     },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   }) as any;
 
-  it("滞后记录狼优 100% + 即时重评 62% → 驳回（不沿用滞后记录）", async () => {
+  function player(seat: number, role: string, stock: string[] = []) {
+    const wolf = ["werewolf", "wolfKing", "whiteWolfKing", "gargoyle", "nightmare", "bloodMoon", "hiddenWolf", "mechWolf"].includes(role);
+    return {
+      seat, role, roleName: role, camp: wolf ? "wolf" : role === "villager" ? "villager" : "god",
+      alive: true, sheriff: false, sheriffCand: false, deathInfo: null, stock, checks: [],
+    };
+  }
+
+  async function auditWith(players: ReturnType<typeof player>[], gid: string) {
+    const rt = fakeRt();
+    const snapshot = rt.engine.getSnapshot();
+    rt.engine.getSnapshot = () => ({ ...snapshot, players });
+    seedEvent(gid);
     const { auditDeclareVictory } = await import("./service");
+    return (await auditDeclareVictory(gid, rt)).outcome;
+  }
+
+  it("一狼一民且无反制路径 → 放行，即使模型宣称好人 100%", async () => {
     h.winRateVary = false;
-    h.winRateText = '{"good":62,"reasons":["神民已翻盘"]}'; // 即时重评的读数
-    seedEvent("g-audit");
-    h.winrates.push({
-      id: 1, gameId: "g-audit", day: 3, phase: "day.vote",
-      goodPct: 0, wolfPct: 100, reasons: ["旧读数"], triggerLabel: "滞后记录", createdAt: new Date(),
-    });
-    expect(await auditDeclareVictory("g-audit", fakeRt())).toBe("reject");
-    // 即时评估的新读数落库（替代滞后读数）
-    const last = h.winrates.filter((r) => r.gameId === "g-audit").at(-1)!;
-    expect(last.goodPct).toBe(62);
+    h.winRateText = '{"verdict":"wolf_win","reason":"分析师推演所有合法后续均为狼胜"}';
+    expect(await auditWith([player(1, "werewolf"), player(2, "villager")], "g-det-1")).toBe("pass");
   });
 
-  it("滞后记录仅 38% 狼优 + 即时重评 100% → 放行（不被早期偏低记录拖累）", async () => {
-    const { auditDeclareVictory } = await import("./service");
+  it("一狼一名存活守卫 → 仍有保护反制，驳回，即使模型宣称狼人 100%", async () => {
     h.winRateVary = false;
-    h.winRateText = '{"good":0,"reasons":["狼队已必胜"]}';
-    seedEvent("g-audit2");
-    h.winrates.push({
-      id: 1, gameId: "g-audit2", day: 3, phase: "day.vote",
-      goodPct: 62, wolfPct: 38, reasons: ["旧读数"], triggerLabel: "滞后记录", createdAt: new Date(),
-    });
-    expect(await auditDeclareVictory("g-audit2", fakeRt())).toBe("pass");
+    h.winRateText = '{"verdict":"not_guaranteed","reason":"分析师推演仍存在反制路径"}';
+    expect(await auditWith([player(1, "werewolf"), player(2, "guard")], "g-det-2")).toBe("reject");
   });
 
-  it("即时评估不可用（解析失败）→ 回落最近记录兜底；无任何记录 → 审核不可用放行", async () => {
-    const { auditDeclareVictory } = await import("./service");
+  it("一狼一名仍有解药的女巫 → 驳回；解药耗尽且仅剩毒药时可放行", async () => {
     h.winRateVary = false;
-    h.winRateText = "这不是 JSON"; // 解析失败 → 即时评估 skip
-    seedEvent("g-audit3");
-    seedEvent("g-none");
-    h.winrates.push({
-      id: 1, gameId: "g-audit3", day: 3, phase: "day.vote",
-      goodPct: 0, wolfPct: 100, reasons: [], triggerLabel: null, createdAt: new Date(),
-    });
-    expect(await auditDeclareVictory("g-audit3", fakeRt())).toBe("pass"); // 兜底读旧记录 100% → 放行
-    expect(await auditDeclareVictory("g-none", fakeRt())).toBe("pass"); // 无记录：审核不可用放行
+    h.winRateText = '{"verdict":"not_guaranteed","reason":"分析师推演仍存在反制路径"}';
+    expect(await auditWith([player(1, "werewolf"), player(2, "witch", ["解药可用", "毒药可用"])], "g-det-3")).toBe("reject");
+    h.winRateText = '{"verdict":"wolf_win","reason":"分析师推演所有合法后续均为狼胜"}';
+    expect(await auditWith([player(1, "werewolf"), player(2, "witch", ["解药已用", "毒药可用"])], "g-det-4")).toBe("pass");
+  });
+
+  it("一狼一名未决斗骑士 → 驳回；决斗已用可放行", async () => {
+    h.winRateVary = false;
+    h.winRateText = '{"verdict":"not_guaranteed","reason":"分析师推演仍存在反制路径"}';
+    expect(await auditWith([player(1, "werewolf"), player(2, "knight", ["决斗可用"])], "g-det-5")).toBe("reject");
+    h.winRateText = '{"verdict":"wolf_win","reason":"分析师推演所有合法后续均为狼胜"}';
+    expect(await auditWith([player(1, "werewolf"), player(2, "knight", ["决斗已用"])], "g-det-6")).toBe("pass");
+  });
+
+  it("一狼两名非狼 → 保守驳回；没有非狼则放行", async () => {
+    h.winRateVary = false;
+    h.winRateText = '{"verdict":"not_guaranteed","reason":"分析师推演仍存在反制路径"}';
+    expect(await auditWith([player(1, "werewolf"), player(2, "villager"), player(3, "seer")], "g-det-7")).toBe("reject");
+    h.winRateText = '{"verdict":"wolf_win","reason":"分析师推演所有合法后续均为狼胜"}';
+    expect(await auditWith([player(1, "werewolf")], "g-det-8")).toBe("pass");
   });
 });

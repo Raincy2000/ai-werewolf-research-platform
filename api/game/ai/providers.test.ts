@@ -76,6 +76,31 @@ describe("providers：请求体参数兼容", () => {
   });
 });
 
+describe("providers：5xx 间歇故障恢复", () => {
+  it("连续 3 次 HTTP 500 后仍允许恢复，不再止步于默认两次重试", async () => {
+    h.failWith500 = 3;
+    const res = await callAi(cfg("deepseek-v4-flash", "deepseek"), "s", "u", { timeoutMs: 30 });
+    expect(res.ok).toBe(true);
+    expect(h.calls.length).toBe(4);
+    // 真实退避共 7 秒；显式延长超时，避免遗留异步请求污染下一用例。
+  }, 20_000);
+
+  it("5xx 退避充分但仍受决策预算约束", async () => {
+    h.failWith500 = 2;
+    const t0 = Date.now();
+    const res = await callAi(cfg("deepseek-v4-flash", "deepseek"), "s", "u", {
+      timeoutMs: 30,
+      maxRetries: 4,
+      deadlineAt: t0 + 10_000,
+    });
+    const elapsed = Date.now() - t0;
+    expect(res.ok).toBe(true);
+    expect(h.calls.length).toBe(3);
+    expect(elapsed).toBeGreaterThanOrEqual(2_500);
+    expect(elapsed).toBeLessThan(10_000);
+  });
+});
+
 describe("providers：deadlineAt 决策预算约束", () => {
   it("预算耗尽即停止重试（不再空烧整轮超时）", async () => {
     h.failWith500 = 10; // 持续 500（可重试错误）

@@ -12,7 +12,7 @@ import {
   buildMirrorPrompt,
   buildSinglePrompt,
   formatTensionTemplate,
-  mirrorFallbackReport,
+  emptyMirrorReport,
   paramLabel,
   paramValueOf,
   parseMirrorReport,
@@ -81,8 +81,12 @@ describe("parseMirrorReport（铁律2：无触发参数判非法）", () => {
     expect(r.selfControl).toBe(40);
   });
 
-  it("pressures 与 tensions 皆空 → null（无根表演判非法）", () => {
-    expect(parseMirrorReport('{"pressures":[],"tensions":[],"impulse":"x"}')).toBeNull();
+  it("平静、无撕裂和无创伤均为合法空反应，只有结构非法才拒绝", () => {
+    const empty = parseMirrorReport('{"pressures":[],"tensions":[],"defenses":[],"trauma":null,"impulse":"","currentReaction":"","selfControl":50}');
+    expect(empty).not.toBeNull();
+    expect(empty!.pressures).toEqual([]);
+    expect(empty!.tensions).toEqual([]);
+    expect(empty!.currentReaction).toBe("");
     expect(parseMirrorReport("不是 JSON")).toBeNull();
     expect(parseMirrorReport('{"pressures":[{"param":"","reason":"x"}]}')).toBeNull();
   });
@@ -96,21 +100,26 @@ describe("parseMirrorReport（铁律2：无触发参数判非法）", () => {
   });
 });
 
-describe("mirrorFallbackReport（心镜失败的确定性兜底：触发参数来自卡本身）", () => {
-  it("极端参数成为触发源；宜人⇄黑暗面构成天然撕裂", () => {
-    const r = mirrorFallbackReport(makeCard(), makePending());
-    expect(r.pressures.length).toBeGreaterThan(0);
-    expect(r.tensions.length).toBeGreaterThan(0);
-    expect(r.tensions[0]!.poles.length).toBe(2);
-    // 曹操焦虑/回避双高 → 还应补一组依恋撕裂
-    expect(r.tensions.length).toBe(2);
+function mirrorWithTensions() {
+  return parseMirrorReport(`{"pressures":[{"param":"bigFive.neuroticism","value":85,"reason":"被质疑"}],
+    "tensions":[{"poles":[{"param":"bigFive.agreeableness","urge":"想维持和气"},{"param":"darkTetrad.machiavellianism","urge":"想借刀杀人"}],"intensity":75}],
+    "defenses":[],"trauma":null,"impulse":"先稳住2号","selfControl":40}`)!;
+}
+
+describe("emptyMirrorReport（心镜失败只标记状态缺失）", () => {
+  it("不由参数编造任何压力、撕裂、关系或冲动", () => {
+    const r = emptyMirrorReport();
+    expect(r.pressures).toEqual([]);
+    expect(r.tensions).toEqual([]);
+    expect(r.bonds).toEqual([]);
+    expect(r.impulse).toBe("");
   });
 });
 
 describe("formatTensionTemplate（张力模板四段式）", () => {
   it("含撕裂组/冲突强度/身体痕迹/涌现输出，且 ≤1600 字", () => {
     const card = makeCard();
-    const mirror = mirrorFallbackReport(card, makePending());
+    const mirror = mirrorWithTensions();
     const t = formatTensionTemplate(card, mirror, "手指敲击桌面", "我先听听再说。");
     expect(t).toContain("【当前撕裂】");
     expect(t).toContain("冲突强度：");
@@ -130,20 +139,63 @@ describe("双/单程自适应与 prompt 组装", () => {
   it("buildMirrorPrompt 含人格卡/记事簿/铁律约束", () => {
     const { system, user } = buildMirrorPrompt(makeCard(), "- [创伤·强度80] 被5号背叛过", makePending());
     expect(system).toContain("心镜");
-    expect(system).toContain("参数溢出");
+    expect(system).toContain("只记录实际出现的参数触发");
     expect(user).toContain("被5号背叛过");
     expect(user).toContain("马基雅维利 90");
   });
 
-  it("buildEmergencePrompt：基础输出契约被人格契约替代（含 bodyTrace/analysisGt）", () => {
+  it("心镜先获得本轮真实发言，空反应合法且不强制撕裂", () => {
+    const pending = makePending("postgameSpeak");
+    const base = buildPrompt(pending, {
+      cognition: {
+        publicFacts: "【赛后完整公共事实】\n旧事实仍在",
+        selfFacts: "【你的完整自我事实台账】\n我此前保持沉默",
+        currentInteraction: "【本轮互动事实】\n最新发言：2号玩家：你刚才为什么沉默？\n明确点名：3号",
+      },
+    });
+    const { user } = buildMirrorPrompt(makeCard(), null, pending, undefined, base);
+    expect(user).toContain("你刚才为什么沉默？");
+    expect(user).toContain("明确点名：3号");
+    expect(user).toContain("currentReaction");
+    expect(user).not.toContain("pressures≥1 或 tensions≥1");
+  });
+
+  it("主体独立定向不读他人逐字话术，涌现保留公共事实但不附加回应指导", () => {
+    const pending = makePending();
+    const base = buildPrompt(pending, {
+      cognition: {
+        publicFacts: "【完整公共事实】\n六只手共用一把尺子",
+        selfFacts: "【你的完整自我事实台账】\n我投6号",
+        intentTrail: "【你的完整意图轨迹】\n12号→6号→12号，理由完整",
+      },
+    });
+    const mirror = buildMirrorPrompt(makeCard(), null, pending, undefined, base);
+    expect(mirror.user).not.toContain("六只手");
+    expect(mirror.user).not.toContain("一把尺子");
+    expect(mirror.user).toContain("我投6号");
+    expect(mirror.user).toContain("12号→6号→12号，理由完整");
+    const emergence = buildEmergencePrompt(makeCard(), mirrorWithTensions(), null, base, null, pending);
+    expect(emergence.user).toContain("六只手共用一把尺子");
+    expect(emergence.user).not.toContain("【公开证据边界】");
+    expect(emergence.system).not.toContain("他人的话是互动材料");
+    expect(emergence.system).not.toContain("如何权衡与选择");
+    expect(emergence.user).not.toContain("如何回应由你决定");
+    expect(emergence.user).not.toContain("是否以及如何行动由你决定");
+    const single = buildSinglePrompt(makeCard(), null, pending, base);
+    expect(single.user).not.toContain("【公开证据边界】");
+    expect(single.user).not.toContain("是否形成、保留或改变战术由你决定");
+  });
+
+  it("buildEmergencePrompt：主体契约保留身体反应，但不生成观察者分析", () => {
     const card = makeCard();
-    const mirror = mirrorFallbackReport(card, makePending());
+    const mirror = mirrorWithTensions();
     const base = buildPrompt(makePending(), {});
     const { system, user } = buildEmergencePrompt(card, mirror, null, base);
     expect(system).toContain("你就是 TA");
     expect(user).toContain("【心镜 · 你此刻的人格状态报告】");
     expect(user).toContain("bodyTrace");
-    expect(user).toContain("analysisGt");
+    expect(user).not.toContain("analysisGt");
+    expect(user).not.toContain("analysisPsy");
     // 基础版 JSON 契约不应残留（人格版契约接管）
     expect(user).not.toContain('"thought":"你的真实内心推理');
   });
@@ -162,7 +214,7 @@ describe("双/单程自适应与 prompt 组装", () => {
     card.profile.values = "完整价值观".repeat(100);
     card.profile.essence = "完整自我认知".repeat(100);
     const mirrorPrompt = buildMirrorPrompt(card, null, makePending());
-    const emergePrompt = buildEmergencePrompt(card, mirrorFallbackReport(card, makePending()), null, buildPrompt(makePending(), {}));
+    const emergePrompt = buildEmergencePrompt(card, mirrorWithTensions(), null, buildPrompt(makePending(), {}));
     expect(mirrorPrompt.user).toContain(card.profile.values);
     expect(emergePrompt.system).toContain(card.profile.speechStyle);
     expect(emergePrompt.system).toContain("一／二／三／四／五");
@@ -171,7 +223,7 @@ describe("双/单程自适应与 prompt 组装", () => {
 
   it("双程表达层不接收可自述的原始参数报告", () => {
     const card = makeCard();
-    const { user } = buildEmergencePrompt(card, mirrorFallbackReport(card, makePending()), null, buildPrompt(makePending(), {}));
+    const { user } = buildEmergencePrompt(card, mirrorWithTensions(), null, buildPrompt(makePending(), {}));
     expect(user).not.toContain('"pressures"');
     expect(user).not.toContain("bigFive.neuroticism");
     expect(user).toContain("【隐性行为倾向】");
@@ -201,7 +253,7 @@ describe("米勒山谷穿越认知注入（涌现 system）", () => {
       aliveStatus: "deceased",
       specialAbilities: "巨人之力",
     };
-    const mirror = mirrorFallbackReport(card, pending);
+    const mirror = mirrorWithTensions();
     const { system } = buildEmergencePrompt(card, mirror, null, base);
     // 分身降临设定（2026-10-15 用户裁定）：原世界生命最后一刻分出的分身降临米勒山谷
     expect(system).toContain("生命的最后一刻");
@@ -215,14 +267,14 @@ describe("米勒山谷穿越认知注入（涌现 system）", () => {
   it("在世铸造卡 → 忽然穿越；原创手动卡 → 山谷原住民（能力设定不存在）", () => {
     const alive = makeCard();
     alive.profile = { ...alive.profile, aliveStatus: "alive" };
-    const m1 = mirrorFallbackReport(alive, pending);
+    const m1 = mirrorWithTensions();
     const s1 = buildEmergencePrompt(alive, m1, null, base).system;
     expect(s1).toContain("米勒山谷的村庄小镇");
     expect(s1).toContain("分身");
 
     const original = makeCard({ source: "manual" });
     original.profile = { ...original.profile, specialAbilities: "言灵" };
-    const m2 = mirrorFallbackReport(original, pending);
+    const m2 = mirrorWithTensions();
     const s2 = buildEmergencePrompt(original, m2, null, base).system;
     expect(s2).toContain("米勒山谷村庄小镇土生土长的原住民");
     expect(s2).toContain("在这里不存在");

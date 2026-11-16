@@ -7,6 +7,7 @@ import { applyRelationColumns, writeRelationRow } from "../network/writeModel";
 import {
   personas,
   personaMemories,
+  personaMemoryEvidence,
   personaRelationships,
   personaRelationshipHistory,
   personaCastDrafts,
@@ -38,6 +39,8 @@ import {
   type PersonaDriftChange,
   type PersonaDriftEntry,
   type PersonaMemory,
+  type MemoryLearnedAt,
+  type MemorySource,
   type PersonaParams,
   type PersonaProfile,
   type PersonaRelationship,
@@ -119,6 +122,7 @@ function toMemory(row: MemoryRow): PersonaMemory {
     emotionalWeight: row.emotionalWeight,
     valence: row.valence ?? 0,
     strength: row.strength,
+    source: "old_memory",
     createdAt: toIso(row.createdAt),
     updatedAt: toIso(row.updatedAt),
   };
@@ -826,6 +830,7 @@ export async function loadMemoryPool(personaId: number): Promise<MemoryPool> {
         emotionalWeight: m.emotionalWeight,
         situationSignature: m.situationSignature ?? null,
         lifecycle: m.lifecycle ?? "active",
+        origin: m.origin ?? "game",
       })),
     relationships: rels.slice(0, 6).map((r) => ({
       targetName: r.targetName,
@@ -842,15 +847,19 @@ export async function loadMemoryPool(personaId: number): Promise<MemoryPool> {
  *  旧标签「自传体记忆：」「关系图谱：」已移除（前者会直接诱发扮演自传）。 */
 export function renderMemoryText(
   pool: MemoryPool | null | undefined,
-  opts: { signature?: string | null; k?: number; charCap?: number } = {},
+  opts: { signature?: string | null; k?: number; charCap?: number; concerns?: string[]; presentNames?: string[] } = {},
 ): string {
   if (!pool) return "";
   const picked = recallMemories(pool.items, {
     signature: opts.signature ?? null,
+    concerns: opts.concerns,
     k: opts.k ?? 6,
   });
-  const remembered = composeRemembered(picked, { charCap: opts.charCap ?? 0 });
-  const relLines = pool.relationships.map(
+  const remembered = composeRemembered(picked, { charCap: opts.charCap ?? 0, concerns: opts.concerns });
+  const relations = opts.presentNames
+    ? pool.relationships.filter((r) => opts.presentNames!.includes(r.targetName))
+    : pool.relationships;
+  const relLines = relations.map(
     (r) => `· 「${r.targetName}」${r.relation}（亲疏${r.affinity}，信任${r.trust}）${r.note ? `——${r.note}` : ""}`,
   );
   const parts = [remembered, relLines.length ? `（你与他们之间）\n${relLines.join("\n")}` : ""].filter(Boolean);
@@ -898,6 +907,39 @@ export async function insertPersonaMemories(rows: NewPersonaMemory[]): Promise<n
     ids.push(id);
   }
   return ids;
+}
+
+export interface NewPersonaMemoryEvidence {
+  memoryId: number;
+  gameId: string;
+  eventSeq: number;
+  source?: MemorySource;
+  learnedAt?: MemoryLearnedAt;
+  narrativeVersion?: number;
+  supersedes?: number | null;
+}
+
+/** 保存记忆与原始事件的链接；唯一键保证重复回写不重复计数。 */
+export async function insertPersonaMemoryEvidence(rows: NewPersonaMemoryEvidence[]): Promise<void> {
+  if (rows.length === 0) return;
+  await insertIgnore(
+    personaMemoryEvidence,
+    rows.map((row) => ({
+      memoryId: row.memoryId,
+      gameId: row.gameId,
+      eventSeq: row.eventSeq,
+      source: row.source ?? "self_narrative",
+      learnedAt: row.learnedAt ?? "postgame",
+      narrativeVersion: row.narrativeVersion ?? 1,
+      supersedes: row.supersedes ?? null,
+    })),
+  );
+}
+
+export async function getPersonaMemoryEvidence(memoryIds: number[]): Promise<(typeof personaMemoryEvidence.$inferSelect)[]> {
+  if (memoryIds.length === 0) return [];
+  const db = getDb();
+  return db.select().from(personaMemoryEvidence).where(inArray(personaMemoryEvidence.memoryId, memoryIds));
 }
 
 /** 强化已有记忆（被再次唤起/复述）：strength += boost（封顶 100） */
