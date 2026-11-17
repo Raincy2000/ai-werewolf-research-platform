@@ -4,7 +4,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## 📌 当前状态
+## 🎮 客户端介绍
+
+客户端是 Windows x64 的 Electron 桌面应用：每个座位可独立配置 AI 提供方与 API Key，自动跑完整对局，数据保存在本机 SQLite，不依赖云端数据库。
+
+### 当前状态
 
 | 项目 | 状态 |
 |---|---|
@@ -13,11 +17,11 @@
 | 开发工作区 | `werewolf-workspace.zip`（五区结构，1.7 MB） |
 | 开源源码 | `main` 分支（本仓库，扁平源码镜像） |
 | CI | GitHub Actions：check / test / build 通过 |
-| 安装版 | 当前 Release 不提供 `setup.exe`；可从源码构建（见下文） |
+| 安装版 | 当前 Release 不提供 `setup.exe`；可从源码构建（见「从公开源码构建」） |
 
 > 便携版未做代码签名，Windows SmartScreen 可能提示；这是预期行为。客户端数据保存在本机 SQLite，不上传云端。
 
-## ⬇️ 下载与入口
+### 下载与入口
 
 到 [Releases](https://github.com/Raincy2000/ai-werewolf-research-platform/releases) 下载：
 
@@ -33,6 +37,35 @@
 2. **想开始开发**：下载 `werewolf-workspace.zip`，解压后按「开发工作区」一节操作。需要 Node.js ≥ 22.5。
 
 > `werewolf-workspace.zip` 文件名不带版本号，版本写在包内 `WORKSPACE-VERSION.txt` / `WORKSPACE.json`。
+
+### 核心特性
+
+- **多模型对战**：每个座位独立配置 AI 提供方（Kimi / OpenAI / DeepSeek / Anthropic / 自定义 OpenAI 兼容端点）与 API Key。
+- **完整狼人杀规则**：11 种版型；警长竞选/退水、狼人自爆、白日交刀、屠边、平票 PK；预言家/女巫/猎人/守卫/白痴/骑士/摄梦人/守墓人/猎魔人/乌鸦/通灵师等 19 种角色。
+- **犯规裁判**：分析师 AI 实时巡检公开发言（违规亮牌自证 / AI 身份泄露 / 元游戏言论），犯规即终局、对立阵营判胜。
+- **上帝视角实时观察**：事件流直播、AI 心理活动（thought）、阶段呼吸灯、阵营胜率推测条。
+- **赛后研究**：心理学 × 博弈论分析报告、经验指南蒸馏、MVP/SVP 评选、赛后讨论、人格心理检查。
+- **人格研究库（铸魂师）**：把现实/虚构人物蒸馏为量化人格参数卡；对局中运行「心镜→涌现」双程人格管线，跨对局记忆与关系图谱持续演进。
+- **赛前图书馆学习**：上传资料，开局前各座位 AI 自主学习并形成心得注入对局。
+- **对局回放 / 断点恢复**：按真实节奏回放；崩溃后经决策日志重放恢复。
+
+### 技术栈
+
+| 层 | 技术 |
+|---|---|
+| 前端 | React 19 · Vite 7 · TypeScript · Tailwind CSS v3 · shadcn/ui · tRPC |
+| 后端 | Hono · tRPC · Drizzle ORM（MySQL/TiDB 与 SQLite 双方言） |
+| 引擎 | TypeScript 生成器 Flow（`advance()`/`decide()` 驱动，事件缓冲） |
+| 桌面端 | Electron（本地 SQLite，数据不出本机） |
+| 测试 | Vitest |
+
+### 客户端使用说明
+
+- 双击 `WerewolfAI-*-portable.exe` 启动；首次运行会在本机创建 SQLite 数据库与机器级配置。
+- 数据位置：`%APPDATA%\AI狼人杀研究平台\`（`werewolf.db`、`desktop-config.json`、`desktop.log`）。
+- 每个座位在界面里填自己的 API Key；Key 只保存在本机，不进入公开仓库。
+- owner 初始密码随机生成，写在 `desktop-config.json` 的 `ownerPassword`；不需要在公开环境配置。
+- 当前 Release 只提供便携版；需要安装版可从源码构建（见下文）。
 
 ## 🧭 五区工作区架构
 
@@ -158,27 +191,6 @@ node dev\tools\release\push-to-github.mjs
 - GitHub 发布默认上传 **portable + 五区开发工作区包**；`--with-setup` 可追加安装版，`--with-source` 可追加源码包/校验和。
 - 发布前会执行 check/test/build、敏感文件门禁、PE/哈希校验。
 - 发布记录在 `records/releases/`，开发记录在 `records/journal/`。
-
-## ✨ 核心特性
-
-- **多模型对战**：每个座位独立配置 AI 提供方（Kimi / OpenAI / DeepSeek / Anthropic / 自定义 OpenAI 兼容端点）与 API Key。
-- **完整狼人杀规则**：11 种版型；警长竞选/退水、狼人自爆、白日交刀、屠边、平票 PK；预言家/女巫/猎人/守卫/白痴/骑士/摄梦人/守墓人/猎魔人/乌鸦/通灵师等 19 种角色。
-- **犯规裁判**：分析师 AI 实时巡检公开发言（违规亮牌自证 / AI 身份泄露 / 元游戏言论），犯规即终局、对立阵营判胜。
-- **上帝视角实时观察**：事件流直播、AI 心理活动（thought）、阶段呼吸灯、阵营胜率推测条。
-- **赛后研究**：心理学 × 博弈论分析报告、经验指南蒸馏、MVP/SVP 评选、赛后讨论、人格心理检查。
-- **人格研究库（铸魂师）**：把现实/虚构人物蒸馏为量化人格参数卡；对局中运行「心镜→涌现」双程人格管线，跨对局记忆与关系图谱持续演进。
-- **赛前图书馆学习**：上传资料，开局前各座位 AI 自主学习并形成心得注入对局。
-- **对局回放 / 断点恢复**：按真实节奏回放；崩溃后经决策日志重放恢复。
-
-## 🧱 技术栈
-
-| 层 | 技术 |
-|---|---|
-| 前端 | React 19 · Vite 7 · TypeScript · Tailwind CSS v3 · shadcn/ui · tRPC |
-| 后端 | Hono · tRPC · Drizzle ORM（MySQL/TiDB 与 SQLite 双方言） |
-| 引擎 | TypeScript 生成器 Flow（`advance()`/`decide()` 驱动，事件缓冲） |
-| 桌面端 | Electron（本地 SQLite，数据不出本机） |
-| 测试 | Vitest |
 
 ## 📁 公开仓库结构
 
