@@ -122,6 +122,8 @@ npm test
 npm run build
 ```
 
+> Windows 下单独运行 `npm test` 时需设置 `NODE_OPTIONS=--experimental-sqlite`（`start-dev.cmd` 已自动设置）。
+
 Windows 下从源码构建客户端：
 
 ```bat
